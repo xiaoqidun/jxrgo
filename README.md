@@ -1,4 +1,4 @@
-# JXRGo
+# JXRGo [![PkgGoDev](https://pkg.go.dev/badge/github.com/xiaoqidun/jxrgo)](https://pkg.go.dev/github.com/xiaoqidun/jxrgo)
 高性能、零依赖、纯 Go 语言 JXR 图像编解码库
 
 # 授权协议
