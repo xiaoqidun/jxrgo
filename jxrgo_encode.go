@@ -1,0 +1,1818 @@
+// Copyright 2026 肖其顿 (XIAO QI DUN)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package jxrgo
+
+import (
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"image"
+	"io"
+	"math"
+	"slices"
+)
+
+// jxrInputHeaderReserve 为编码头、临时布局、量化描述及验证状态预留固定容量
+const jxrInputHeaderReserve uint64 = 32768
+
+// errJXRInputHeaderMemory 预构造固定容量错误，预算不足时不再为格式化诊断分配堆存储
+var errJXRInputHeaderMemory = fmt.Errorf("%w: JPEG XR input header fixed memory", ErrLimit)
+
+// errJXREncodingPlanMemory 预构造原图扣减后的额度错误，资源拒绝路径不再临时分配诊断
+var errJXREncodingPlanMemory = fmt.Errorf("%w: encoding plan retained source memory", ErrLimit)
+
+// jxrNativeOutput 保存原生编码的文件类型、可选格式标识及完整码流输出参数
+type jxrNativeOutput struct {
+	format      Format
+	pixelFormat [16]byte
+	stream      jxrStreamOutput
+}
+
+// jxrForwardPacket 保存首遍得到的包偏移、长度及内容身份，第二遍不能悄然写出不同索引对应的包
+type jxrForwardPacket struct {
+	offset uint64
+	length uint64
+	digest [sha256.Size]byte
+}
+
+// jxrForwardPlan 保存有界非定位输出所需的包目录及固定头部身份，不驻留任何完整压缩包
+type jxrForwardPlan struct {
+	packets     []jxrForwardPacket
+	prefix      [sha256.Size]byte
+	prefixBytes uint64
+	total       uint64
+	ready       bool
+}
+
+// jxrCountingSeeker 仅计算现有逐包编码器的实际写入和回填位置，不保存压缩字节
+type jxrCountingSeeker struct {
+	position int64
+	length   int64
+}
+
+// jxrForwardWriter 为已规划索引的编码路径提供只允许查询当前位置的顺序输出
+type jxrForwardWriter struct {
+	writer   io.Writer
+	position int64
+}
+
+// Encode 编码标准图像，opts为nil时使用无损JXR
+// 入参: w 输出流, m 标准图像, opts 编码选项
+// 返回: error 图像、编码或写入错误
+func Encode(w io.Writer, m image.Image, opts *EncodeOptions) error {
+	return wrapJXRError("Encode", encodeContextCore(context.Background(), w, m, opts))
+}
+
+// EncodeContext 保留标准图像的可读颜色精度及预乘状态，输出原点归零
+// 自定义图像与YCbCr按Color.RGBA转换为十六位预乘颜色，原生分量应使用EncodeRaster
+// 工作内存包含内部原生副本而不包含调用方标准图像的存储，不关闭输出流
+// 入参: ctx 取消上下文，nil采用Background, w 输出流, m 标准图像, opts 编码选项
+// 返回: error 图像、资源、精度、取消或写入错误
+func EncodeContext(ctx context.Context, w io.Writer, m image.Image, opts *EncodeOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return wrapJXRError("EncodeContext", encodeContextCore(ctx, w, m, opts))
+}
+
+// encodeContextCore 执行标准图像编码核心流程，由外层公开入口统一包装错误操作名
+// 入参: ctx 已规范化取消上下文, w 输出流, m 标准图像, opts 编码选项
+// 返回: error 图像、资源、精度、取消或写入错误
+func encodeContextCore(ctx context.Context, w io.Writer, m image.Image, opts *EncodeOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if w == nil || m == nil {
+		return fmt.Errorf("%w: nil output or image", ErrInvalid)
+	}
+	limits := DefaultLimits()
+	if opts != nil {
+		if err := checkJXREncodeOptions(*opts); err != nil {
+			return err
+		}
+		limits = opts.Limits.normalized()
+	}
+	raster, err := standardImageRaster(ctx, m, limits)
+	if err != nil {
+		return err
+	}
+	return encodeRasterCore(ctx, w, raster, opts)
+}
+
+// standardImageRaster 将标准图像读取为独立原生样本，不通过八位RGBA缩减十六位精度
+// 入参: ctx 取消上下文, m 标准图像, limits 内部原生图像资源限制
+// 返回: *Raster 原点为零的原生图像, error 颜色、资源或取消错误
+func standardImageRaster(ctx context.Context, m image.Image, limits Limits) (*Raster, error) {
+	bounds := m.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("%w: standard image bounds", ErrInvalid)
+	}
+	if err := checkJXRDimensions(uint64(width), uint64(height), limits.MaxPixels); err != nil {
+		return nil, err
+	}
+	precision, count, space, alpha, premultiply := uint8(16), 4, ColorRGB, true, true
+	switch m.(type) {
+	case *image.Gray:
+		precision, count, space, alpha, premultiply = 8, 1, ColorGray, false, false
+	case *image.Gray16:
+		count, space, alpha, premultiply = 1, ColorGray, false, false
+	case *image.CMYK:
+		precision, space, alpha, premultiply = 8, ColorCMYK, false, false
+	case *image.NRGBA:
+		precision, premultiply = 8, false
+	case *image.NRGBA64:
+		premultiply = false
+	case *image.RGBA:
+		precision = 8
+	}
+	info := Info{Bounds: image.Rect(0, 0, width, height), ColorSpace: space, Alpha: alpha, Premultiplied: premultiply, Components: make([]ComponentInfo, count)}
+	for index := range info.Components {
+		info.Components[index] = ComponentInfo{Format: SampleUnsigned, Precision: precision}
+	}
+	raster, err := newRasterContext(ctx, info, limits)
+	if err != nil {
+		return nil, err
+	}
+	switch src := m.(type) {
+	case *image.Gray:
+		if err := copyStandardGray8(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.Gray16:
+		if err := copyStandardGray16(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.RGBA:
+		if err := copyStandardRGBA8(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.NRGBA:
+		if err := copyStandardRGBA8(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.CMYK:
+		if err := copyStandardRGBA8(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.NRGBA64:
+		if err := copyStandardRGBA16(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.RGBA64:
+		if err := copyStandardRGBA16(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	}
+	p0, p1, p2, p3 := raster.planes[0].values, raster.planes[1].values, raster.planes[2].values, raster.planes[3].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		rowBase := y * width
+		for x := range width {
+			if x&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			c := m.At(bounds.Min.X+x, bounds.Min.Y+y)
+			if c == nil {
+				return nil, fmt.Errorf("%w: nil image colour", ErrInvalid)
+			}
+			r, g, b, a := c.RGBA()
+			if r > 65535 || g > 65535 || b > 65535 || a > 65535 {
+				return nil, fmt.Errorf("%w: image colour channel range", ErrInvalid)
+			}
+			at := rowBase + x
+			p0[at], p1[at], p2[at], p3[at] = uint16(r), uint16(g), uint16(b), uint16(a)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return raster, nil
+}
+
+// checkStandardPix 校验标准图像像素切片步长与有效边界，防止畸形输入触发越界
+// 入参: pixLen 像素字节切片长度, stride 行字节步长, offset0 首像素偏移, width, height 图像尺寸, bpp 每像素字节数
+// 返回: error 步长或缓冲范围错误
+func checkStandardPix(pixLen, stride, offset0, width, height, bpp int) error {
+	rowBytes := int64(width) * int64(bpp)
+	if offset0 < 0 || stride < 0 || int64(stride) < rowBytes || int64(offset0) > int64(pixLen)-rowBytes {
+		return fmt.Errorf("%w: standard image pixel buffer", ErrInvalid)
+	}
+	if height > 1 && int64(height-1) > (int64(pixLen)-int64(offset0)-rowBytes)/int64(stride) {
+		return fmt.Errorf("%w: standard image pixel buffer", ErrInvalid)
+	}
+	return nil
+}
+
+// copyStandardGray8 按行直接读取八位灰度像素写入单通道原生存储
+// 入参: ctx 取消上下文, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 返回: error 缓冲校验或取消错误
+func copyStandardGray8(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
+	if err := checkStandardPix(len(pix), stride, offset0, width, height, 1); err != nil {
+		return err
+	}
+	p0 := raster.planes[0].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		row := pix[offset0+y*stride:]
+		rowBase := y * width
+		for start := 0; start < width; start += 1024 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := min(start+1024, width)
+			n := end - start
+			src := row[start:end]
+			d0 := p0[rowBase+start : rowBase+end]
+			_ = src[n-1]
+			_ = d0[n-1]
+			for i := range n {
+				d0[i] = uint16(src[i])
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// copyStandardGray16 按行直接读取大端十六位灰度像素写入单通道原生存储
+// 入参: ctx 取消上下文, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 返回: error 缓冲校验或取消错误
+func copyStandardGray16(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
+	if err := checkStandardPix(len(pix), stride, offset0, width, height, 2); err != nil {
+		return err
+	}
+	p0 := raster.planes[0].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		row := pix[offset0+y*stride:]
+		rowBase := y * width
+		for start := 0; start < width; start += 1024 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := min(start+1024, width)
+			n := end - start
+			src := row[start*2 : end*2]
+			d0 := p0[rowBase+start : rowBase+end]
+			_ = src[n*2-1]
+			_ = d0[n-1]
+			for i := range n {
+				o := i * 2
+				d0[i] = uint16(src[o])<<8 | uint16(src[o+1])
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// copyStandardRGBA8 按行直接读取四通道八位像素写入原生平面存储
+// 入参: ctx 取消上下文, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 返回: error 缓冲校验或取消错误
+func copyStandardRGBA8(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
+	if err := checkStandardPix(len(pix), stride, offset0, width, height, 4); err != nil {
+		return err
+	}
+	p0, p1, p2, p3 := raster.planes[0].values, raster.planes[1].values, raster.planes[2].values, raster.planes[3].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		row := pix[offset0+y*stride:]
+		rowBase := y * width
+		for start := 0; start < width; start += 1024 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := min(start+1024, width)
+			n := end - start
+			src := row[start*4 : end*4]
+			d0 := p0[rowBase+start : rowBase+end]
+			d1 := p1[rowBase+start : rowBase+end]
+			d2 := p2[rowBase+start : rowBase+end]
+			d3 := p3[rowBase+start : rowBase+end]
+			_ = src[n*4-1]
+			_ = d0[n-1]
+			_ = d1[n-1]
+			_ = d2[n-1]
+			_ = d3[n-1]
+			for i := range n {
+				o := i * 4
+				d0[i] = uint16(src[o])
+				d1[i] = uint16(src[o+1])
+				d2[i] = uint16(src[o+2])
+				d3[i] = uint16(src[o+3])
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// copyStandardRGBA16 按行直接读取大端四通道十六位像素写入原生平面存储
+// 入参: ctx 取消上下文, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 返回: error 缓冲校验或取消错误
+func copyStandardRGBA16(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
+	if err := checkStandardPix(len(pix), stride, offset0, width, height, 8); err != nil {
+		return err
+	}
+	p0, p1, p2, p3 := raster.planes[0].values, raster.planes[1].values, raster.planes[2].values, raster.planes[3].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		row := pix[offset0+y*stride:]
+		rowBase := y * width
+		for start := 0; start < width; start += 1024 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := min(start+1024, width)
+			n := end - start
+			src := row[start*8 : end*8]
+			d0 := p0[rowBase+start : rowBase+end]
+			d1 := p1[rowBase+start : rowBase+end]
+			d2 := p2[rowBase+start : rowBase+end]
+			d3 := p3[rowBase+start : rowBase+end]
+			_ = src[n*8-1]
+			_ = d0[n-1]
+			_ = d1[n-1]
+			_ = d2[n-1]
+			_ = d3[n-1]
+			for i := range n {
+				o := i * 8
+				d0[i] = uint16(src[o])<<8 | uint16(src[o+1])
+				d1[i] = uint16(src[o+2])<<8 | uint16(src[o+3])
+				d2[i] = uint16(src[o+4])<<8 | uint16(src[o+5])
+				d3[i] = uint16(src[o+6])<<8 | uint16(src[o+7])
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// jxrInputTransform 按原生四二二采样方向确定编码网格的转置位，其他颜色保留明确请求的方向
+// 入参: info 已校验原生描述, color 编码输出颜色, transform 请求的标准方向
+// 返回: uint8 实际编码网格到原生显示网格的方向
+func jxrInputTransform(info Info, color, transform uint8) uint8 {
+	if color == 2 {
+		transform &^= 4
+		if info.Components[1].XStep == 1 && info.Components[1].YStep == 2 {
+			transform |= 4
+		}
+	}
+	return transform
+}
+
+// newJXRInputStream 从原生图像建立编码头部，布局控制窗口、分块及平面数值和量化参数
+// 尺寸、输出颜色、位深、预乘和色度位置来自图像，未指定的内部颜色采用对应的可逆格式
+// 入参: ctx 已规范化取消上下文, raster 显示方向的原生图像, layout 编码布局, maxPixels 像素上限, maxMemory 新头部内存上限
+// 返回: jxrStream 独立头部与包索引空间, error 格式、布局、资源或取消错误
+func newJXRInputStream(ctx context.Context, raster *Raster, layout jxrStream, maxPixels, maxMemory uint64) (jxrStream, error) {
+	if raster == nil {
+		return jxrStream{}, fmt.Errorf("%w: JPEG XR native input image", ErrInvalid)
+	}
+	source, err := newJXRInputHeader(ctx, raster.info, layout, maxPixels, maxMemory)
+	if err != nil {
+		return jxrStream{}, err
+	}
+	for index := range raster.info.Components {
+		if err := ctx.Err(); err != nil {
+			return jxrStream{}, err
+		}
+		component, err := raster.component(index)
+		if err != nil {
+			return jxrStream{}, err
+		}
+		if _, err := component.sampleBitsAt(component.Bounds().Dx()-1, component.Bounds().Dy()-1); err != nil {
+			return jxrStream{}, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return jxrStream{}, err
+	}
+	return source, nil
+}
+
+// newJXRInputHeader 按已明确来源的完整元数据建立编码头，不触碰不存在于逐块源中的整图样本
+// 入参: ctx 已规范化取消上下文, info 原生元数据, layout 编码布局, maxPixels 像素上限, maxMemory 新头部内存上限
+// 返回: jxrStream 独立头部及包目录, error 元数据、布局、资源或取消错误
+func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixels, maxMemory uint64) (jxrStream, error) {
+	if err := ctx.Err(); err != nil {
+		return jxrStream{}, err
+	}
+	if info.Bounds.Empty() || info.Bounds.Min != (image.Point{}) || len(info.Components) == 0 {
+		return jxrStream{}, fmt.Errorf("%w: JPEG XR native input image", ErrInvalid)
+	}
+	components := info.Channels
+	if info.Alpha {
+		components++
+	}
+	if info.Channels < 1 || len(info.Components) != components {
+		return jxrStream{}, fmt.Errorf("%w: JPEG XR native input components", ErrInvalid)
+	}
+	if maxMemory < jxrInputHeaderReserve {
+		return jxrStream{}, errJXRInputHeaderMemory
+	}
+	f, err := rasterPixelFormat(info)
+	if err != nil {
+		return jxrStream{}, err
+	}
+	s := layout
+	h := &s.header
+	h.transform = jxrInputTransform(info, f.color, h.transform)
+	h.width, h.height = uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
+	if h.transform&4 != 0 {
+		h.width, h.height = h.height, h.width
+	}
+	if err := checkJXRDimensions(h.width, h.height, maxPixels); err != nil {
+		return jxrStream{}, err
+	}
+	h.color, h.depth, h.alpha, h.premultiply = f.color, f.depth, f.alpha, f.premultiply
+	h.longWord = h.longWord || f.color == 8 || f.depth != 0 && f.depth != 1 && f.depth != 15
+	h.planeStart = 0
+	if h.top == 0 && h.left == 0 && h.bottom == 0 && h.right == 0 {
+		h.right, h.bottom = uint32((16-h.width%16)%16), uint32((16-h.height%16)%16)
+	}
+	if h.columns == nil {
+		extent := (h.width + uint64(h.left) + uint64(h.right)) / 16
+		h.columns = []uint32{0, uint32(extent)}
+		if extent == jxrDimensionLimit/16 {
+			h.columns = []uint32{0, 1, uint32(extent)}
+		}
+	}
+	if h.rows == nil {
+		extent := (h.height + uint64(h.top) + uint64(h.bottom)) / 16
+		h.rows = []uint32{0, uint32(extent)}
+		if extent == jxrDimensionLimit/16 {
+			h.rows = []uint32{0, 1, uint32(extent)}
+		}
+	}
+	h.index = h.index || h.frequency || len(h.columns) > 2 || len(h.rows) > 2
+	short := h.width <= 65536 && h.height <= 65536
+	for _, boundary := range [][]uint32{h.columns, h.rows} {
+		for n := 1; n < len(boundary)-1; n++ {
+			if boundary[n] > boundary[n-1] && boundary[n]-boundary[n-1] > 255 {
+				short = false
+			}
+		}
+	}
+	h.short = h.short || short
+	if err := checkJXRHeader(h, maxPixels); err != nil {
+		return jxrStream{}, err
+	}
+	if s.primary.channels == 0 {
+		s.primary.color, s.primary.channels = f.color, f.channels
+		if f.color == 7 || f.color == 8 {
+			s.primary.color = 3
+		} else if f.color == 5 {
+			s.primary.color = 4
+		}
+	}
+	if s.alpha != nil {
+		alpha := *s.alpha
+		alpha.color, alpha.channels, alpha.chromaX, alpha.chromaY = 0, 1, 0, 0
+		s.alpha = &alpha
+	}
+	quantMemory := uint64(0)
+	for _, p := range []*jxrPlane{&s.primary, s.alpha} {
+		if p == nil {
+			continue
+		}
+		if err := checkJXRPlaneComponents(p); err != nil {
+			return jxrStream{}, err
+		}
+		for n, target := range []*[]uint8{&p.dcQuant, &p.lpQuant, &p.hpQuant} {
+			if len(*target) != 0 && len(*target) != p.channels {
+				return jxrStream{}, fmt.Errorf("%w: JPEG XR input quantization component count", ErrInvalid)
+			}
+			uniform := p.dcUniform
+			if n == 1 {
+				uniform = p.lpUniform
+			} else if n == 2 {
+				uniform = p.hpUniform
+			}
+			amount := uint64(len(*target))
+			if uniform && *target == nil {
+				amount = uint64(p.channels)
+			}
+			if amount > maxMemory-quantMemory {
+				return jxrStream{}, fmt.Errorf("%w: JPEG XR input quantization memory", ErrLimit)
+			}
+			quantMemory += amount
+			if uniform && *target == nil {
+				*target = make([]uint8, p.channels)
+			} else {
+				*target = cloneJXRQuant(*target)
+			}
+		}
+	}
+	if f.color == 6 && s.primary.channels != f.channels {
+		return jxrStream{}, fmt.Errorf("%w: JPEG XR native input component count", ErrInvalid)
+	}
+	if f.color == 1 || f.color == 2 {
+		component := info.Components[1]
+		s.primary.chromaX, s.primary.chromaY = 7, 0
+		if f.color == 1 {
+			s.primary.chromaY = 7
+		}
+		x, y := component.XOffset, component.YOffset
+		knownX, knownY := component.XPositionKnown, component.YPositionKnown
+		if h.transform&2 != 0 && component.XStep == 2 {
+			x = 1 - x
+		}
+		if h.transform&1 != 0 && component.YStep == 2 {
+			y = 1 - y
+		}
+		if h.transform&4 != 0 {
+			x, y, knownX, knownY = y, x, knownY, knownX
+			if f.color == 1 {
+				y = 1 - y
+			}
+		}
+		if knownX {
+			s.primary.chromaX = uint8(x * 4)
+		}
+		if f.color == 1 && knownY {
+			s.primary.chromaY = uint8(y * 4)
+		}
+	}
+	if err := checkJXRPlaneHeader(h, &s.primary, false); err != nil {
+		return jxrStream{}, err
+	}
+	if f.alpha {
+		alpha := s.primary
+		if s.alpha != nil {
+			alpha = *s.alpha
+		}
+		alpha.color, alpha.channels, alpha.chromaX, alpha.chromaY = 0, 1, 0, 0
+		if layout.alpha == nil {
+			amount := uint64(min(1, len(alpha.dcQuant)) + min(1, len(alpha.lpQuant)) + min(1, len(alpha.hpQuant)))
+			if amount > maxMemory-quantMemory {
+				return jxrStream{}, &LimitError{Resource: "JPEG XR input alpha quantization memory", Limit: maxMemory, Required: jxrSaturatedAdd(quantMemory, amount)}
+			}
+			quantMemory += amount
+			alpha.dcQuant, alpha.lpQuant, alpha.hpQuant = cloneJXRQuant(alpha.dcQuant[:min(1, len(alpha.dcQuant))]), cloneJXRQuant(alpha.lpQuant[:min(1, len(alpha.lpQuant))]), cloneJXRQuant(alpha.hpQuant[:min(1, len(alpha.hpQuant))])
+		}
+		s.alpha = &alpha
+		if err := checkJXRPlaneHeader(h, s.alpha, true); err != nil {
+			return jxrStream{}, err
+		}
+		if alpha.bands < s.primary.bands {
+			return jxrStream{}, fmt.Errorf("%w: JPEG XR native input alpha bands", ErrInvalid)
+		}
+	} else if s.alpha != nil {
+		return jxrStream{}, fmt.Errorf("%w: JPEG XR native input missing alpha", ErrInvalid)
+	}
+	count := uint64(len(h.columns)-1) * uint64(len(h.rows)-1)
+	if h.frequency {
+		count *= uint64(4 - s.primary.bands)
+	}
+	if count > uint64(^uint(0)>>1)/8 {
+		return jxrStream{}, &LimitError{Resource: "JPEG XR input header packet count", Limit: uint64(^uint(0)>>1) / 8, Required: count}
+	}
+	if len(s.profiles) > 4096 {
+		return jxrStream{}, &LimitError{Resource: "JPEG XR input header profile count", Limit: 4096, Required: uint64(len(s.profiles))}
+	}
+	memory := jxrInputHeaderReserve + count*8 + uint64(len(h.columns)+len(h.rows)+len(s.profiles))*4
+	if memory > maxMemory || quantMemory > maxMemory-memory {
+		return jxrStream{}, &LimitError{Resource: "JPEG XR input header memory", Limit: maxMemory, Required: jxrSaturatedAdd(memory, quantMemory)}
+	}
+	if err := ctx.Err(); err != nil {
+		return jxrStream{}, err
+	}
+	h.columns, h.rows = slices.Clone(h.columns), slices.Clone(h.rows)
+	s.profiles = slices.Clone(s.profiles)
+	s.packets, s.dataStart = make([]uint64, int(count)), 0
+	if err := checkJXRStreamOutput(&s, maxPixels); err != nil {
+		return jxrStream{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return jxrStream{}, err
+	}
+	return s, nil
+}
+
+// makeJXREncodingPlan 校验公开选项，在扣除原图后的剩余预算内生成内部编码参数，不修改调用方配置
+// 入参: ctx 取消上下文, raster 原生图像, opts 编码选项
+// 返回: jxrStream 编码头部, jxrNativeOutput 输出参数, error 选项、资源或取消错误
+func makeJXREncodingPlan(ctx context.Context, raster *Raster, opts *EncodeOptions) (jxrStream, jxrNativeOutput, error) {
+	var o EncodeOptions
+	if opts != nil {
+		o = *opts
+	}
+	if err := checkJXREncodeOptions(o); err != nil {
+		return jxrStream{}, jxrNativeOutput{}, err
+	}
+	retained, err := jxrRasterWork(raster, o.Limits.normalized().MaxMemoryBytes)
+	if err != nil {
+		return jxrStream{}, jxrNativeOutput{}, err
+	}
+	return makeJXREncodingPlanRetained(ctx, raster, &o, retained)
+}
+
+// makeJXREncodingPlanRetained 共用完整原图和有界分块源的布局规划，选项及常驻源容量由对应入口先行校验
+// 入参: ctx 已规范化取消上下文, raster 原图或仅含完整元数据的内部视图, opts 已校验编码选项, retained 常驻源和元数据容量
+// 返回: jxrStream 编码头部, jxrNativeOutput 输出参数, error 选项、资源或取消错误
+func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *EncodeOptions, retained uint64) (jxrStream, jxrNativeOutput, error) {
+	var o EncodeOptions
+	if opts != nil {
+		o = *opts
+	}
+	limits := o.Limits.normalized()
+	if o.Format == FormatUnknown {
+		o.Format = FormatJXR
+	}
+	output := jxrNativeOutput{format: o.Format, stream: jxrStreamOutput{exact: !o.Lossy, workers: normalizeJXRWorkers(o.Workers), maxPixels: limits.MaxPixels, maxBytes: o.MaxOutputBytes, maxMemory: limits.MaxMemoryBytes}}
+	if output.stream.maxBytes == 0 {
+		output.stream.maxBytes = 64 << 20
+	}
+	if retained > limits.MaxMemoryBytes {
+		return jxrStream{}, output, errJXREncodingPlanMemory
+	}
+	available := limits.MaxMemoryBytes - retained
+	if available < jxrInputHeaderReserve {
+		return jxrStream{}, output, errJXREncodingPlanMemory
+	}
+	layout := jxrStream{header: jxrHeader{frequency: o.Layout == LayoutFrequency, overlap: uint8(o.Overlap), transform: uint8(o.Orientation), hardTiles: o.HardTiles, trim: o.Trim != 0}}
+	main := PlaneOptions{Band: o.Band, Scaled: o.Scaled, Shift: o.Shift, Float: o.Float, Quantization: o.Quantization}
+	p, err := makeJXREncodePlane(ctx, raster, main, false, o.Alpha == nil, o.Lossy)
+	if err != nil {
+		return layout, output, err
+	}
+	p.legacyHighpassPrediction = o.LegacyHighpassPrediction
+	layout.primary = p
+	if o.Alpha != nil {
+		if !raster.info.Alpha {
+			return layout, output, fmt.Errorf("%w: alpha options without alpha", ErrInvalid)
+		}
+		alpha, err := makeJXREncodePlane(ctx, raster, *o.Alpha, true, false, o.Lossy)
+		if err != nil {
+			return layout, output, err
+		}
+		alpha.legacyHighpassPrediction = o.LegacyHighpassPrediction
+		layout.alpha = &alpha
+	}
+	s, err := newJXRInputHeader(ctx, raster.info, layout, limits.MaxPixels, available)
+	if err != nil {
+		return layout, output, err
+	}
+	if o.TileSize.X != 0 || o.TileSize.Y != 0 {
+		for axis, target := range []*[]uint32{&s.header.columns, &s.header.rows} {
+			extent, size := s.header.columns[len(s.header.columns)-1], uint32(o.TileSize.X/16)
+			if axis == 1 {
+				extent, size = s.header.rows[len(s.header.rows)-1], uint32(o.TileSize.Y/16)
+			}
+			count := (uint64(extent) + uint64(size) - 1) / uint64(size)
+			if count > 4096 {
+				return layout, output, &LimitError{Resource: "encode tile partition count", Limit: 4096, Required: count}
+			}
+			if count*4 > available {
+				return layout, output, &LimitError{Resource: "encode tile partition memory", Limit: available, Required: count * 4}
+			}
+			boundary := make([]uint32, int(count)+1)
+			for n := uint64(1); n <= count; n++ {
+				boundary[n] = uint32(min(n*uint64(size), uint64(extent)))
+			}
+			*target = boundary
+		}
+		s.header.short = false
+		s, err = newJXRInputHeader(ctx, raster.info, s, limits.MaxPixels, available)
+		if err != nil {
+			return layout, output, err
+		}
+	}
+	output.stream.tiles, output.stream.quantWork, err = planJXRQuantization(ctx, &s, o, available)
+	if err != nil {
+		return layout, output, err
+	}
+	if err := checkJXRStreamOutput(&s, limits.MaxPixels); err != nil {
+		return layout, output, err
+	}
+	return s, output, nil
+}
+
+// checkJXREncodeOptions 在图像复制及样本扫描前校验与图像无关的公开选项
+// 入参: o 编码选项
+// 返回: error 参数或容量错误
+func checkJXREncodeOptions(o EncodeOptions) error {
+	if o.Workers < 0 {
+		return fmt.Errorf("%w: negative encode workers", ErrInvalid)
+	}
+	if o.MirrorSeparateAlpha && !o.SeparateAlpha {
+		return fmt.Errorf("%w: mirrored alpha requires separate alpha", ErrInvalid)
+	}
+	if o.SeparateAlpha && o.Format == FormatCodestream {
+		return fmt.Errorf("%w: separate alpha requires a file container", ErrInvalid)
+	}
+	if o.Format > FormatCodestream || o.Band > BandDC || o.Layout > LayoutFrequency || o.Overlap > OverlapTwo || o.Orientation > OrientationRotate90FlipXY || o.Trim > 15 || o.Alpha != nil && o.Alpha.Band > BandDC {
+		return fmt.Errorf("%w: encode options", ErrInvalid)
+	}
+	if (o.TileSize.X != 0 || o.TileSize.Y != 0) && (o.TileSize.X <= 0 || o.TileSize.Y <= 0 || o.TileSize.X%16 != 0 || o.TileSize.Y%16 != 0 || o.TileSize.X/16 > 65535 || o.TileSize.Y/16 > 65535) {
+		return fmt.Errorf("%w: encode tile dimensions", ErrInvalid)
+	}
+	if o.Float != nil && o.Float.Mantissa > 23 {
+		return fmt.Errorf("%w: encode floating mantissa", ErrInvalid)
+	}
+	if o.Alpha != nil && o.Alpha.Float != nil && o.Alpha.Float.Mantissa > 23 {
+		return fmt.Errorf("%w: encode alpha floating mantissa", ErrInvalid)
+	}
+	return nil
+}
+
+// makeJXREncodePlane 按原生数值编码建立图像级共用参数，量化切片只读取不共享
+// 入参: ctx 取消上下文, raster 原生图像, o 平面选项, alpha 透明度平面, includeAlpha 自动浮点偏置是否同时覆盖透明度, lossy 是否允许精度损失
+// 返回: jxrPlane 平面参数, error 选项、精度或取消错误
+func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alpha, includeAlpha, lossy bool) (jxrPlane, error) {
+	p := jxrPlane{bands: uint8(o.Band), scaled: o.Scaled, shift: o.Shift, dcUniform: true, lpUniform: true, hpUniform: true}
+	if o.Band > BandDC {
+		return p, fmt.Errorf("%w: encode plane bands", ErrInvalid)
+	}
+	count, base := raster.info.Channels, 0
+	if alpha {
+		count, base = 1, raster.info.Channels
+	}
+	if count < 1 || count > rasterMaxComponents {
+		return p, fmt.Errorf("%w: encode component count", ErrInvalid)
+	}
+	if err := checkJXRModelComponents(&jxrPlane{channels: count}); err != nil {
+		return p, err
+	}
+	first := raster.info.Components[base]
+	p.dcQuant, p.lpQuant, p.hpQuant = make([]uint8, count), make([]uint8, count), make([]uint8, count)
+	if o.Float != nil {
+		if first.Format != SampleFloat || first.Precision != 32 || o.Float.Mantissa > 23 {
+			return p, fmt.Errorf("%w: encode floating parameters", ErrInvalid)
+		}
+		p.mantissa, p.exponent = o.Float.Mantissa, o.Float.Bias
+	} else if first.Format == SampleFloat && first.Precision == 32 {
+		maximum := uint32(1)
+		n := count
+		if includeAlpha && raster.info.Alpha {
+			n++
+		}
+		for index := range n {
+			component, err := raster.Component(base + index)
+			if err != nil {
+				return p, err
+			}
+			for y := range component.Bounds().Dy() {
+				if err := ctx.Err(); err != nil {
+					return p, err
+				}
+				for x := range component.Bounds().Dx() {
+					if x&1023 == 0 {
+						if err := ctx.Err(); err != nil {
+							return p, err
+						}
+					}
+					bits, err := component.SampleBits(x, y)
+					if err != nil {
+						return p, err
+					}
+					maximum = max(maximum, bits>>23&255)
+				}
+			}
+		}
+		p.mantissa, p.exponent = 23, int8(min(127, max(-128, 128-int(maximum))))
+		if lossy {
+			p.mantissa = 16
+		}
+	}
+	if o.Quantization != nil {
+		for n, target := range [][]uint8{p.dcQuant, p.lpQuant, p.hpQuant} {
+			values := o.Quantization.DC
+			if n == 1 {
+				values = o.Quantization.Lowpass
+			} else if n == 2 {
+				values = o.Quantization.Highpass
+			}
+			if len(values) != 0 && len(values) != 1 && len(values) != count {
+				return p, fmt.Errorf("%w: encode quantization component count", ErrInvalid)
+			}
+			for index := range count {
+				if len(values) == 1 {
+					target[index] = values[0]
+				} else if len(values) != 0 {
+					target[index] = values[index]
+				}
+			}
+		}
+	}
+	return p, nil
+}
+
+// jxrQuantizationWork 计算公开量化配置持有的数组容量，不把裁短切片视为释放底层数据
+// 入参: ctx 当前上下文, q 可选量化配置, maximum 活动容量上限
+// 返回: uint64 配置存储容量, error 资源或取消错误
+func jxrQuantizationWork(ctx context.Context, q *Quantization, maximum uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if q == nil {
+		return 0, nil
+	}
+	if uint64(cap(q.Tiles)) > maximum/128 {
+		return 0, fmt.Errorf("%w: quantization tile metadata", ErrLimit)
+	}
+	work, ok := jxrWorkTotal(maximum, 96, uint64(cap(q.DC)), uint64(cap(q.Lowpass)), uint64(cap(q.Highpass)), uint64(cap(q.Tiles))*128)
+	if !ok {
+		return 0, fmt.Errorf("%w: retained quantization parameters", ErrLimit)
+	}
+	for _, tile := range q.Tiles[:cap(q.Tiles)] {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		work, ok = jxrWorkTotal(maximum, work, uint64(cap(tile.DC)), uint64(cap(tile.LowpassIndex)), uint64(cap(tile.HighpassIndex)))
+		if !ok {
+			return 0, fmt.Errorf("%w: retained quantization indices", ErrLimit)
+		}
+		for _, groups := range [][][]uint8{tile.Lowpass, tile.Highpass} {
+			if uint64(cap(groups)) > (maximum-work)/24 {
+				return 0, fmt.Errorf("%w: quantization collection metadata", ErrLimit)
+			}
+			work += uint64(cap(groups)) * 24
+			for _, values := range groups[:cap(groups)] {
+				if uint64(cap(values)) > maximum-work {
+					return 0, fmt.Errorf("%w: retained quantization collection", ErrLimit)
+				}
+				work += uint64(cap(values))
+			}
+		}
+	}
+	return work, nil
+}
+
+// snapshotJXRQuantization 按实际长度复制公开配置，可为继承透明度只保留每组首分量
+// 入参: ctx 当前上下文, q 原始配置, maximum 副本额度, first 是否提取首分量
+// 返回: *Quantization 独占配置, uint64 副本存储容量, error 资源或取消错误
+func snapshotJXRQuantization(ctx context.Context, q *Quantization, maximum uint64, first bool) (*Quantization, uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	if q == nil {
+		return nil, 0, ctx.Err()
+	}
+	work := uint64(96)
+	if uint64(len(q.Tiles)) > maximum/128 || uint64(len(q.Tiles)) > uint64(^uint(0)>>1)/128 {
+		return nil, 0, fmt.Errorf("%w: quantization snapshot tile count", ErrLimit)
+	}
+	work += uint64(len(q.Tiles)) * 128
+	for _, values := range [][]uint8{q.DC, q.Lowpass, q.Highpass} {
+		count := len(values)
+		if first {
+			count = min(count, 1)
+		}
+		if work > maximum || uint64(count) > maximum-work {
+			return nil, 0, fmt.Errorf("%w: quantization snapshot vectors", ErrLimit)
+		}
+		work += uint64(count)
+	}
+	for _, tile := range q.Tiles {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		count := len(tile.DC)
+		if first {
+			count = min(count, 1)
+		}
+		var ok bool
+		work, ok = jxrWorkTotal(maximum, work, uint64(count), uint64(len(tile.LowpassIndex)), uint64(len(tile.HighpassIndex)))
+		if !ok {
+			return nil, 0, fmt.Errorf("%w: quantization snapshot indices", ErrLimit)
+		}
+		for _, groups := range [][][]uint8{tile.Lowpass, tile.Highpass} {
+			if uint64(len(groups)) > (maximum-work)/24 || uint64(len(groups)) > uint64(^uint(0)>>1)/24 {
+				return nil, 0, fmt.Errorf("%w: quantization snapshot collections", ErrLimit)
+			}
+			work += uint64(len(groups)) * 24
+			for _, values := range groups {
+				count := len(values)
+				if first {
+					count = min(count, 1)
+				}
+				if uint64(count) > maximum-work {
+					return nil, 0, fmt.Errorf("%w: quantization snapshot values", ErrLimit)
+				}
+				work += uint64(count)
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	result := &Quantization{}
+	if q.Tiles != nil {
+		result.Tiles = make([]TileQuantization, len(q.Tiles))
+	}
+	for index, values := range [][]uint8{q.DC, q.Lowpass, q.Highpass} {
+		if first {
+			values = values[:min(len(values), 1)]
+		}
+		copy := cloneJXRQuant(values)
+		switch index {
+		case 0:
+			result.DC = copy
+		case 1:
+			result.Lowpass = copy
+		case 2:
+			result.Highpass = copy
+		}
+	}
+	for index, tile := range q.Tiles {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		target := &result.Tiles[index]
+		*target = tile
+		values := tile.DC
+		if first {
+			values = values[:min(len(values), 1)]
+		}
+		target.DC = cloneJXRQuant(values)
+		var err error
+		target.LowpassIndex, err = copyJXRQuantIndex(ctx, tile.LowpassIndex)
+		if err != nil {
+			return nil, 0, err
+		}
+		target.HighpassIndex, err = copyJXRQuantIndex(ctx, tile.HighpassIndex)
+		if err != nil {
+			return nil, 0, err
+		}
+		for band, groups := range [][][]uint8{tile.Lowpass, tile.Highpass} {
+			var copy [][]uint8
+			if groups != nil {
+				copy = make([][]uint8, len(groups))
+			}
+			for group, values := range groups {
+				if first {
+					values = values[:min(len(values), 1)]
+				}
+				copy[group] = cloneJXRQuant(values)
+			}
+			if band == 0 {
+				target.Lowpass = copy
+			} else {
+				target.Highpass = copy
+			}
+		}
+	}
+	return result, work, ctx.Err()
+}
+
+// planJXRQuantization 按最终分块网格统一预检并复制双平面量化，默认透明度继承主平面首分量
+// 入参: ctx 当前上下文, source 已校验最终网格, options 公开选项, maximum 包含布局和设置的额度
+// 返回: []jxrTileSetting 独占设置, uint64 仍活动的公开配置容量, error 参数、资源或取消错误
+func planJXRQuantization(ctx context.Context, source *jxrStream, options EncodeOptions, maximum uint64) ([]jxrTileSetting, uint64, error) {
+	configuration := [2]*Quantization{options.Quantization, nil}
+	if source.alpha != nil {
+		configuration[1] = options.Quantization
+		if options.Alpha != nil {
+			configuration[1] = options.Alpha.Quantization
+		}
+	}
+	active := false
+	for _, q := range configuration {
+		active = active || q != nil && len(q.Tiles) != 0
+	}
+	if !active {
+		quant := [2]jxrTileQuant{newJXRTileQuant(&source.primary)}
+		if source.alpha != nil {
+			quant[1] = newJXRTileQuant(source.alpha)
+		}
+		return []jxrTileSetting{{quant: quant, trim: options.Trim}}, 0, nil
+	}
+	count := (len(source.header.columns) - 1) * (len(source.header.rows) - 1)
+	if uint64(count) > uint64(^uint(0)>>1)/jxrTileSettingBytes || uint64(count) > maximum/jxrTileSettingBytes {
+		return nil, 0, fmt.Errorf("%w: adaptive quantization tile storage", ErrLimit)
+	}
+	retained := uint64(0)
+	for index, q := range configuration {
+		if q == nil || len(q.Tiles) == 0 || index == 1 && q == configuration[0] {
+			continue
+		}
+		if len(q.Tiles) != count {
+			return nil, 0, fmt.Errorf("%w: adaptive quantization tile count", ErrInvalid)
+		}
+		amount, err := jxrQuantizationWork(ctx, q, maximum-retained)
+		if err != nil {
+			return nil, 0, err
+		}
+		retained += amount
+	}
+	memory, ok := jxrWorkTotal(maximum, retained, source.headerWork(), jxrInputHeaderReserve, uint64(count)*jxrTileSettingBytes)
+	if !ok {
+		return nil, 0, fmt.Errorf("%w: adaptive quantization planning memory", ErrLimit)
+	}
+	var flags [2]uint8
+	columns := len(source.header.columns) - 1
+	for tile := range count {
+		x, y := tile%columns, tile/columns
+		macros := uint64(source.header.columns[x+1]-source.header.columns[x]) * uint64(source.header.rows[y+1]-source.header.rows[y])
+		for index, plane := range [2]*jxrPlane{&source.primary, source.alpha} {
+			if plane == nil {
+				continue
+			}
+			var values TileQuantization
+			if q := configuration[index]; q != nil && len(q.Tiles) != 0 {
+				values = q.Tiles[tile]
+			}
+			channels := plane.channels
+			if index == 1 && options.Alpha == nil {
+				channels = source.primary.channels
+			}
+			work, fields, err := checkJXRQuantTile(ctx, values, plane, channels, macros)
+			if err != nil {
+				return nil, 0, err
+			}
+			if work > maximum-memory {
+				return nil, 0, fmt.Errorf("%w: adaptive quantization collections", ErrLimit)
+			}
+			memory += work
+			flags[index] |= fields
+		}
+	}
+	for index, plane := range [2]*jxrPlane{&source.primary, source.alpha} {
+		if plane != nil {
+			plane.dcUniform = flags[index]&1 == 0
+			plane.lpUniform = flags[index]&2 == 0
+			plane.hpUniform = flags[index]&4 == 0
+		}
+	}
+	result := make([]jxrTileSetting, count)
+	for tile := range result {
+		result[tile].trim = options.Trim
+		for index, plane := range [2]*jxrPlane{&source.primary, source.alpha} {
+			if plane == nil {
+				continue
+			}
+			var values TileQuantization
+			q := configuration[index]
+			if q != nil && len(q.Tiles) != 0 {
+				values = q.Tiles[tile]
+			}
+			value, err := copyJXRQuantTile(ctx, values, plane, q != nil && len(q.Tiles) != 0)
+			if err != nil {
+				return nil, 0, err
+			}
+			if err := checkJXRTileQuant(plane, &value); err != nil {
+				return nil, 0, err
+			}
+			result[tile].quant[index] = value
+		}
+	}
+	return result, retained, ctx.Err()
+}
+
+// checkJXRQuantTile 校验单块集合、复用及核心索引，并计算精确容量的私有参数存储
+// 入参: ctx 当前上下文, values 公开分块参数, plane 目标平面, channels 来源向量允许的分量数, macros 核心宏块数
+// 返回: uint64 私有参数容量, uint8 改写的频带标志, error 参数或取消错误
+func checkJXRQuantTile(ctx context.Context, values TileQuantization, plane *jxrPlane, channels int, macros uint64) (uint64, uint8, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	if len(values.Lowpass) > 16 || len(values.Highpass) > 16 || values.UseDC && len(values.Lowpass) != 0 || values.UseLowpass && (len(values.Highpass) != 0 || len(values.HighpassIndex) != 0) {
+		return 0, 0, fmt.Errorf("%w: adaptive quantization collection or reuse", ErrInvalid)
+	}
+	if plane.bands == 3 && (len(values.Lowpass) != 0 || len(values.LowpassIndex) != 0 || values.UseDC) || plane.bands >= 2 && (len(values.Highpass) != 0 || len(values.HighpassIndex) != 0 || values.UseLowpass) {
+		return 0, 0, fmt.Errorf("%w: adaptive quantization omitted band", ErrInvalid)
+	}
+	if n := len(values.DC); n != 0 && n != 1 && n != channels {
+		return 0, 0, fmt.Errorf("%w: adaptive DC component count", ErrInvalid)
+	}
+	for _, groups := range [][][]uint8{values.Lowpass, values.Highpass} {
+		for _, vector := range groups {
+			if len(vector) != 0 && len(vector) != 1 && len(vector) != channels {
+				return 0, 0, fmt.Errorf("%w: adaptive collection component count", ErrInvalid)
+			}
+		}
+	}
+	lp, hp := max(1, len(values.Lowpass)), max(1, len(values.Highpass))
+	if values.UseLowpass {
+		hp = lp
+	}
+	for band, indices := range [][]uint8{values.LowpassIndex, values.HighpassIndex} {
+		if len(indices) != 0 && uint64(len(indices)) != macros {
+			return 0, 0, fmt.Errorf("%w: adaptive macroblock index count", ErrInvalid)
+		}
+		count := lp
+		if band == 1 {
+			count = hp
+		}
+		for index, value := range indices {
+			if index&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return 0, 0, err
+				}
+			}
+			if int(value) >= count {
+				return 0, 0, fmt.Errorf("%w: adaptive macroblock index", ErrInvalid)
+			}
+		}
+	}
+	flags := uint8(0)
+	if len(values.DC) != 0 {
+		flags |= 1
+	}
+	if len(values.Lowpass) != 0 || len(values.LowpassIndex) != 0 || values.UseDC {
+		flags |= 2
+	}
+	if len(values.Highpass) != 0 || len(values.HighpassIndex) != 0 || values.UseLowpass {
+		flags |= 4
+	}
+	work := uint64(plane.channels) + uint64(lp+hp)*uint64(24+plane.channels) + uint64(len(values.LowpassIndex)) + uint64(len(values.HighpassIndex))
+	return work, flags, nil
+}
+
+// copyJXRQuantTile 在已完成容量预检后复制单块参数，宏块索引只属于核心而不包含软重叠邻域
+// 入参: ctx 当前上下文, values 公开分块参数, plane 目标平面, adaptive 是否来自公开分块配置
+// 返回: jxrTileQuant 独占参数, error 取消错误
+func copyJXRQuantTile(ctx context.Context, values TileQuantization, plane *jxrPlane, adaptive bool) (jxrTileQuant, error) {
+	q := jxrTileQuant{adaptive: adaptive, useDC: values.UseDC, useLP: values.UseLowpass}
+	q.dc = expandJXRQuantVector(values.DC, plane.dcQuant, plane.channels)
+	q.lpCount, q.hpCount = max(1, len(values.Lowpass)), max(1, len(values.Highpass))
+	if q.useDC {
+		q.lp = [][]uint8{q.dc}
+	} else {
+		q.lp = make([][]uint8, q.lpCount)
+		for index := range q.lp {
+			var vector []uint8
+			if len(values.Lowpass) != 0 {
+				vector = values.Lowpass[index]
+			}
+			q.lp[index] = expandJXRQuantVector(vector, plane.lpQuant, plane.channels)
+			if len(values.Lowpass) != 0 && len(vector) == 0 {
+				clear(q.lp[index])
+			}
+		}
+	}
+	if q.useLP {
+		q.hpCount, q.hp = q.lpCount, q.lp
+	} else {
+		q.hp = make([][]uint8, q.hpCount)
+		for index := range q.hp {
+			var vector []uint8
+			if len(values.Highpass) != 0 {
+				vector = values.Highpass[index]
+			}
+			q.hp[index] = expandJXRQuantVector(vector, plane.hpQuant, plane.channels)
+			if len(values.Highpass) != 0 && len(vector) == 0 {
+				clear(q.hp[index])
+			}
+		}
+	}
+	var err error
+	q.lpIndex, err = copyJXRQuantIndex(ctx, values.LowpassIndex)
+	if err != nil {
+		return jxrTileQuant{}, err
+	}
+	q.hpIndex, err = copyJXRQuantIndex(ctx, values.HighpassIndex)
+	return q, err
+}
+
+// expandJXRQuantVector 将已校验的单值或分量向量展开为精确长度存储，透明度取来源首分量
+// 入参: values 可选覆盖值, fallback 默认向量, channels 目标分量数
+// 返回: []uint8 独占逐分量参数
+func expandJXRQuantVector(values, fallback []uint8, channels int) []uint8 {
+	if len(values) == 0 {
+		values = fallback
+	}
+	result := make([]uint8, channels)
+	for index := range result {
+		if len(values) == 1 || channels == 1 && len(values) != 0 {
+			result[index] = values[0]
+		} else if len(values) != 0 {
+			result[index] = values[index]
+		}
+	}
+	return result
+}
+
+// copyJXRQuantIndex 分段复制已预留额度的宏块索引，避免大表复制长时间忽略取消
+// 入参: ctx 当前上下文, source 来源索引
+// 返回: []uint8 精确容量副本, error 取消错误
+func copyJXRQuantIndex(ctx context.Context, source []uint8) ([]uint8, error) {
+	if source == nil {
+		return nil, ctx.Err()
+	}
+	result := make([]uint8, len(source))
+	for at := 0; at < len(source); at += 16384 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		copy(result[at:min(at+16384, len(source))], source[at:min(at+16384, len(source))])
+	}
+	return result, ctx.Err()
+}
+
+// checkJXRQuantizationGeometry 无分块参数分配地预检多图配置，保证后图错误不在首图提交后才发现
+// 入参: ctx 当前上下文, info 已规范化原生描述, options 含明确分块尺寸的选项
+// 返回: error 网格、集合、索引或取消错误
+func checkJXRQuantizationGeometry(ctx context.Context, info Info, options EncodeOptions) error {
+	configuration := [2]*Quantization{options.Quantization, nil}
+	alphaBand := options.Band
+	if info.Alpha {
+		configuration[1] = options.Quantization
+		if options.Alpha != nil {
+			configuration[1], alphaBand = options.Alpha.Quantization, options.Alpha.Band
+		}
+	}
+	active := false
+	for _, q := range configuration {
+		active = active || q != nil && len(q.Tiles) != 0
+	}
+	if !active {
+		return ctx.Err()
+	}
+	if options.TileSize.X <= 0 || options.TileSize.Y <= 0 {
+		return fmt.Errorf("%w: adaptive tile geometry", ErrInvalid)
+	}
+	format, err := rasterPixelFormat(info)
+	if err != nil {
+		return err
+	}
+	width, height := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
+	if jxrInputTransform(info, format.color, uint8(options.Orientation))&4 != 0 {
+		width, height = height, width
+	}
+	width, height = (width+15)/16, (height+15)/16
+	sx, sy := uint64(options.TileSize.X/16), uint64(options.TileSize.Y/16)
+	if sx == 0 || sy == 0 {
+		return fmt.Errorf("%w: adaptive tile macroblock geometry", ErrInvalid)
+	}
+	columns, rows := (width+sx-1)/sx, (height+sy-1)/sy
+	if columns == 0 || rows == 0 || columns > 4096 || rows > 4096 {
+		return fmt.Errorf("%w: adaptive tile partition geometry", ErrLimit)
+	}
+	for _, q := range configuration {
+		if q != nil && len(q.Tiles) != 0 && uint64(len(q.Tiles)) != columns*rows {
+			return fmt.Errorf("%w: adaptive quantization tile count", ErrInvalid)
+		}
+	}
+	for tile := uint64(0); tile < columns*rows; tile++ {
+		w, h := min(sx, width-tile%columns*sx), min(sy, height-tile/columns*sy)
+		for index, q := range configuration {
+			if q == nil || len(q.Tiles) == 0 {
+				continue
+			}
+			plane := jxrPlane{channels: info.Channels, bands: uint8(options.Band)}
+			channels := info.Channels
+			if index == 1 {
+				plane.channels, plane.bands = 1, uint8(alphaBand)
+				if options.Alpha != nil {
+					channels = 1
+				}
+			}
+			if _, _, err := checkJXRQuantTile(ctx, q.Tiles[tile], &plane, channels, w*h); err != nil {
+				return err
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// encodeJXRNative 完成原生图像的头部、变换、分块编码及文件封装，阶段间共用输出容量预算
+// 独立码流不携带分辨率或ICC，不将缺少文件GUID的原生格式隐式转换为RGB
+// 入参: ctx 已规范化取消上下文, raster 原生图像, layout 编码布局, options 输出参数，内存上限包含原图存储
+// 返回: []byte 完整文件或独立码流, error 格式、精度、资源或取消错误
+func encodeJXRNative(ctx context.Context, raster *Raster, layout jxrStream, options jxrNativeOutput) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if options.format != FormatJXR && options.format != FormatCodestream || options.stream.budget != nil {
+		return nil, fmt.Errorf("%w: JPEG XR native output format or budget", ErrInvalid)
+	}
+	rasterWork, err := jxrRasterWork(raster, options.stream.maxMemory)
+	if err != nil {
+		return nil, err
+	}
+	if options.stream.maxBytes == 0 {
+		return nil, &LimitError{Resource: "JPEG XR native output bytes", Limit: 0, Required: 1}
+	}
+	if rasterWork >= options.stream.maxMemory {
+		return nil, &LimitError{Resource: "JPEG XR native output memory", Limit: options.stream.maxMemory, Required: jxrSaturatedAdd(rasterWork, 1)}
+	}
+	var identifier [16]byte
+	var pixelFormat jxrPixelFormat
+	if options.format == FormatJXR {
+		identifier, pixelFormat, err = jxrRasterIdentifier(raster.info, options.pixelFormat)
+		if err != nil {
+			return nil, err
+		}
+	} else if options.pixelFormat != ([16]byte{}) {
+		return nil, fmt.Errorf("%w: JPEG XR identifier in bare codestream", ErrInvalid)
+	}
+	available := options.stream.maxMemory - rasterWork
+	s, err := newJXRInputStream(ctx, raster, layout, options.stream.maxPixels, available)
+	if err != nil {
+		return nil, jxrPlanLimitError(err, options.stream.maxMemory, rasterWork)
+	}
+	if options.format == FormatJXR {
+		validation := uint64(32768) + uint64(len(s.packets))*8 + uint64(len(s.header.columns)+len(s.header.rows)+len(s.profiles))*4
+		if validation >= available {
+			return nil, &LimitError{Resource: "JPEG XR file validation memory", Limit: available, Required: jxrSaturatedAdd(validation, 1)}
+		}
+		available -= validation
+	}
+	coeff, err := forwardJXRNative(ctx, raster, &s, &options.stream, available)
+	if err != nil {
+		return nil, err
+	}
+	settingsWork, err := options.stream.tileWork(ctx, available)
+	if err != nil {
+		return nil, err
+	}
+	work, ok := jxrWorkTotal(available, coeff.outputWork(&s), uint64(len(s.packets))*8, settingsWork)
+	if !ok || work >= available {
+		required := jxrSaturatedAdd(coeff.outputWork(&s), jxrSaturatedAdd(uint64(len(s.packets))*8, jxrSaturatedAdd(settingsWork, 1)))
+		return nil, &LimitError{Resource: "JPEG XR native stream working memory", Limit: available, Required: required}
+	}
+	budget := jxrWriteBudget{limit: available - work}
+	options.stream.maxMemory, options.stream.budget = available, &budget
+	data, err := coeff.writeStream(ctx, &s, options.stream)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if options.format == FormatCodestream {
+		return data, nil
+	}
+	c := jxrContainer{width: s.header.width, height: s.header.height, transform: uint32(s.header.transform), format: pixelFormat, pixelFormat: identifier, image: data, imageBands: uint32(s.primary.bands), profiles: s.profiles, dpi: raster.info.Resolution, colorHint: raster.info.ColorHint, encoding: raster.info.ColorEncoding, imageType: raster.info.ImageType}
+	if s.header.transform&4 != 0 {
+		c.dpi.X, c.dpi.Y = c.dpi.Y, c.dpi.X
+	}
+	if len(raster.info.ICCProfile) != 0 {
+		c.profile = raster.info.ICCProfile
+	}
+	w := newJXRBitWriter(ctx, options.stream.maxBytes, budget.limit)
+	w.budget = &budget
+	writeJXRContainer(&w, &c, options.stream.maxPixels)
+	if w.err != nil {
+		return nil, w.err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return w.data, nil
+}
+
+// forwardJXRNative 共用原生编码的量化预检、样本装载及正变换，不生成完整压缩输出
+// 入参: ctx 已规范化上下文, raster 原生图像, s 已校验头部, options 精度及分块参数, available 除原图外可用容量
+// 返回: jxrCoefficientImage 完整系数图像, error 格式、精度、资源或取消错误
+func forwardJXRNative(ctx context.Context, raster *Raster, s *jxrStream, options *jxrStreamOutput, available uint64) (jxrCoefficientImage, error) {
+	var planes [2]*jxrCoefficients
+	return forwardJXRNativeWindowStorage(ctx, raster, s, options, available, &planes, nil)
+}
+
+// forwardJXRNativeWindowStorage 共用样本容量及参数预检，可选择完整变换或仅软重叠核心
+// 入参: ctx 当前上下文, raster 原生输入, s 已校验布局, options 编码精度, available 活跃容量, planes 独占缓冲, window 为空时完整变换
+// 返回: jxrCoefficientImage 当前系数视图, error 参数、容量、数值或取消错误
+func forwardJXRNativeWindowStorage(ctx context.Context, raster *Raster, s *jxrStream, options *jxrStreamOutput, available uint64, planes *[2]*jxrCoefficients, window *jxrForwardWindow) (jxrCoefficientImage, error) {
+	if s == nil || options == nil || planes == nil || s.alpha == nil && planes[1] != nil {
+		return jxrCoefficientImage{}, fmt.Errorf("%w: JPEG XR forward storage layout", ErrInvalid)
+	}
+	if options.tiles == nil {
+		q := [2]jxrTileQuant{newJXRTileQuant(&s.primary)}
+		if s.alpha != nil {
+			q[1] = newJXRTileQuant(s.alpha)
+		}
+		options.tiles = []jxrTileSetting{{quant: q}}
+	}
+	tiles := (len(s.header.columns) - 1) * (len(s.header.rows) - 1)
+	if len(options.tiles) != 1 && len(options.tiles) != tiles {
+		return jxrCoefficientImage{}, fmt.Errorf("%w: JPEG XR native tile settings", ErrInvalid)
+	}
+	settingsWork, err := options.tileWork(ctx, available)
+	if err != nil {
+		return jxrCoefficientImage{}, err
+	}
+	working, limit := s.coefficientWork(), available-settingsWork
+	if working >= limit {
+		return jxrCoefficientImage{}, &LimitError{Resource: "JPEG XR native coefficient memory", Limit: limit, Required: jxrSaturatedAdd(working, 1)}
+	}
+	for _, setting := range options.tiles {
+		if err := ctx.Err(); err != nil {
+			return jxrCoefficientImage{}, err
+		}
+		if setting.trim > 15 || !s.header.trim && setting.trim != 0 {
+			return jxrCoefficientImage{}, fmt.Errorf("%w: JPEG XR native trim", ErrInvalid)
+		}
+		for n, p := range [2]*jxrPlane{&s.primary, s.alpha} {
+			if p != nil {
+				if err := checkJXRTileQuant(p, &setting.quant[n]); err != nil {
+					return jxrCoefficientImage{}, err
+				}
+			}
+		}
+	}
+	count := uint64(s.header.columns[len(s.header.columns)-1]) * uint64(s.header.rows[len(s.header.rows)-1])
+	for index, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
+		storage := planes[index]
+		if plane == nil || storage == nil {
+			continue
+		}
+		if plane.channels < 1 || !storage.plane.equal(*plane) || storage.longWord != s.header.longWord {
+			return jxrCoefficientImage{}, fmt.Errorf("%w: reused JPEG XR transform plane", ErrInvalid)
+		}
+		for _, term := range [3][3]uint64{
+			{uint64(cap(storage.low)), count * uint64(plane.channels) * 16, 8},
+			{uint64(cap(storage.high)), count * uint64(plane.channels) * 256, 8},
+			{uint64(cap(storage.info)), count, 6},
+		} {
+			if term[0] < term[1] {
+				return jxrCoefficientImage{}, &LimitError{Resource: "reused JPEG XR transform capacity", Limit: term[0], Required: term[1]}
+			}
+			extra := term[0] - term[1]
+			if extra > (limit-working)/term[2] {
+				return jxrCoefficientImage{}, &LimitError{Resource: "retained JPEG XR transform capacity", Limit: limit, Required: jxrSaturatedAdd(working, jxrSaturatedMul(extra, term[2]))}
+			}
+			working += extra * term[2]
+			if working >= limit {
+				return jxrCoefficientImage{}, &LimitError{Resource: "retained JPEG XR transform capacity", Limit: limit, Required: jxrSaturatedAdd(working, 1)}
+			}
+		}
+	}
+	allocated := uint64(0)
+	for n, p := range [2]*jxrPlane{&s.primary, s.alpha} {
+		if p == nil {
+			continue
+		}
+		c := planes[n]
+		if c == nil {
+			var err error
+			c, err = newJXRTransformPlane(ctx, &s.header, p, available-allocated)
+			if err != nil {
+				return jxrCoefficientImage{}, err
+			}
+		} else {
+			if err := ctx.Err(); err != nil {
+				return jxrCoefficientImage{}, err
+			}
+			c.low, c.high, c.info = c.low[:int(count)*p.channels*16], c.high[:int(count)*p.channels*256], c.info[:int(count)]
+			c.plane = *p
+			clear(c.low)
+			clear(c.high)
+			clear(c.info)
+		}
+		planes[n] = c
+		c.workers = options.workers
+		amount := uint64(cap(c.low)+cap(c.high))*8 + uint64(cap(c.info))*6
+		if amount > available-allocated {
+			return jxrCoefficientImage{}, &LimitError{Resource: "retained JPEG XR transform capacity", Limit: available, Required: jxrSaturatedAdd(allocated, amount)}
+		}
+		allocated += amount
+		if err := c.loadSamples(ctx, raster, &s.header, n != 0, options.exact); err != nil {
+			return jxrCoefficientImage{}, err
+		}
+		var err error
+		if window == nil {
+			err = c.forward(ctx, &s.header)
+		} else {
+			err = c.forwardWindow(ctx, &s.header, *window)
+		}
+		if err != nil {
+			return jxrCoefficientImage{}, err
+		}
+	}
+	return jxrCoefficientImage{header: s.header, primary: *planes[0], alpha: planes[1]}, nil
+}
+
+// jxrRasterWork 计算原生图像已持有的样本、平面及元数据容量，不仅计算可见样本长度
+// 入参: raster 有效原生图像, maximum 总工作容量上限
+// 返回: uint64 原图存储预算, error 图像状态或资源错误
+func jxrRasterWork(raster *Raster, maximum uint64) (uint64, error) {
+	if raster == nil || raster.Bounds().Empty() || len(raster.info.Components) == 0 || raster.native == nil && len(raster.planes) == 0 || raster.native != nil && len(raster.planes) != 0 {
+		return 0, fmt.Errorf("%w: JPEG XR input raster storage", ErrInvalid)
+	}
+	work := uint64(512)
+	if raster.info.ColorEncoding != nil {
+		work += 4
+	}
+	for _, size := range []uint64{uint64(cap(raster.info.Components)) * 128, uint64(cap(raster.planes)) * 128, uint64(cap(raster.info.ICCProfile))} {
+		if work > maximum || size > maximum-work {
+			return 0, &LimitError{Resource: "JPEG XR retained raster metadata", Limit: maximum, Required: jxrSaturatedAdd(work, size)}
+		}
+		work += size
+	}
+	for n := -1; n < len(raster.planes); n++ {
+		plane := raster.native
+		if n >= 0 {
+			plane = &raster.planes[n]
+		}
+		if plane == nil {
+			continue
+		}
+		for _, size := range []uint64{uint64(cap(plane.values)) * 2, uint64(cap(plane.words)) * 4} {
+			if work > maximum || size > maximum-work {
+				return 0, &LimitError{Resource: "JPEG XR retained raster samples", Limit: maximum, Required: jxrSaturatedAdd(work, size)}
+			}
+			work += size
+		}
+	}
+	return work, nil
+}
+
+// jxrRasterIdentifier 选择与原生描述一致的标准GUID，优先保留已指定名称并采用非填充RGB格式
+// 入参: info 图像信息, specified 明确指定的标识，零值自动选择
+// 返回: [16]byte 标准标识, jxrPixelFormat 文件格式, error 格式或绑定错误
+func jxrRasterIdentifier(info Info, specified [16]byte) ([16]byte, jxrPixelFormat, error) {
+	format, err := rasterPixelFormat(info)
+	if err != nil {
+		return [16]byte{}, jxrPixelFormat{}, err
+	}
+	if specified != ([16]byte{}) {
+		candidate, err := readJXRPixelFormat(specified[:])
+		if err != nil {
+			return [16]byte{}, jxrPixelFormat{}, err
+		}
+		if candidate.name == "BlackWhite" && format.depth == 15 {
+			candidate.depth = 15
+		}
+		if !jxrPixelFormatMatches(candidate, format) {
+			return [16]byte{}, jxrPixelFormat{}, fmt.Errorf("%w: JPEG XR requested output pixel format", ErrInvalid)
+		}
+		return specified, candidate, nil
+	}
+	var fallback [16]byte
+	var selected jxrPixelFormat
+	for id := byte(5); id <= 0x56; id++ {
+		candidate, ok := jxrLookupPixelFormatID(id, format.depth)
+		if !ok || !jxrPixelFormatMatches(candidate, format) {
+			continue
+		}
+		var identifier [16]byte
+		copy(identifier[:], jxrPixelPrefix)
+		identifier[15] = id
+		if candidate.name == info.PixelFormat {
+			return identifier, candidate, nil
+		}
+		if fallback == ([16]byte{}) || id == 0x0d && format.color == 7 && format.depth == 1 && !format.alpha {
+			fallback, selected = identifier, candidate
+		}
+	}
+	if fallback == ([16]byte{}) {
+		return fallback, selected, fmt.Errorf("%w: JPEG XR container cannot describe native pixel format", ErrUnsupported)
+	}
+	return fallback, selected, nil
+}
+
+// jxrPlanLimitError 将零分配规划预检哨兵转换为包含真实额度的资源上限错误
+// 入参: err 规划阶段返回的错误, limit 当前总内存上限, retained 已占用常驻容量
+// 返回: error 原错误或带真实额度的资源错误
+func jxrPlanLimitError(err error, limit, retained uint64) error {
+	if err == errJXREncodingPlanMemory || err == errJXRInputHeaderMemory {
+		return &LimitError{Resource: "encoding plan memory", Limit: limit, Required: jxrSaturatedAdd(retained, jxrInputHeaderReserve)}
+	}
+	return err
+}
+
+// EncodeRaster 编码原生分量，不进行ICC转换、解除预乘或隐式重采样
+// 编码失败不写入输出流，底层写入失败可能已输出部分字节；不关闭调用方输出流
+// 入参: ctx 取消上下文，nil采用Background, w 输出流, raster 原生图像, opts 编码选项，nil采用无损JXR
+// 返回: error 格式、精度、资源、取消或写入错误
+func EncodeRaster(ctx context.Context, w io.Writer, raster *Raster, opts *EncodeOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return wrapJXRError("EncodeRaster", encodeRasterCore(ctx, w, raster, opts))
+}
+
+// encodeRasterCore 执行原生图像编码与写入核心逻辑，由外层公开入口统一包装错误操作名
+// 入参: ctx 已规范化取消上下文, w 输出流, raster 原生图像, opts 编码选项
+// 返回: error 格式、精度、资源、取消或写入错误
+func encodeRasterCore(ctx context.Context, w io.Writer, raster *Raster, opts *EncodeOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if w == nil || raster == nil {
+		return fmt.Errorf("%w: nil output or raster", ErrInvalid)
+	}
+	if raster.info.ImageType&ImageTypePreview != 0 && (opts == nil || opts.Format != FormatCodestream) {
+		return fmt.Errorf("%w: JPEG XR preview requires corresponding image", ErrInvalid)
+	}
+	data, err := encodeRasterData(ctx, raster, opts)
+	if err != nil {
+		return err
+	}
+	return writeEncoderOutput(ctx, w, data)
+}
+
+// encodeRasterData 编码一幅完整原生图像，是否为多图文件中的预览图由外层容器操作校验
+// 入参: ctx 已规范化的取消上下文, raster 原生图像, opts 编码选项
+// 返回: []byte 独占编码缓冲, error 格式、精度、资源或取消错误
+func encodeRasterData(ctx context.Context, raster *Raster, opts *EncodeOptions) ([]byte, error) {
+	if opts != nil && opts.SeparateAlpha {
+		return encodeJXRSeparateAlpha(ctx, raster, *opts)
+	}
+	layout, output, err := makeJXREncodingPlan(ctx, raster, opts)
+	if err != nil {
+		if err == errJXREncodingPlanMemory || err == errJXRInputHeaderMemory {
+			retained, _ := jxrRasterWork(raster, output.stream.maxMemory)
+			return nil, jxrPlanLimitError(err, output.stream.maxMemory, retained)
+		}
+		return nil, err
+	}
+	return encodeJXRNative(ctx, raster, layout, output)
+}
+
+// writeEncoderOutput 分段写入完整编码数据，保留底层错误并拒绝无错误的短写入
+// 入参: ctx 取消上下文, w 输出流, data 完整编码数据
+// 返回: error 写入协议、底层或取消错误
+func writeEncoderOutput(ctx context.Context, w io.Writer, data []byte) error {
+	for len(data) != 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		part := data[:min(len(data), 32768)]
+		n, err := w.Write(part)
+		if n < 0 || n > len(part) {
+			return fmt.Errorf("%w: output write count", ErrInvalid)
+		}
+		if err != nil {
+			return err
+		}
+		if n != len(part) {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return ctx.Err()
+}
+
+// sameInterfaceTarget 比较两个接口值是否指向同一底层对象，不可比较类型安全返回false
+// 入参: a, b 接口值
+// 返回: bool 是否为同一对象
+func sameInterfaceTarget(a, b any) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return a == b
+}
+
+// encodeJXRCodestreamTilesSequential 从可重读提供器两遍编码独立码流到普通Writer，不持有整幅原图或拼接完整压缩结果
+// 入参: ctx 已规范化上下文, w 顺序输出, info 原生描述, read 可重读逐块提供器, opts 明确分块参数
+// 返回: error 参数、能力、精度、资源、源、取消或写入错误
+func encodeJXRCodestreamTilesSequential(ctx context.Context, w io.Writer, info Info, read RasterTileReader, opts *EncodeOptions) error {
+	var settings EncodeOptions
+	if opts != nil {
+		settings = *opts
+	}
+	if err := checkJXREncodeOptions(settings); err != nil {
+		return err
+	}
+	if settings.Format != FormatUnknown && settings.Format != FormatCodestream || settings.SeparateAlpha || settings.TileSize.X == 0 || settings.TileSize.Y == 0 {
+		return fmt.Errorf("%w: sequential tile input requires explicit bare-stream tiles", ErrUnsupported)
+	}
+	settings.Format = FormatCodestream
+	info, retained, err := prepareJXRTileInfo(ctx, info, settings)
+	if err != nil {
+		return err
+	}
+	metadata := Raster{info: info}
+	source, output, err := makeJXREncodingPlanRetained(ctx, &metadata, &settings, retained)
+	if err != nil {
+		return jxrPlanLimitError(err, output.stream.maxMemory, retained)
+	}
+	plan, options, err := newJXRForwardPlan(ctx, &source, output.stream, retained)
+	if err != nil {
+		return err
+	}
+	options.maxMemory -= retained
+	return encodeJXRForwardPasses(ctx, w, plan, func(destination io.WriteSeeker) error {
+		return encodeJXRProvidedTilesTo(ctx, destination, info, &source, options, read)
+	})
+}
+
+// newJXRForwardPlan 共用整图及提供器输入的有界包目录规划，并预留仍活动的源描述和原编码参数
+// 入参: ctx 当前上下文, source 完整编码几何, options 当前输出参数, retained 源图或描述容量
+// 返回: *jxrForwardPlan 两遍共享目录, jxrStreamOutput 扣除规划后的参数, error 几何或容量错误
+func newJXRForwardPlan(ctx context.Context, source *jxrStream, options jxrStreamOutput, retained uint64) (*jxrForwardPlan, jxrStreamOutput, error) {
+	if source == nil || len(source.header.columns) < 2 || len(source.header.rows) < 2 || len(source.header.columns) > 4097 || len(source.header.rows) > 4097 || source.primary.bands > 3 {
+		return nil, options, fmt.Errorf("%w: sequential planning geometry", ErrInvalid)
+	}
+	count := uint64(len(source.header.columns)-1) * uint64(len(source.header.rows)-1)
+	if source.header.frequency {
+		count *= uint64(4 - source.primary.bands)
+	}
+	if count == 0 || count > uint64(^uint(0)>>1)/48 {
+		return nil, options, &LimitError{Resource: "sequential packet directory", Limit: uint64(^uint(0)>>1) / 48, Required: count}
+	}
+	settingsWork, err := options.tileWork(ctx, options.maxMemory)
+	if err != nil {
+		return nil, options, err
+	}
+	reserved := uint64(512) + count*48
+	for _, amount := range []uint64{source.headerWork(), settingsWork, retained} {
+		if reserved > options.maxMemory || amount > options.maxMemory-reserved {
+			return nil, options, &LimitError{Resource: "sequential retained planning memory", Limit: options.maxMemory, Required: jxrSaturatedAdd(reserved, amount)}
+		}
+		reserved += amount
+	}
+	reserved -= retained
+	plan := &jxrForwardPlan{packets: make([]jxrForwardPacket, int(count))}
+	options.maxMemory -= reserved
+	options.forward = plan
+	return plan, options, nil
+}
+
+// encodeJXRForwardPasses 先测量并校验完整包目录，再以只前进的Writer提交相同内容，不重用上一遍的系数或包缓存
+// 入参: ctx 当前上下文, w 顺序输出, plan 共享目录, encode 每遍重新创建独占状态的编码器
+// 返回: error 任一遍资源、数据、源、取消或输出错误
+func encodeJXRForwardPasses(ctx context.Context, w io.Writer, plan *jxrForwardPlan, encode func(io.WriteSeeker) error) error {
+	counting := jxrCountingSeeker{}
+	if err := encode(&counting); err != nil {
+		return err
+	}
+	if plan.total > math.MaxInt64 || counting.position != int64(plan.total) || counting.length != int64(plan.total) {
+		return fmt.Errorf("%w: sequential encoded extent", ErrInvalid)
+	}
+	plan.ready = true
+	forward := jxrForwardWriter{writer: w}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return encode(&forward)
+}
+
+// Write 累加本次虚拟写入范围，不分配输出缓冲或忽略有符号地址溢出
+// 入参: data 当前头部、包或回填字节
+// 返回: int 计入长度, error 地址错误
+func (w *jxrCountingSeeker) Write(data []byte) (int, error) {
+	if w.position < 0 || int64(len(data)) > math.MaxInt64-w.position {
+		return 0, fmt.Errorf("%w: sequential count address", ErrLimit)
+	}
+	w.position += int64(len(data))
+	w.length = max(w.length, w.position)
+	return len(data), nil
+}
+
+// Seek 模拟已经写入范围内的索引回填，不允许创建空洞或无效位置
+// 入参: offset 位移, whence 定位基准
+// 返回: int64 新位置, error 定位错误
+func (w *jxrCountingSeeker) Seek(offset int64, whence int) (int64, error) {
+	base := int64(0)
+	switch whence {
+	case io.SeekStart:
+	case io.SeekCurrent:
+		base = w.position
+	case io.SeekEnd:
+		base = w.length
+	default:
+		return 0, fmt.Errorf("%w: sequential count seek origin", ErrInvalid)
+	}
+	if offset < -base || offset > w.length-base {
+		return 0, fmt.Errorf("%w: sequential count seek range", ErrInvalid)
+	}
+	w.position = base + offset
+	return w.position, nil
+}
+
+// Write 原样转发顺序写入并仅累计合法的实际写入量，协议错误仍交由共用写入检查传播
+// 入参: data 当前输出字节
+// 返回: int 实际写入量, error 原始写入错误
+func (w *jxrForwardWriter) Write(data []byte) (int, error) {
+	count, err := w.writer.Write(data)
+	if count >= 0 && count <= len(data) {
+		w.position += int64(count)
+	}
+	return count, err
+}
+
+// Seek 只允许查询当前位置，任何需要回退或跳过的生产路径都属于非定位输出能力错误
+// 入参: offset 须为零, whence 须为SeekCurrent
+// 返回: int64 当前位置, error 不支持的定位请求
+func (w *jxrForwardWriter) Seek(offset int64, whence int) (int64, error) {
+	if offset != 0 || whence != io.SeekCurrent {
+		return 0, fmt.Errorf("%w: sequential output cannot seek", ErrUnsupported)
+	}
+	return w.position, nil
+}
