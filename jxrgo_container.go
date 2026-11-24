@@ -102,7 +102,7 @@ type jxrReaderAt struct {
 	buffer [4096]byte
 }
 
-// jxrLevel 保存T.832表B.1的级别及尺寸、分块和缓冲上限
+// jxrLevel 保存级别及尺寸、分块和缓冲上限
 type jxrLevel struct {
 	level                              uint8
 	dimension, tiles, tileSize, buffer uint64
@@ -314,7 +314,7 @@ func (parser *jxrParser) directoryContainer(d *jxrDirectory, maxPixels uint64) (
 	return c, c.checkProfile(parser, maxPixels)
 }
 
-// directoryFields 读取附录A标签与码流位置，供已解析码流的入口共用
+// directoryFields 读取容器目录标签与码流位置，供已解析码流的入口共用
 // 入参: d 已校验原始目录视图, maxPixels 图像像素上限
 // 返回: jxrContainer 解析得到的容器元数据, error 标签、格式或资源错误
 func (parser *jxrParser) directoryFields(d *jxrDirectory, maxPixels uint64) (jxrContainer, error) {
@@ -771,12 +771,9 @@ func copyJXRContainerData(b *jxrBitWriter, offset uint64, data []byte) {
 	}
 }
 
-// NewDecoderAt 按需读取JPEG XR附录A文件或独立码流，不持有完整压缩输入
-// size指定从零开始的输入字节范围，仍受MaxInputBytes约束；ICC等元数据在预算内独立复制
-// r须在解码器存续期间保持稳定且可读取，Close不关闭r；解码器串行访问自己的固定读取窗
-// 内存预算包含固定窗、头部和索引，后续区域解码只读取所需包及最多4096字节的预取
-// 构造时另检查常驻存储与单份Info副本的总容量，不计调用方持有的既往返回值
-// 入参: ctx 构造阶段上下文，nil采用Background, r 随机输入, size 码流长度, opts 解码资源限制
+// NewDecoderAt 按需读取JPEG XR容器或独立码流，size受MaxInputBytes约束，不持有完整压缩输入
+// r在解码器存续期间须保持稳定可读且Close不关闭r，构造时在内存预算内校验固定读取窗、头部、索引及单份Info副本
+// 入参: ctx Context，nil采用Background, r 随机输入, size 码流长度, opts 解码选项，nil采用默认上限
 // 返回: *Decoder 可复用解码器, error 结构、能力、读取、资源或取消错误
 func NewDecoderAt(ctx context.Context, r io.ReaderAt, size int64, opts *DecodeOptions) (*Decoder, error) {
 	if ctx == nil {
@@ -790,7 +787,7 @@ func NewDecoderAt(ctx context.Context, r io.ReaderAt, size int64, opts *DecodeOp
 }
 
 // newDecoderAt 执行NewDecoderAt的核心解析逻辑，由公开入口统一归一化错误
-// 入参: ctx 已规范化上下文, r 随机输入, size 码流长度, opts 解码选项
+// 入参: ctx 已规范化Context, r 随机输入, size 码流长度, opts 解码选项
 // 返回: *Decoder 可复用解码器, error 解析或资源错误
 func newDecoderAt(ctx context.Context, r io.ReaderAt, size int64, opts *DecodeOptions) (*Decoder, error) {
 	if err := ctx.Err(); err != nil {
@@ -977,8 +974,8 @@ func (r *jxrReaderAt) storageWork() uint64 {
 	return jxrReaderAtWork
 }
 
-// bindInputContext 为独占操作设置随机读取上下文，nil释放已经结束的上下文引用
-// 入参: ctx 当前操作上下文或nil
+// bindInputContext 为独占操作设置随机读取Context，nil释放已结束的Context引用
+// 入参: ctx 当前操作Context或nil
 func (d *Decoder) bindInputContext(ctx context.Context) {
 	if d.fileInput != nil {
 		d.fileInput.ctx = ctx
@@ -986,8 +983,8 @@ func (d *Decoder) bindInputContext(ctx context.Context) {
 	d.source.bindLogicalContext(ctx)
 }
 
-// bindLogicalContext 为逻辑样本视图绑定或释放操作上下文，不修改共享文件的上下文
-// 入参: ctx 当前操作上下文或nil
+// bindLogicalContext 为逻辑样本视图绑定或释放操作Context，不修改共享文件的Context
+// 入参: ctx 当前操作Context或nil
 func (source *jxrRasterSource) bindLogicalContext(ctx context.Context) {
 	if source.primary.input != nil {
 		source.primary.input.ctx = ctx
@@ -1039,8 +1036,8 @@ func (parser *jxrParser) directoryAt(input *jxrReaderAt, offset uint64) (jxrDire
 	return directory, nil
 }
 
-// fileDecoderAt 解析附录A首目录及双流有界视图，不持有目录临时缓冲或完整压缩文件
-// 入参: ctx 构造上下文, input 已预留固定窗的完整文件视图, parser 共享解析预算, limits 解码上限
+// fileDecoderAt 解析容器首目录及双流有界视图，不持有目录临时缓冲或完整压缩文件
+// 入参: ctx Context, input 已预留固定窗的完整文件视图, parser 共享解析预算, limits 解码上限
 // 返回: *Decoder 独立元数据及随机源, error 容器、码流、读取或资源错误
 func fileDecoderAt(ctx context.Context, input *jxrReaderAt, parser *jxrParser, limits Limits) (*Decoder, error) {
 	if input.size > math.MaxUint32 {
@@ -1081,7 +1078,7 @@ func fileDecoderAt(ctx context.Context, input *jxrReaderAt, parser *jxrParser, l
 }
 
 // imageDirectoryAt 取得已经通过文件头校验的目录，随机输入分配受调用方剩余容量约束
-// 入参: ctx 当前操作上下文, offset 全文件偏移, maximum 本次目录可用临时容量
+// 入参: ctx Context, offset 全文件偏移, maximum 本次目录可用临时容量
 // 返回: jxrDirectory 原始目录视图, error 目录、资源或读取错误
 func (d *Decoder) imageDirectoryAt(ctx context.Context, offset, maximum uint64) (jxrDirectory, error) {
 	if d.fileInput == nil {
@@ -1267,7 +1264,7 @@ func (s *jxrRasterSource) sampleCount() uint64 {
 	return samples
 }
 
-// jxrWritableProfileLevel 只允许附录B明列的输出档位和级别，解码端保留值解释不授权编码端写出
+// jxrWritableProfileLevel 检查档位与级别组合是否允许编码输出，拒绝保留值
 // 入参: declaration 待输出声明
 // 返回: bool 是否为已定义且保留位全零的输出组合
 func jxrWritableProfileLevel(declaration jxrProfileLevel) bool {
@@ -1287,8 +1284,7 @@ func jxrWritableProfileLevel(declaration jxrProfileLevel) bool {
 	}
 }
 
-// profiles 按8.6及A.7.22预扫描声明，以输入范围、可寻址容量和共享预算约束分配
-// 去重键包含保留位但不含终止位，成功仅保留结果容量，失败归还全部新增预留
+// profiles 在输入范围与共享预算内预扫描并去重档次级别声明，失败时归还新增预留
 // 入参: b 码流读取器, end 声明区域的字节结束位置
 // 返回: []jxrProfileLevel 声明列表, error 数据或资源错误
 func (parser *jxrParser) profiles(b *jxrBits, end uint64) ([]jxrProfileLevel, error) {
@@ -1425,7 +1421,7 @@ func (s *jxrStream) profileAllowed(profile uint8, alpha bool) bool {
 	}
 }
 
-// checkLevel 检查表B.1及表B.2的级别约束，保留级别按标准取不低于它的最近已定义级别
+// checkLevel 检查级别对应的尺寸、分块、头部与缓冲约束，保留级别按不低于它的最近已定义级别处理
 // 入参: level 声明或推定的级别, channels 所属声明规定的分量数，包含透明度而不包含填充
 // 返回: error 尺寸、分块、头部或缓冲约束错误
 func (s *jxrStream) checkLevel(level uint8, channels int) error {

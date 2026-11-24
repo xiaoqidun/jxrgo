@@ -38,7 +38,7 @@ var jxrStandardPixelFormats = makeJXRPixelFormats()
 type ResampleFilter uint8
 
 // ResampleOptions 指定滤波及输出资源限制，零值采用最近邻，不计入调用方保留的原图
-// 双线性按原生数值域计算并按目标编码取最近偶数，不是线性光或颜色管理操作
+// 双线性按原生数值域计算并向最近偶数舍入，不执行线性光或颜色空间转换
 type ResampleOptions struct {
 	Filter ResampleFilter
 	Limits Limits
@@ -62,7 +62,7 @@ func jxrIntegerOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha
 	return jxrIntegerScaleComponents(h, p, values, color, count)
 }
 
-// jxrOutputCount 校验平面及表183的颜色组合，确定转换后有效分量数
+// jxrOutputCount 校验平面输出颜色组合，确定转换后有效分量数
 // 入参: h 图像头, p 当前平面, alpha 是否为透明度平面
 // 返回: int 输出分量数, error 平面或颜色组合错误
 func jxrOutputCount(h *jxrHeader, p *jxrPlane, alpha bool) (int, error) {
@@ -90,7 +90,7 @@ func jxrOutputCount(h *jxrHeader, p *jxrPlane, alpha bool) (int, error) {
 	}
 }
 
-// jxrColorOutputComponents 执行T.832表183规定的输出颜色转换，采样转换由调用方先行完成
+// jxrColorOutputComponents 执行输出颜色转换，采样转换由调用方先行完成
 // 入参: h 图像头, p 当前平面, values 原地转换的分量值, alpha 是否为透明度平面
 // 返回: int 输出分量数, error 颜色组合或数值范围错误
 func jxrColorOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha bool) (int, error) {
@@ -151,8 +151,7 @@ func jxrColorOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha b
 	return count, nil
 }
 
-// jxrIntegerScaleComponents 执行整数分量的偏置、缩放、范围裁剪和二值位模式转换
-// T.832表199将BD1BLACK1亮度反转为原生位模式
+// jxrIntegerScaleComponents 执行整数分量的偏置、缩放、范围裁剪及二值亮度位模式转换
 // 入参: h 图像头, p 当前平面, values 原地替换的分量值, color 输出颜色格式, count 分量数
 // 返回: int 输出分量数, error 数值范围或位深错误
 func jxrIntegerScaleComponents(h *jxrHeader, p *jxrPlane, values []int64, color uint8, count int) (int, error) {
@@ -247,9 +246,7 @@ func jxrIntegerScaleComponents(h *jxrHeader, p *jxrPlane, values []int64, color 
 	return count, nil
 }
 
-// jxrIntegerInput 将整数位模式转换为去偏置、预缩放的颜色样本，尚不执行颜色变换
-// 精确模式拒绝有效位丢弃，显式有损模式按附录D.1算术右移，不改变原始位模式
-// BD1BLACK1按T.832表199的逆运算恢复变换域使用的亮度方向
+// jxrIntegerInput 将整数位模式转换为去偏置预缩放颜色样本，精确模式拒绝有效位丢弃，不执行颜色变换
 // 入参: h 图像头, p 目标平面参数, bits 原生位模式, values 目标样本缓冲, alpha 是否为透明度平面, exact 是否要求输入精确恢复
 // 返回: int 输入颜色分量数, error 格式、范围或精度错误
 func jxrIntegerInput(h *jxrHeader, p *jxrPlane, bits []uint32, values []int64, alpha, exact bool) (int, error) {
@@ -403,7 +400,7 @@ func jxrFloatOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha b
 	return count, nil
 }
 
-// jxrFloatBits 按T.832表192恢复浮点位模式，保留符号、非规格化数及非有限数编码
+// jxrFloatBits 将输出缩放后的整数值恢复为浮点位模式，保留符号、非规格化数及非有限数编码
 // 入参: value 输出缩放后的整数值, depth 浮点位深, mantissa 有效尾数位数, bias 码流指数偏置
 // 返回: uint32 浮点位模式, error 参数或数值范围错误
 func jxrFloatBits(value int64, depth, mantissa uint8, bias int8) (uint32, error) {
@@ -445,8 +442,7 @@ func jxrFloatBits(value int64, depth, mantissa uint8, bias int8) (uint32, error)
 	return sign<<31 | uint32(exponent)<<23 | uint32(fraction)<<(23-mantissa), nil
 }
 
-// float64HalfBits 直接将双精度值舍入为IEEE半精度，保留符号零及非有限数类别
-// 不经过单精度中间值，避免半精度中点附近的二次舍入
+// float64HalfBits 直接将双精度值舍入为IEEE半精度位模式，保留符号零与非有限数并避免二次舍入
 // 入参: value 双精度数值
 // 返回: uint16 半精度位模式
 func float64HalfBits(value float64) uint16 {
@@ -519,8 +515,7 @@ func jxrFloatInput(h *jxrHeader, p *jxrPlane, bits []uint32, values []int64, alp
 	return count, nil
 }
 
-// jxrFloatInputBits 构造T.832表192的逆映射，允许舍入时选取数值最近的相邻编码
-// 等距采用偶数编码；符号零及非有限数的位模式变化不作为精确输入接受
+// jxrFloatInputBits 将浮点位模式逆映射为编码侧整数样本，舍入取最近偶数编码且精确模式拒绝位模式变化
 // 入参: bits 浮点位模式, depth 浮点位深, mantissa 尾数长度, bias 指数偏置, exact 是否要求位模式精确恢复
 // 返回: int64 编码样本, error 格式、精度或数值范围错误
 func jxrFloatInputBits(bits uint32, depth, mantissa uint8, bias int8, exact bool) (int64, error) {
@@ -601,7 +596,7 @@ func jxrFloatInputBits(bits uint32, depth, mantissa uint8, bias int8, exact bool
 	return value, nil
 }
 
-// jxrRGBEOutputComponents 按T.832表193转换共享指数的RGBE分量并裁剪到字节范围
+// jxrRGBEOutputComponents 转换共享指数RGBE分量并裁剪到字节范围
 // 入参: h 图像头, p 主平面, values 逐分量重建样本
 // 返回: [4]uint8 RGBE值, error 颜色或位深错误
 func jxrRGBEOutputComponents(h *jxrHeader, p *jxrPlane, values []int64) ([4]uint8, error) {
@@ -615,7 +610,7 @@ func jxrRGBEOutputComponents(h *jxrHeader, p *jxrPlane, values []int64) ([4]uint
 	return jxrRGBEPackComponents(p, values), nil
 }
 
-// jxrRGBEPackComponents 按T.832表193缩放RGB整数样本并构造共享指数，不重复执行颜色变换
+// jxrRGBEPackComponents 缩放RGB整数样本并打包为共享指数RGBE格式，不重复执行颜色变换
 // 入参: p 平面缩放参数, values 已通过数值校验的RGB样本
 // 返回: [4]uint8 RGBE值
 func jxrRGBEPackComponents(p *jxrPlane, values []int64) [4]uint8 {
@@ -874,7 +869,7 @@ func jxrFastUnsignedBitsComponents(h *jxrHeader, p *jxrPlane, values []int64, al
 }
 
 // decodeSubsampled 在独立网格中保留YCC420或YCC422分量，不进行未请求的色度上采样
-// 入参: ctx 取消上下文, state 重建主平面, views 主平面样本视图, alpha 透明度视图, alphaHeader 透明度头, alphaPlane 透明度参数, maxPixels RGBA64等价输出容量
+// 入参: ctx Context, state 重建主平面, views 主平面样本视图, alpha 透明度视图, alphaHeader 透明度头, alphaPlane 透明度参数, maxPixels RGBA64等价输出容量
 // 返回: *Raster 原生网格图像, error 分量、数值、资源或取消错误
 func (s *jxrRasterSource) decodeSubsampled(ctx context.Context, state *jxrCoefficientImage, views []jxrComponentView, alpha *jxrComponentView, alphaHeader *jxrHeader, alphaPlane *jxrCoefficients, maxPixels uint64) (*Raster, error) {
 	count := s.sampleCount()
@@ -948,7 +943,7 @@ func (s *jxrRasterSource) decodeSubsampled(ctx context.Context, state *jxrCoeffi
 	return raster, nil
 }
 
-// sampleJXRChroma 按T.832表180依次进行垂直及水平上采样，不分配整幅中间图像
+// sampleJXRChroma 依次执行色度垂直与水平上采样，不分配整幅中间图像
 // 入参: v 色度样本视图, p 平面参数, component 色度分量编号, x, y 亮度样本坐标
 // 返回: int64 上采样后的色度值
 func sampleJXRChroma(v *jxrComponentView, p *jxrPlane, component, x, y int) int64 {
@@ -977,12 +972,9 @@ func jxrSamplePosition(position, length int, centering uint8) (int, int, int64) 
 	return k, min(length-1, k+1), 4 - int64(centering)
 }
 
-// Resample 将原生分量显式重采样到指定大小的完整采样网格，保持颜色空间、ICC及预乘状态
-// 像素中心映射为(x+0.5)*原宽/新宽-0.5，随后按分量已知偏移和间隔定位，边界采用端点延拓
-// 最近邻中点选择较大坐标并保留位模式，RGBE双线性尚不支持
-// 双线性落在原样点时保留位模式，其余插值拒绝非有限贡献；分辨率随尺寸调整以保持物理大小
-// 未知分量相位返回错误；不猜测YCC或多通道的RGB解释，不替代压缩域降分辨率解码
-// 入参: ctx 取消上下文，nil采用Background, size 输出可见尺寸, opts 滤波及输出限制
+// Resample 将原生分量重采样到指定尺寸的完整采样网格并同步调整分辨率，保持颜色空间、ICC与预乘状态，opts为nil默认最近邻
+// 边界采用端点延拓，未知分量相位、RGBE双线性及双线性非有限插值返回错误，返回独立新图像
+// 入参: ctx Context，nil采用Background, size 输出可见尺寸, opts 滤波及输出限制
 // 返回: *Raster 独立完整采样原生图像, error 参数、相位、能力、数值、资源或取消错误
 func (r *Raster) Resample(ctx context.Context, size image.Point, opts *ResampleOptions) (*Raster, error) {
 	if ctx == nil {
@@ -996,7 +988,7 @@ func (r *Raster) Resample(ctx context.Context, size image.Point, opts *ResampleO
 }
 
 // resample 执行原生分量的几何重采样，由公开入口统一归一化错误
-// 入参: ctx 已规范化取消上下文, size 输出可见尺寸, opts 滤波及输出限制
+// 入参: ctx 已规范化Context, size 输出可见尺寸, opts 滤波及输出限制
 // 返回: *Raster 独立完整采样原生图像, error 参数、相位、能力、数值、资源或取消错误
 func (r *Raster) resample(ctx context.Context, size image.Point, opts *ResampleOptions) (*Raster, error) {
 	if err := ctx.Err(); err != nil {

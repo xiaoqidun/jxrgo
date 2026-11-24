@@ -22,12 +22,9 @@ import (
 	"math"
 )
 
-// ColorTransform 将原生颜色值及原透明度显式转换为非预乘sRGB，不改变原图
-// 调用方根据Raster.Info中的ICC、颜色声明及预乘状态建立变换；不提供默认ICC或多通道解释
-// samples不含透明度，保持原生数值域和预乘状态；切片仅在当前调用内有效，不得保留
-// alpha为原透明度数值，无透明度时为一；返回颜色只在最终显示输出时裁剪并量化
-// 入参: samples 当前像素颜色分量, alpha 当前像素原透明度
-// 返回: float64 红、绿、蓝sRGB值, error 调用方颜色变换错误
+// ColorTransform 将单个像素的原生颜色分量samples及原透明度alpha显式转换为非预乘sRGB三通道
+// samples不含透明度且保持原生数值域与预乘状态，切片仅在本次调用内有效不得保留，无透明度时alpha为一
+// 返回值仅在最终显示输出时裁剪并量化，非nil错误直接中止显示转换
 type ColorTransform func(samples []float64, alpha float64) (red, green, blue float64, err error)
 
 // DisplayOptions 指定原生分量取样、显式颜色变换及输出限制，零值采用最近邻和内建基本显示策略
@@ -40,16 +37,9 @@ type DisplayOptions struct {
 	ApplyICC  bool
 }
 
-// Display 将原生分量直接绘制为十六位非预乘sRGB图像，不创建整幅重采样中间图
-// 分量按已知相位及间隔采样，最近邻中点取较大坐标，双线性在原生数值域计算并采用端点延拓
-// ApplyICC以媒体相对色度将ICC矩阵曲线、整数查表或浮点管线（含D2B1）转换为sRGB，支持灰度、RGB、CMYK及声明的xCLR设备分量
-// 默认采用标准Decode的基本显示策略并应用已支持的CICP颜色编码和文件颜色提示，Transform可显式解释色彩
-// BT.2100 PQ及HLG采用BT.2446方法A，按1000至100 cd/m²转换并裁切超出输入峰值的显示光
-// Transform接收原生预乘状态；无Transform时按显示透明度解除预乘；非数值显示为零、扩展范围裁剪
-// 双线性实际插值拒绝非有限贡献，不是抗混叠或线性光滤波；RGBE按数值解释后插值
-// 不修改原图，不进行压缩域降分辨率解码；并发调用要求原图不被修改且调用方变换自行保证并发安全
-// 变换返回后立即检查取消，但不强制中断调用方已阻塞的变换函数
-// 入参: ctx 取消上下文，nil采用Background, opts 显示策略及限制，nil采用默认值
+// Display 按已知分量相位将原生图像绘制为十六位非预乘sRGB图像，不修改原图也不构造整幅重采样中间图
+// 色彩按Transform优先、ApplyICC内建ICC或默认CICP与BT.2446方法A策略转换，并发调用须保证原图只读与Transform并发安全
+// 入参: ctx Context，nil采用Background, opts 显示策略及限制，nil采用默认值
 // 返回: *image.NRGBA64 独立显示图像, error 参数、相位、颜色、数值、资源、变换或取消错误
 func (r *Raster) Display(ctx context.Context, opts *DisplayOptions) (*image.NRGBA64, error) {
 	if ctx == nil {
@@ -63,7 +53,7 @@ func (r *Raster) Display(ctx context.Context, opts *DisplayOptions) (*image.NRGB
 }
 
 // display 执行原生分量的十六位sRGB显示转换，由公开入口统一归一化错误
-// 入参: ctx 已规范化取消上下文, opts 显示策略及限制
+// 入参: ctx 已规范化Context, opts 显示策略及限制
 // 返回: *image.NRGBA64 独立显示图像, error 参数、相位、颜色、数值、资源、变换或取消错误
 func (r *Raster) display(ctx context.Context, opts *DisplayOptions) (*image.NRGBA64, error) {
 	if err := ctx.Err(); err != nil {
@@ -139,7 +129,7 @@ func checkJXRDisplayPositions(info Info) error {
 }
 
 // renderJXRDisplay 共用标准解码与原生显示转换的直通整数快路径与通用采样渲染循环
-// 入参: ctx 已规范化取消上下文, r 原生图像, info 图像元数据, mapping 已选显示映射, filter 采样策略, transform 可选显式色彩变换
+// 入参: ctx 已规范化Context, r 原生图像, info 图像元数据, mapping 已选显示映射, filter 采样策略, transform 可选显式色彩变换
 // 返回: *image.NRGBA64 独立十六位非预乘显示图像, error 采样、颜色、数值、变换或取消错误
 func renderJXRDisplay(ctx context.Context, r *Raster, info Info, mapping jxrDisplayMapping, filter ResampleFilter, transform ColorTransform) (*image.NRGBA64, error) {
 	bounds := info.Bounds
@@ -416,7 +406,7 @@ func canDisplayJXRDirect(raster *Raster, info Info, mapping jxrDisplayMapping) (
 }
 
 // displayJXRDirect 用纯整数算术直接填充非预乘十六位标准图像缓冲区，与通用浮点路径逐位一致
-// 入参: ctx 取消上下文, raster 原生图像, info 图像元数据, precision 分量位深, interleaved 是否交织存储, output 目标标准图像
+// 入参: ctx Context, raster 原生图像, info 图像元数据, precision 分量位深, interleaved 是否交织存储, output 目标标准图像
 // 返回: error 取消错误
 func displayJXRDirect(ctx context.Context, raster *Raster, info Info, precision uint8, interleaved bool, output *image.NRGBA64) error {
 	switch info.ColorSpace {
@@ -436,7 +426,7 @@ func displayJXRDirect(ctx context.Context, raster *Raster, info Info, precision 
 }
 
 // displayJXRDirectGray8 将八位无符号灰度及可选透明度直接写入十六位显示缓冲区
-// 入参: ctx 取消上下文, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
+// 入参: ctx Context, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
 // 返回: error 取消错误
 func displayJXRDirectGray8(ctx context.Context, raster *Raster, alpha, interleaved bool, output *image.NRGBA64) error {
 	width, height := output.Rect.Dx(), output.Rect.Dy()
@@ -528,7 +518,7 @@ func displayJXRDirectGray8(ctx context.Context, raster *Raster, alpha, interleav
 }
 
 // displayJXRDirectGray16 将十六位无符号灰度及可选透明度直接写入十六位显示缓冲区
-// 入参: ctx 取消上下文, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
+// 入参: ctx Context, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
 // 返回: error 取消错误
 func displayJXRDirectGray16(ctx context.Context, raster *Raster, alpha, interleaved bool, output *image.NRGBA64) error {
 	width, height := output.Rect.Dx(), output.Rect.Dy()
@@ -623,7 +613,7 @@ func displayJXRDirectGray16(ctx context.Context, raster *Raster, alpha, interlea
 }
 
 // displayJXRDirectRGB8 将八位无符号RGB及可选透明度直接写入十六位显示缓冲区
-// 入参: ctx 取消上下文, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
+// 入参: ctx Context, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
 // 返回: error 取消错误
 func displayJXRDirectRGB8(ctx context.Context, raster *Raster, alpha, interleaved bool, output *image.NRGBA64) error {
 	width, height := output.Rect.Dx(), output.Rect.Dy()
@@ -740,7 +730,7 @@ func displayJXRDirectRGB8(ctx context.Context, raster *Raster, alpha, interleave
 }
 
 // displayJXRDirectRGB16 将十六位无符号RGB及可选透明度直接写入十六位显示缓冲区
-// 入参: ctx 取消上下文, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
+// 入参: ctx Context, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
 // 返回: error 取消错误
 func displayJXRDirectRGB16(ctx context.Context, raster *Raster, alpha, interleaved bool, output *image.NRGBA64) error {
 	width, height := output.Rect.Dx(), output.Rect.Dy()
@@ -857,7 +847,7 @@ func displayJXRDirectRGB16(ctx context.Context, raster *Raster, alpha, interleav
 }
 
 // displayJXRDirectCMYK8 按与color.CMYK.RGBA完全等价的整数公式将八位CMYK直接写入十六位显示缓冲区
-// 入参: ctx 取消上下文, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
+// 入参: ctx Context, raster 原生图像, alpha 是否含透明度, interleaved 是否交织存储, output 目标标准图像
 // 返回: error 取消错误
 func displayJXRDirectCMYK8(ctx context.Context, raster *Raster, alpha, interleaved bool, output *image.NRGBA64) error {
 	width, height := output.Rect.Dx(), output.Rect.Dy()

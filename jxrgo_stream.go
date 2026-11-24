@@ -23,7 +23,7 @@ import (
 // jxrCoefficientLimit 限制有符号整数重建的计算容量，为后续变换保留运算余量
 const jxrCoefficientLimit int64 = 1 << 50
 
-// jxrOutputDepth 保存T.832表176允许的逐输出颜色位深组合
+// jxrOutputDepth 保存允许的逐输出颜色位深组合
 var jxrOutputDepth = [9]uint16{
 	1<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<6 | 1<<7 | 1<<15,
 	1 << 1,
@@ -238,8 +238,7 @@ func (parser *jxrParser) streamIndex(b jxrBits, s jxrStream) (jxrStream, error) 
 	return s, nil
 }
 
-// reserve 在新增解析存储分配前检查剩余预算及累计地址容量，失败不增加已保留容量
-// 空接收者用于已由上层系数工作预算覆盖的熵读取器，不用于公开解码器头部解析
+// reserve 在新增解析存储分配前检查剩余预算及累计地址容量，失败时不增加已保留容量
 // 入参: amount 新增活动存储字节数
 // 返回: error 取消或资源错误
 func (p *jxrParser) reserve(amount uint64) error {
@@ -258,7 +257,7 @@ func (p *jxrParser) reserve(amount uint64) error {
 }
 
 // check 在较长索引及声明解析循环中响应取消，不修改内存预算
-// 返回: error 上下文取消错误
+// 返回: error Context取消错误
 func (p *jxrParser) check() error {
 	if p != nil && p.ctx != nil {
 		return p.ctx.Err()
@@ -583,7 +582,7 @@ func checkJXRHeader(h *jxrHeader, maxPixels uint64) error {
 }
 
 // writeJXRStreamHeader 写入图像、主平面、透明度、包索引及档次级别声明，不写入像素包
-// 入参: b 位写入器, s 完整头部及相对包偏移, maxPixels 输出像素上限, wideIndex 是否采用表19的固定六十四位索引表示
+// 入参: b 位写入器, s 完整头部及相对包偏移, maxPixels 输出像素上限, wideIndex 是否采用固定六十四位索引表示
 // 返回: uint64 首个索引字节的位置，无索引或失败时为零
 func writeJXRStreamHeader(b *jxrBitWriter, s *jxrStream, maxPixels uint64, wideIndex bool) uint64 {
 	if b.err != nil {
@@ -792,7 +791,7 @@ func readJXRPlane(b *jxrBits, h *jxrHeader, alpha bool) (jxrPlane, error) {
 	return p, b.err
 }
 
-// jxrPlaneColorAllowed 检查T.832表179及表183规定的采样和颜色转换组合
+// jxrPlaneColorAllowed 检查允许的采样与颜色转换组合
 // 入参: output 输出颜色格式, depth 输出位深, internal 内部颜色格式
 // 返回: bool 是否为标准定义的转换组合
 func jxrPlaneColorAllowed(output, depth, internal uint8) bool {
@@ -1092,7 +1091,7 @@ func writeJXRQuant(b *jxrBitWriter, values []uint8) {
 	}
 }
 
-// jxrQuantScale 按T.832表149计算量化倍率，零量化值对应精确重建
+// jxrQuantScale 根据量化参数和移位计算量化倍率，零量化值对应精确重建
 // 入参: qp 量化参数, scaled 是否使用缩放模式, shift 当前频带及分量的缩放位数
 // 返回: int64 正量化倍率
 func jxrQuantScale(qp uint8, scaled bool, shift uint8) int64 {
@@ -1170,8 +1169,7 @@ func jxrAbs(value int64) int64 {
 	return value
 }
 
-// quantJXRValue 将有界系数量化为整数，非精确模式采用最近值及中点取偶舍入
-// 舍入后的重建值须仍在声明范围内，不通过整数溢出改变结果
+// quantJXRValue 将有界系数量化为整数，非精确模式采用中点取偶舍入并校验重建值不越界
 // 入参: value 原始系数, factor 正量化倍率, longWord 是否使用三十二位范围, exact 是否要求精确恢复
 // 返回: int64 量化系数, error 参数、范围或精度错误
 func quantJXRValue(value, factor int64, longWord, exact bool) (int64, error) {
@@ -1210,7 +1208,7 @@ func quantJXRValue(value, factor int64, longWord, exact bool) (int64, error) {
 }
 
 // quantJXRLow 按分量量化宏块DC及低通系数，保留子采样网格中未使用的位置
-// 入参: ctx 取消上下文, p 平面格式, values 分量步长为16的系数缓冲, dc, lp 逐分量量化参数, longWord 是否使用三十二位范围, exact 是否要求精确恢复
+// 入参: ctx Context, p 平面格式, values 分量步长为16的系数缓冲, dc, lp 逐分量量化参数, longWord 是否使用三十二位范围, exact 是否要求精确恢复
 // 返回: error 格式、缓冲、精度、范围或取消错误
 func quantJXRLow(ctx context.Context, p *jxrPlane, values []int64, dc, lp []uint8, longWord, exact bool) error {
 	if err := checkJXRPlaneComponents(p); err != nil {
@@ -1258,7 +1256,7 @@ func quantJXRLow(ctx context.Context, p *jxrPlane, values []int64, dc, lp []uint
 }
 
 // quantJXRHigh 量化各有效块的高通残差，不修改块直流位置或子采样填充位置
-// 入参: ctx 取消上下文, p 平面格式, values 分量步长为256的残差缓冲, hp 逐分量量化参数, longWord 是否使用三十二位范围, exact 是否要求精确恢复
+// 入参: ctx Context, p 平面格式, values 分量步长为256的残差缓冲, hp 逐分量量化参数, longWord 是否使用三十二位范围, exact 是否要求精确恢复
 // 返回: error 格式、缓冲、精度、范围或取消错误
 func quantJXRHigh(ctx context.Context, p *jxrPlane, values []int64, hp []uint8, longWord, exact bool) error {
 	if err := checkJXRPlaneComponents(p); err != nil {

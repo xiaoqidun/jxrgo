@@ -38,28 +38,28 @@ const (
 )
 
 var (
-	// jxrBT2100Luma 保存表5指定的BT.2020场景亮度权重
+	// jxrBT2100Luma 保存BT.2020场景亮度权重
 	jxrBT2100Luma = [3]float64{jxrBT2100Red, jxrBT2100Green, jxrBT2100Blue}
 	// jxrBT2020ToSRGB 将方法A输出转换到线性sRGB
 	jxrBT2020ToSRGB, _, _, _ = jxrCICPPrimaries(9)
 	// jxrSRGBToBT2020 将线性sRGB坐标转换到方法A的输入基色
 	jxrSRGBToBT2020 = jxrInvertCompositionMatrix(jxrBT2020ToSRGB)
 
-	// jxrBT2446HDRRho 保存方法A表2中1000 cd/m²输入的ρ减一
+	// jxrBT2446HDRRho 保存BT.2446方法A中1000 cd/m²输入的ρ减一
 	jxrBT2446HDRRho = 32 * math.Pow(1000.0/10000, 1/2.4)
-	// jxrBT2446SDRRho 保存方法A表2中100 cd/m²输出的ρ减一
+	// jxrBT2446SDRRho 保存BT.2446方法A中100 cd/m²输出的ρ减一
 	jxrBT2446SDRRho = 32 * math.Pow(100.0/10000, 1/2.4)
 	// jxrBT2446HDRLog 保存HDR的ρ对数
 	jxrBT2446HDRLog = math.Log1p(jxrBT2446HDRRho)
 	// jxrBT2446SDRLog 保存SDR的ρ对数
 	jxrBT2446SDRLog = math.Log1p(jxrBT2446SDRRho)
-	// jxrIPTToLMSPrime 反转SMPTE ST 2128式1的非线性LMS到IPT矩阵
+	// jxrIPTToLMSPrime 保存非线性IPT到LMS的逆变换矩阵
 	jxrIPTToLMSPrime = jxrInvertCompositionMatrix([3][3]float64{
 		{1638.0 / 4096, 1638.0 / 4096, 820.0 / 4096},
 		{18248.0 / 4096, -19870.0 / 4096, 1622.0 / 4096},
 		{3300.0 / 4096, 1463.0 / 4096, -4763.0 / 4096},
 	})
-	// jxrIPTLMS2RGB 反转SMPTE ST 2128式2的线性BT.2100 RGB到LMS矩阵
+	// jxrIPTLMS2RGB 保存线性LMS到BT.2100 RGB的逆变换矩阵
 	jxrIPTLMS2RGB = jxrInvertCompositionMatrix([3][3]float64{
 		{1747.0 / 4096, 2169.0 / 4096, 180.0 / 4096},
 		{673.0 / 4096, 3029.0 / 4096, 394.0 / 4096},
@@ -110,7 +110,7 @@ type jxrCICPColorDisplay struct {
 	constant   jxrCICPConstantLuminance
 }
 
-// jxrCICPYCgCo 保存H.273第8.3节的整数分量范围及YCgCo或YCgCo-R反变换参数
+// jxrCICPYCgCo 保存整数分量范围及YCgCo或YCgCo-R反变换参数
 type jxrCICPYCgCo struct {
 	yMax, cMax, center float64
 	rgbMax, offset     float64
@@ -118,13 +118,13 @@ type jxrCICPYCgCo struct {
 	lifted             bool
 }
 
-// jxrCICPConstantLuminance 保存H.273式68至75中按色差符号选择的幅值
+// jxrCICPConstantLuminance 保存恒定亮度矩阵按色差符号选择的幅值
 type jxrCICPConstantLuminance struct {
 	blueNegative, bluePositive float64
 	redNegative, redPositive   float64
 }
 
-// jxrCICPDisplay 按H.273第8节准备SDR、数字影院XYZ、PQ或HLG到sRGB的转换，PQ和HLG采用BT.2446方法A
+// jxrCICPDisplay 准备SDR、数字影院XYZ、PQ或HLG到sRGB的转换，PQ和HLG采用BT.2446方法A
 // 入参: info 原生分量描述, specification PTM颜色声明
 // 返回: jxrDisplayMapping 转换, bool 是否支持声明及样本组合
 func jxrCICPDisplay(info Info, specification ColorEncoding) (jxrDisplayMapping, bool) {
@@ -255,8 +255,8 @@ func jxrCICPDisplay(info Info, specification ColorEncoding) (jxrDisplayMapping, 
 	return mapping, true
 }
 
-// jxrCICPPrimaries 用H.273表2色度和BT.2380式2.1至2.3求相对XYZ，按线性Bradford适配到sRGB
-// 入参: code H.273 RGB基色编号
+// jxrCICPPrimaries 由CICP基色色度求相对XYZ并按线性Bradford适配到sRGB
+// 入参: code CICP RGB基色编号
 // 返回: [3][3]float64 线性源RGB到线性sRGB, float64 源红及蓝的亮度权重, bool 是否已定义
 func jxrCICPPrimaries(code uint16) ([3][3]float64, float64, float64, bool) {
 	const d65x, d65y = 0.3127, 0.3290
@@ -321,7 +321,7 @@ func jxrRGBChromaticityMatrix(xy [3][2]float64, whiteXY [2]float64) ([3][3]float
 	return toRGB, weights[0] * xyz[0][1], weights[2] * xyz[2][1], true
 }
 
-// color 按H.273第8.3节逆变换，再应用传递函数和源基色转换
+// color 执行颜色矩阵逆变换，再应用传递函数和源基色转换
 // 入参: info 原生描述, samples 归一化原生样本, alpha 原透明度
 // 返回: float64 非预乘红、绿、蓝sRGB值
 func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha float64) (float64, float64, float64) {
@@ -389,7 +389,7 @@ func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha fl
 	return srgb[0], srgb[1], srgb[2]
 }
 
-// jxrCICPYCCToRGB 反解H.273式45至47的非恒定亮度颜色矩阵
+// jxrCICPYCCToRGB 反解非恒定亮度颜色矩阵
 // 入参: signal 全范围亮度及带符号色差, kr,kb 红及蓝的亮度权重
 // 返回: [3]float64 相同传递域中的RGB
 func jxrCICPYCCToRGB(signal [3]float64, kr, kb float64) [3]float64 {
@@ -400,8 +400,8 @@ func jxrCICPYCCToRGB(signal [3]float64, kr, kb float64) [3]float64 {
 	return [3]float64{red, green, blue}
 }
 
-// jxrCICPInverseTransfer 反解H.273表3的SDR传递，分段常数满足8.2的值和斜率连续条件
-// 入参: value 非线性信号, transfer 表3编号, ycc 是否采用非零矩阵的有符号sRGB分支
+// jxrCICPInverseTransfer 反解CICP的SDR传递特性
+// 入参: value 非线性信号, transfer 传递特性编号, ycc 是否采用非零矩阵的有符号sRGB分支
 // 返回: float64 线性分量
 func jxrCICPInverseTransfer(value float64, transfer uint16, ycc bool) float64 {
 	switch transfer {
@@ -430,7 +430,7 @@ func jxrCICPInverseTransfer(value float64, transfer uint16, ycc bool) float64 {
 	return math.Copysign(math.Pow((magnitude+alpha-1)/alpha, power), value)
 }
 
-// jxrCICPForwardSDR 应用H.273表3的标称SDR传递函数
+// jxrCICPForwardSDR 应用CICP标称SDR传递函数
 // 入参: value 零至一的线性分量, transfer 已验证的传递代码
 // 返回: float64 编码分量
 func jxrCICPForwardSDR(value float64, transfer uint16) float64 {
@@ -451,7 +451,7 @@ func jxrCICPForwardSDR(value float64, transfer uint16) float64 {
 	return alpha*math.Pow(value, 1/power) - (alpha - 1)
 }
 
-// jxrCICPLogDecades 返回H.273表3的对数动态范围，零信号码反解到对数段起点
+// jxrCICPLogDecades 返回对数传递特性的动态范围，零信号码反解到对数段起点
 // 入参: transfer 对数传递特性代码
 // 返回: float64 动态范围十倍程数
 func jxrCICPLogDecades(transfer uint16) float64 {
@@ -461,7 +461,7 @@ func jxrCICPLogDecades(transfer uint16) float64 {
 	return 2.5
 }
 
-// jxrCICPPiecewiseTransfer 返回H.273第8.2节连续分段的参数，正反变换共用边界
+// jxrCICPPiecewiseTransfer 返回连续分段传递特性的参数，正反变换共用边界
 // 入参: transfer 已选择的分段传递代码
 // 返回: float64 增益、线性分段边界、线性斜率及逆传递幂次
 func jxrCICPPiecewiseTransfer(transfer uint16) (alpha, beta, slope, power float64) {
@@ -498,7 +498,7 @@ func jxrCICPHDRMatrixSupported(color ColorEncoding) bool {
 	return false
 }
 
-// jxrCICPXYZEncoding 识别H.273的XYZ直传和SMPTE ST 2085的PQ色差信号
+// jxrCICPXYZEncoding 识别CICP的XYZ直传和YDzDx色差信号
 // 入参: color PTM颜色编码声明
 // 返回: bool 是否为支持的XYZ编码组合
 func jxrCICPXYZEncoding(color ColorEncoding) bool {
@@ -506,7 +506,7 @@ func jxrCICPXYZEncoding(color ColorEncoding) bool {
 		color.Matrix == 11 && color.Transfer == 16
 }
 
-// jxrHLGLuma 按BT.2390第6.2节取得源基色和源白点的场景亮度权重
+// jxrHLGLuma 取得源基色和源白点的HLG场景亮度权重
 // 入参: color PTM颜色编码声明
 // 返回: [3]float64 RGB场景亮度权重, bool 权重是否有效
 func jxrHLGLuma(color ColorEncoding) ([3]float64, bool) {
@@ -518,7 +518,7 @@ func jxrHLGLuma(color ColorEncoding) ([3]float64, bool) {
 	return [3]float64{red, green, blue}, ok && red >= 0 && green >= 0 && blue >= 0
 }
 
-// jxrBT2100Linear 依BT.2100-3表4、5及7恢复相对1000 cd/m²的PQ显示光或HLG场景光
+// jxrBT2100Linear 恢复相对1000 cd/m²的BT.2100 PQ显示光或HLG场景光
 // 入参: signal 非线性RGB或归一化ICtCp/IPT, transfer H.273的PQ或HLG编号, matrix H.273矩阵编号
 // 返回: [3]float64 源基色的线性RGB，ICtCp和IPT使用BT.2020基色
 func jxrBT2100Linear(signal [3]float64, transfer, matrix uint16) [3]float64 {
@@ -569,7 +569,7 @@ func jxrHDRInverseTransfer(value float64, transfer uint16) float64 {
 	return (math.Exp((value-jxrHLGC)/jxrHLGA) + jxrHLGB) / 12
 }
 
-// jxrHLGDisplayLight 按BT.2100-3表5和BT.2390第6.2节将场景光转换为参考显示光
+// jxrHLGDisplayLight 将HLG场景光转换为参考显示光
 // 入参: rgb 线性场景RGB, weights 场景亮度权重
 // 返回: [3]float64 参考显示光RGB
 func jxrHLGDisplayLight(rgb, weights [3]float64) [3]float64 {
@@ -581,8 +581,7 @@ func jxrHLGDisplayLight(rgb, weights [3]float64) [3]float64 {
 	return rgb
 }
 
-// jxrBT2446MethodA 按BT.2446-1第4.1节将1000 cd/m²显示光映射到100 cd/m²
-// 输入显示光先裁到方法A的定义域，输出按零黑位BT.1886线性化
+// jxrBT2446MethodA 按BT.2446方法A将1000 cd/m²显示光映射到100 cd/m²并按BT.1886线性化输出
 // 入参: rgb BT.2020线性显示RGB，相对1000 cd/m²
 // 返回: [3]float64 BT.2020线性SDR显示RGB
 func jxrBT2446MethodA(rgb [3]float64) [3]float64 {
@@ -613,7 +612,7 @@ func jxrBT2446MethodA(rgb [3]float64) [3]float64 {
 	return rgb
 }
 
-// jxrNewCICPYCgCo 按H.273表4及式23至26推导矩阵8、16、17的RGB位数与量化范围
+// jxrNewCICPYCgCo 推导YCgCo与YCgCo-R矩阵的RGB位数与量化范围
 // 入参: info 已校验的三个无符号分量, matrix 矩阵编号, full 是否为全范围
 // 返回: jxrCICPYCgCo 转换参数, bool 是否为已定义的位深组合
 func jxrNewCICPYCgCo(info Info, matrix uint16, full bool) (jxrCICPYCgCo, bool) {
@@ -649,8 +648,7 @@ func jxrNewCICPYCgCo(info Info, matrix uint16, full bool) (jxrCICPYCgCo, bool) {
 	return quant, true
 }
 
-// rgb 按H.273式54至57或62至65恢复非线性RGB，再撤销RGB量化
-// YCgCo-R对已插值的分量先四舍五入到码值，整数源保留可逆提升的有符号右移
+// rgb 执行YCgCo或YCgCo-R逆变换恢复非线性RGB并撤销RGB量化
 // 入参: samples 归一化的Y、Cg、Co码值
 // 返回: [3]float64 非线性RGB
 func (quant *jxrCICPYCgCo) rgb(samples []float64) [3]float64 {
@@ -672,7 +670,7 @@ func (quant *jxrCICPYCgCo) rgb(samples []float64) [3]float64 {
 	return rgb
 }
 
-// jxrCICPSMPTE2085ToRGB 反解H.273式76至78的亮度及色差信号
+// jxrCICPSMPTE2085ToRGB 反解YDzDx亮度及色差信号
 // 入参: signal 归一化YDzDx信号
 // 返回: [3]float64 线性三刺激分量
 func jxrCICPSMPTE2085ToRGB(signal [3]float64) [3]float64 {

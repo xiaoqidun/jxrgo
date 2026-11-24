@@ -22,7 +22,7 @@ import (
 // jxrScanOrder 保存低通及水平、垂直高通的初始逆扫描顺序
 var jxrScanOrder = [2][16]uint8{{0, 4, 1, 5, 8, 2, 9, 6, 12, 3, 10, 13, 7, 14, 11, 15}, {0, 1, 2, 5, 4, 3, 6, 9, 8, 7, 12, 15, 13, 10, 11, 14}}
 
-// jxrQPBits 保存T.832表47规定的非零量化索引位数
+// jxrQPBits 保存非零量化索引位数
 var jxrQPBits = [17]uint8{0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4}
 
 // jxrMacroInfo 保存频率模式跨包使用的宏块方向、量化索引及细化位数
@@ -75,8 +75,7 @@ type jxrScan struct {
 	totals [16]uint16
 }
 
-// jxrComponentView 保存按宏块及分量存储的二维系数或样本视图
-// masks的低四位及高四位分别保存水平和垂直块内掩码
+// jxrComponentView 保存按宏块及分量存储的二维系数或样本视图，masks高低四位分别保存垂直和水平块内掩码
 type jxrComponentView struct {
 	data        []int64
 	width       int
@@ -208,7 +207,7 @@ func (s *jxrStream) tileScratchWork() uint64 {
 }
 
 // coefficientsContext 从已校验头部解码系数，分配前检查预算，按宏块响应取消
-// 入参: ctx 取消上下文, data 当前独立码流, maxWork 系数及临时状态的字节容量
+// 入参: ctx Context, data 当前独立码流, maxWork 系数及临时状态的字节容量
 // 返回: *jxrCoefficientImage 双平面系数, error 数据、能力、资源或取消错误
 func (s *jxrStream) coefficientsContext(ctx context.Context, data []byte, maxWork uint64) (*jxrCoefficientImage, error) {
 	if err := ctx.Err(); err != nil {
@@ -338,7 +337,7 @@ func (c *jxrCoefficients) finishHighComponents(at int, q *jxrTileQuant, low [][1
 }
 
 // readSpatial 按宏块及平面顺序解析空间模式系数，状态不跨越分块
-// 入参: ctx 取消上下文, data 独立码流, s 码流头, tile 分块编号
+// 入参: ctx Context, data 独立码流, s 码流头, tile 分块编号
 // 返回: error 数据、量化、计算容量或取消错误
 func (img *jxrCoefficientImage) readSpatial(ctx context.Context, data []byte, s *jxrStream, tile int) error {
 	r, err := newJXRSpatialRows(ctx, data, s, tile, s.coefficientWork())
@@ -497,7 +496,7 @@ func (v *jxrComponentView) set(x, y int, value int64) {
 }
 
 // readFrequency 按独立频带包解析系数，预测缓存及编码状态分别属于当前分块
-// 入参: ctx 取消上下文, data 独立码流, s 码流头, tile 分块编号
+// 入参: ctx Context, data 独立码流, s 码流头, tile 分块编号
 // 返回: error 数据、量化、计算容量或取消错误
 func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, s *jxrStream, tile int) error {
 	planes := [2]*jxrCoefficients{&img.primary, img.alpha}
@@ -610,7 +609,7 @@ func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, 
 }
 
 // readDC 读取并预测宏块DC，只有缺失低通频带时立即完成反量化
-// 入参: b 码流读取器, decoder 分块DC状态, q 分块量化参数, m 当前宏块上下文, cache 独立预测缓存, scratch 分块工作缓冲
+// 入参: b 码流读取器, decoder 分块DC状态, q 分块量化参数, m 当前宏块状态, cache 独立预测缓存, scratch 分块工作缓冲
 // 返回: error 数据、缓存或计算容量错误
 func (c *jxrCoefficients) readDC(b *jxrBits, decoder *jxrDC, q *jxrTileQuant, m jxrMacroContext, cache *jxrPrediction, scratch *jxrDecodedMacro) error {
 	residual := scratch.dc
@@ -651,7 +650,7 @@ func (c *jxrCoefficients) readDC(b *jxrBits, decoder *jxrDC, q *jxrTileQuant, m 
 }
 
 // readLP 读取并预测低通系数，先保存扫描方向和预测缓存，再反量化存储
-// 入参: b 码流读取器, decoder 分块低通状态, q 分块量化参数, m 当前宏块上下文, cache 独立预测缓存, scratch 分块工作缓冲
+// 入参: b 码流读取器, decoder 分块低通状态, q 分块量化参数, m 当前宏块状态, cache 独立预测缓存, scratch 分块工作缓冲
 // 返回: error 数据、缓存或计算容量错误
 func (c *jxrCoefficients) readLP(b *jxrBits, decoder *jxrLP, q *jxrTileQuant, m jxrMacroContext, cache *jxrPrediction, scratch *jxrDecodedMacro) error {
 	values := scratch.low
@@ -689,7 +688,7 @@ func (c *jxrCoefficients) readLP(b *jxrBits, decoder *jxrLP, q *jxrTileQuant, m 
 }
 
 // readHP 重建高通块标志并读取高通系数，保留供频率精细位包使用的模型位数
-// 入参: b 码流读取器, decoder 分块高通状态, m 宏块上下文, spatial 是否为空间模式, trim 精细位截断量, residual, pattern 逐分量残差及重建标志缓冲
+// 入参: b 码流读取器, decoder 分块高通状态, m 宏块状态, spatial 是否为空间模式, trim 精细位截断量, residual, pattern 逐分量残差及重建标志缓冲
 // 返回: error 数据或缓冲错误
 func (c *jxrCoefficients) readHP(b *jxrBits, decoder *jxrHP, m jxrMacroContext, spatial bool, trim uint8, residual, pattern []uint16) error {
 	decoder.cbp.readComponents(b, &c.plane, residual)
@@ -706,7 +705,7 @@ func (c *jxrCoefficients) readHP(b *jxrBits, decoder *jxrHP, m jxrMacroContext, 
 }
 
 // newJXRDecodedMacro 在预算内分配实际分量工作缓冲，三类存储仅在分块开始时创建
-// 入参: ctx 取消上下文, channels 分量数, maximum 本缓冲可用的字节预算
+// 入参: ctx Context, channels 分量数, maximum 本缓冲可用的字节预算
 // 返回: *jxrDecodedMacro 工作缓冲, error 参数、资源或取消错误
 func newJXRDecodedMacro(ctx context.Context, channels int, maximum uint64) (*jxrDecodedMacro, error) {
 	if err := ctx.Err(); err != nil {
@@ -864,7 +863,7 @@ func jxrDisplayTileIndex(h *jxrHeader, ordinal int) int {
 }
 
 // writeTile 按分块及宏块顺序写入系数，频率模式将各频带写入独立包缓冲
-// 入参: ctx 取消上下文, s 所属码流头, tile 分块编号, output 包写入器及独立工作缓冲
+// 入参: ctx Context, s 所属码流头, tile 分块编号, output 包写入器及独立工作缓冲
 // 返回: [4]uint64 各频带包在对应缓冲中的字节起点, error 数据、资源、精度或取消错误
 func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, tile int, output *jxrTileOutput) ([4]uint64, error) {
 	var offsets [4]uint64

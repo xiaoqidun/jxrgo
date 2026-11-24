@@ -27,7 +27,7 @@ type jxrForwardWindow struct {
 }
 
 // newJXRTransformPlane 校验宏块布局并在预算内分配编码侧低通、高通及状态缓冲
-// 入参: ctx 已规范化取消上下文, h 图像头, p 平面信息, maxWork 新缓冲内存预算
+// 入参: ctx 已规范化Context, h 图像头, p 平面信息, maxWork 新缓冲内存预算
 // 返回: *jxrCoefficients 空变换平面, error 布局、资源或取消错误
 func newJXRTransformPlane(ctx context.Context, h *jxrHeader, p *jxrPlane, maxWork uint64) (*jxrCoefficients, error) {
 	if err := ctx.Err(); err != nil {
@@ -86,7 +86,7 @@ func newJXRTransformPlane(ctx context.Context, h *jxrHeader, p *jxrPlane, maxWor
 }
 
 // forward 将已填充的完整样本网格转换为两级系数，不执行预测、量化或熵编码
-// 入参: ctx 已规范化取消上下文, h 图像头
+// 入参: ctx 已规范化Context, h 图像头
 // 返回: error 变换、资源或取消错误
 func (c *jxrCoefficients) forward(ctx context.Context, h *jxrHeader) error {
 	if err := ctx.Err(); err != nil {
@@ -109,14 +109,14 @@ func (c *jxrCoefficients) forward(ctx context.Context, h *jxrHeader) error {
 }
 
 // forwardFirst 对每个四乘四样本块执行正变换，将块直流值归入宏块低通网格
-// 入参: ctx 取消上下文, h 图像头
+// 入参: ctx Context, h 图像头
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) forwardFirst(ctx context.Context, h *jxrHeader) error {
 	return c.forwardFirstRegion(ctx, h, image.Rect(0, 0, int(h.columns[len(h.columns)-1]), int(h.rows[len(h.rows)-1])))
 }
 
 // forwardFirstRegion 只变换已预滤波的宏块矩形，不对邻域人工边缘计算无关变换
-// 入参: ctx 当前上下文, h 已校验布局, region 宏块坐标矩形
+// 入参: ctx Context, h 已校验布局, region 宏块坐标矩形
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) forwardFirstRegion(ctx context.Context, h *jxrHeader, region image.Rectangle) error {
 	total := region.Dx() * region.Dy()
@@ -133,7 +133,7 @@ func (c *jxrCoefficients) forwardFirstRegion(ctx context.Context, h *jxrHeader, 
 }
 
 // forwardFirstRange 对矩形内指定宏块区间执行首级四乘四正变换
-// 入参: ctx 当前上下文, h 已校验布局, region 宏块坐标矩形, start 起始位置, end 结束位置
+// 入参: ctx Context, h 已校验布局, region 宏块坐标矩形, start 起始位置, end 结束位置
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) forwardFirstRange(ctx context.Context, h *jxrHeader, region image.Rectangle, start, end int) error {
 	columns := int(h.columns[len(h.columns)-1])
@@ -175,14 +175,14 @@ func (c *jxrCoefficients) forwardFirstRange(ctx context.Context, h *jxrHeader, r
 }
 
 // forwardSecond 对宏块低通网格执行正变换，按标准色度编码布局组织系数
-// 入参: ctx 取消上下文, h 图像头
+// 入参: ctx Context, h 图像头
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) forwardSecond(ctx context.Context, h *jxrHeader) error {
 	return c.forwardSecondRegion(ctx, h, image.Rect(0, 0, int(h.columns[len(h.columns)-1]), int(h.rows[len(h.rows)-1])))
 }
 
 // forwardSecondRegion 只变换输出所需的宏块低通值，仍执行全部标准字长检查
-// 入参: ctx 当前上下文, h 已校验布局, region 宏块坐标矩形
+// 入参: ctx Context, h 已校验布局, region 宏块坐标矩形
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) forwardSecondRegion(ctx context.Context, h *jxrHeader, region image.Rectangle) error {
 	total := region.Dx() * region.Dy()
@@ -199,7 +199,7 @@ func (c *jxrCoefficients) forwardSecondRegion(ctx context.Context, h *jxrHeader,
 }
 
 // forwardSecondRange 对矩形内指定宏块区间执行二级低通正变换
-// 入参: ctx 当前上下文, h 已校验布局, region 宏块坐标矩形, start 起始位置, end 结束位置
+// 入参: ctx Context, h 已校验布局, region 宏块坐标矩形, start 起始位置, end 结束位置
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) forwardSecondRange(ctx context.Context, h *jxrHeader, region image.Rectangle, start, end int) error {
 	columns := int(h.columns[len(h.columns)-1])
@@ -252,10 +252,8 @@ func (c *jxrCoefficients) forwardSecondRange(ctx context.Context, h *jxrHeader, 
 	return ctx.Err()
 }
 
-// loadSamples 将显示方向的原生图像反映射到编码网格，窗口外采用相邻边缘样本填充
-// 不隐式进行RGB与子采样YUV间的有损抽样，原生子采样图像使用自己的分量网格
-// 少分量描述使用局部临时容量，超过容量仍按实际分量数分配，不改变原生通道或模型能力边界
-// 入参: ctx 已规范化取消上下文, raster 原生图像, h 图像头, alpha 是否加载独立透明度, exact 是否要求输入精确恢复
+// loadSamples 将显示方向的原生图像反映射到编码网格并以边缘样本填充窗口外区域，不隐式抽样
+// 入参: ctx 已规范化Context, raster 原生图像, h 图像头, alpha 是否加载独立透明度, exact 是否要求输入精确恢复
 // 返回: error 格式、采样、数值或取消错误
 func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jxrHeader, alpha, exact bool) error {
 	if err := ctx.Err(); err != nil {
@@ -377,7 +375,7 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 }
 
 // loadFullSamplesParallel 将大尺寸全采样图像按宏块行分片并行装载到编码视图
-// 入参: ctx 取消上下文, h 图像头, components 源分量视图, views 目标编码视图, alpha 是否加载透明度, exact 是否精确恢复, workers 并发槽位数, chunkRows 单片宏块行数, tasks 分片数
+// 入参: ctx Context, h 图像头, components 源分量视图, views 目标编码视图, alpha 是否加载透明度, exact 是否精确恢复, workers 并发槽位数, chunkRows 单片宏块行数, tasks 分片数
 // 返回: error 格式、采样、数值或取消错误
 func (c *jxrCoefficients) loadFullSamplesParallel(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView, alpha, exact bool, workers, chunkRows, tasks int) error {
 	count := len(components)
@@ -397,7 +395,7 @@ func (c *jxrCoefficients) loadFullSamplesParallel(ctx context.Context, h *jxrHea
 }
 
 // loadFullSamplesRange 将指定行范围的全采样原始分量反映射并执行正向色彩变换写入视图
-// 入参: ctx 取消上下文, h 图像头, components 源分量视图, views 目标编码视图, alpha 是否加载透明度, exact 是否精确恢复, startY 起始行, endY 结束行, rowBits 临时位模式缓冲, rowValues 临时样本缓冲
+// 入参: ctx Context, h 图像头, components 源分量视图, views 目标编码视图, alpha 是否加载透明度, exact 是否精确恢复, startY 起始行, endY 结束行, rowBits 临时位模式缓冲, rowValues 临时样本缓冲
 // 返回: error 格式、采样、数值或取消错误
 func (c *jxrCoefficients) loadFullSamplesRange(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView, alpha, exact bool, startY, endY int, rowBits []uint32, rowValues []int64) error {
 	cw, ch := int(h.width), int(h.height)
@@ -473,8 +471,7 @@ func jxrInputSamples(h *jxrHeader, p *jxrPlane, bits []uint32, values []int64, a
 	return jxrIntegerInput(h, p, bits, values, alpha, exact)
 }
 
-// jxrForwardColor 执行规范性输出颜色转换的可逆正向运算，不处理偏置、数值缩放或色度抽样
-// RGB先转换到完整采样的YUV，子采样由后续图像处理执行；灰度目标拒绝不可逆的颜色丢弃
+// jxrForwardColor 执行输出颜色转换的可逆正向运算，不处理偏置、数值缩放或色度抽样
 // 入参: h 图像头, p 目标平面, values 已去偏置及预缩放的颜色分量，原地替换, alpha 是否为透明度平面
 // 返回: int 目标分量数, error 颜色、分量或数值范围错误
 func jxrForwardColor(h *jxrHeader, p *jxrPlane, values []int64, alpha bool) (int, error) {
@@ -546,7 +543,7 @@ func jxrForwardColor(h *jxrHeader, p *jxrPlane, values []int64, alpha bool) (int
 }
 
 // forwardWindow 对软重叠邻域仅执行核心及其必要依赖，子采样低通使用自身网格及真实角部规则
-// 入参: ctx 当前上下文, h 已校验局部布局, window 核心宏块及左上右下真实边缘
+// 入参: ctx Context, h 已校验局部布局, window 核心宏块及左上右下真实边缘
 // 返回: error 布局、能力、数值范围或取消错误
 func (c *jxrCoefficients) forwardWindow(ctx context.Context, h *jxrHeader, window jxrForwardWindow) error {
 	bounds := image.Rect(0, 0, int(h.columns[len(h.columns)-1]), int(h.rows[len(h.rows)-1]))
@@ -571,9 +568,8 @@ func (c *jxrCoefficients) forwardWindow(ctx context.Context, h *jxrHeader, windo
 	return c.forwardSecondRegion(ctx, h, window.core)
 }
 
-// filterWindow 按分量网格处理所需矩形的滤波片，边缘片仅在真实图像边缘执行
-// 子采样低通及普通网格均按各自片尺寸保留预滤波或后滤波依赖
-// 入参: ctx 当前上下文, h 局部布局, samples 样本级而非低通级, region 所需宏块矩形, edges 左上右下真实边缘, pre 是否执行预滤波
+// filterWindow 按各分量网格及片尺寸处理所需矩形的滤波片，边缘片仅在真实图像边缘执行
+// 入参: ctx Context, h 局部布局, samples 样本级而非低通级, region 所需宏块矩形, edges 左上右下真实边缘, pre 是否执行预滤波
 // 返回: error 邻域不足、数值范围或取消错误
 func (c *jxrCoefficients) filterWindow(ctx context.Context, h *jxrHeader, samples bool, region image.Rectangle, edges [4]bool, pre bool) error {
 	if err := ctx.Err(); err != nil {
@@ -619,7 +615,7 @@ func (c *jxrCoefficients) filterWindow(ctx context.Context, h *jxrHeader, sample
 }
 
 // filterComponentWindow 在同一真实滤波分区内处理所需片，视图可保留原宏块行步幅而裁短水平范围
-// 入参: ctx 取消上下文, needed 分量局部所需范围, edges 左上右下真实分区边缘, chroma 是否为子采样低通, pre 是否预滤波
+// 入参: ctx Context, needed 分量局部所需范围, edges 左上右下真实分区边缘, chroma 是否为子采样低通, pre 是否预滤波
 // 返回: error 邻域、数值范围或取消错误
 func (v *jxrComponentView) filterComponentWindow(ctx context.Context, needed image.Rectangle, edges [4]bool, chroma, pre bool) error {
 	margin := 2
@@ -674,7 +670,7 @@ func (v *jxrComponentView) filterComponentWindow(ctx context.Context, needed ima
 }
 
 // filterChromaWindow 执行所需色度低通预滤波或后滤波片及真实角部残差，人工邻域边缘不参与边缘运算
-// 入参: ctx 当前上下文, needed 当前分量的所需低通矩形, edges 左上右下真实边缘, pre 是否执行预滤波
+// 入参: ctx Context, needed 当前分量的所需低通矩形, edges 左上右下真实边缘, pre 是否执行预滤波
 // 返回: error 邻域、数值或取消错误
 func (v *jxrComponentView) filterChromaWindow(ctx context.Context, needed image.Rectangle, edges [4]bool, pre bool) error {
 	if v.width < 4 || needed.Empty() || !needed.In(image.Rect(0, 0, v.width, v.height)) {
@@ -716,7 +712,7 @@ func (v *jxrComponentView) filterChromaWindow(ctx context.Context, needed image.
 }
 
 // chromaWindowCorners 仅在所需真实角部转换或恢复相邻系数残差，保持标准有符号字长保护
-// 入参: ctx 当前上下文, needed 所需低通矩形, edges 真实边缘, direction 减去相邻值为负一，恢复为一
+// 入参: ctx Context, needed 所需低通矩形, edges 真实边缘, direction 减去相邻值为负一，恢复为一
 // 返回: error 数值范围或取消错误
 func (v *jxrComponentView) chromaWindowCorners(ctx context.Context, needed image.Rectangle, edges [4]bool, direction int64) error {
 	for row, y := range [2]int{0, v.height - 1} {

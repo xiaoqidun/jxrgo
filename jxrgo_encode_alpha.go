@@ -60,7 +60,7 @@ type jxrSeparateTileInput struct {
 }
 
 // encodeJXRSeparateAlpha 将颜色与透明度写入独立码流，共用输入、已编码数据和封装的容量预算
-// 入参: ctx 取消上下文, raster 原生图像, options 文件编码选项
+// 入参: ctx Context, raster 原生图像, options 文件编码选项
 // 返回: []byte 完整JXR文件, error 参数、精度、资源或取消错误
 func encodeJXRSeparateAlpha(ctx context.Context, raster *Raster, options EncodeOptions) ([]byte, error) {
 	if err := checkJXREncodeOptions(options); err != nil {
@@ -170,7 +170,7 @@ func encodeJXRSeparateAlpha(ctx context.Context, raster *Raster, options EncodeO
 }
 
 // newJXRAlphaRaster 创建标准独立透明度的辅助主图及透明度，十位格式采用RGB输出及单分量内部主平面
-// 入参: ctx 取消上下文, raster 原始图像, mirror 是否向辅助主平面复制样本, maxMemory 新图像字节上限, maxPixels 像素上限
+// 入参: ctx Context, raster 原始图像, mirror 是否向辅助主平面复制样本, maxMemory 新图像字节上限, maxPixels 像素上限
 // 返回: *Raster 占位主图及透明度, error 参数、资源或取消错误
 func newJXRAlphaRaster(ctx context.Context, raster *Raster, mirror bool, maxMemory, maxPixels uint64) (*Raster, error) {
 	component, err := raster.component(raster.info.Channels)
@@ -221,7 +221,7 @@ func jxrAlphaRasterInfo(bounds image.Rectangle, component ComponentInfo) Info {
 }
 
 // jxrSeparateAlphaOptions 在预算内快照独立透明度，默认逐组继承主平面首分量及完整宏块索引
-// 入参: ctx 当前上下文, o 原始文件编码选项, maximum 原配置与独占副本的共同容量上限
+// 入参: ctx Context, o 原始文件编码选项, maximum 原配置与独占副本的共同容量上限
 // 返回: EncodeOptions 独立透明度选项, uint64 原配置与副本的保守常驻容量, error 资源或取消错误
 func jxrSeparateAlphaOptions(ctx context.Context, o EncodeOptions, maximum uint64) (EncodeOptions, uint64, error) {
 	p := PlaneOptions{Band: o.Band, Scaled: o.Scaled, Shift: o.Shift, Float: o.Float}
@@ -308,7 +308,7 @@ func makeJXRAlphaRowStorage(info Info, scratch io.ReadWriteSeeker, maximum uint6
 }
 
 // encodeJXRSeparateRows 复用主图行缓存，首遍暂存透明度，次遍不再读取原始行源
-// 入参: ctx 当前上下文, w 文件输出, info 完整描述, source 共用行缓存, alpha 透明度暂存, options 文件选项
+// 入参: ctx Context, w 文件输出, info 完整描述, source 共用行缓存, alpha 透明度暂存, options 文件选项
 // 返回: error 参数、资源、源、暂存、取消或输出错误
 func encodeJXRSeparateRows(ctx context.Context, w io.WriteSeeker, info Info, source *jxrRowInput, alpha *jxrAlphaRowStorage, options EncodeOptions) error {
 	info, retained, err := prepareJXRTileInfo(ctx, info, options)
@@ -357,7 +357,7 @@ func encodeJXRSeparateRows(ctx context.Context, w io.WriteSeeker, info Info, sou
 }
 
 // transfer 按原生位模式保存或恢复一条透明度行带，不改变精度、预乘状态或浮点特殊值
-// 入参: ctx 当前上下文, plane 临时透明度行带, save 是否写入暂存
+// 入参: ctx Context, plane 临时透明度行带, save 是否写入暂存
 // 返回: error 容量、暂存或取消错误
 func (s *jxrAlphaRowStorage) transfer(ctx context.Context, plane *imageComponents, save bool) error {
 	count := plane.bounds.Dx() * plane.bounds.Dy()
@@ -412,7 +412,7 @@ func (s *jxrAlphaRowStorage) transfer(ctx context.Context, plane *imageComponent
 }
 
 // readJXRAlphaRowStorage 填满当前暂存片段，校验读取计数并限制无进展读取
-// 入参: ctx 当前上下文, source 透明度暂存, target 本次完整片段
+// 入参: ctx Context, source 透明度暂存, target 本次完整片段
 // 返回: error 读取协议、底层、截断或取消错误
 func readJXRAlphaRowStorage(ctx context.Context, source io.Reader, target []byte) error {
 	empty := 0
@@ -450,7 +450,7 @@ func readJXRAlphaRowStorage(ctx context.Context, source io.Reader, target []byte
 }
 
 // makeJXRSeparateInput 在共用预算内建立主图视图和完整透明度副本，保留标准辅助主平面
-// 入参: ctx 当前上下文, raster 原生图像, options 已校验文件选项
+// 入参: ctx Context, raster 原生图像, options 已校验文件选项
 // 返回: jxrSeparateInput 常驻输入和编码计划, error 参数、能力、资源或取消错误
 func makeJXRSeparateInput(ctx context.Context, raster *Raster, options EncodeOptions) (jxrSeparateInput, error) {
 	var result jxrSeparateInput
@@ -533,7 +533,7 @@ func makeJXRSeparateInput(ctx context.Context, raster *Raster, options EncodeOpt
 }
 
 // writeJXRSeparateFileAt 在指定目录位置写出真实双码流，将目录地址回填为全文件坐标且不重复非首图文件头
-// 入参: ctx 当前上下文, w 当前可定位输出, raster 原生图像, options 当前图像已合并的选项, directory 当前目录位置，首图为八
+// 入参: ctx Context, w 当前可定位输出, raster 原生图像, options 当前图像已合并的选项, directory 当前目录位置，首图为八
 // 返回: uint64 图像结束位置, uint64 当前目录链接位置, error 参数、资源、取消、定位或写入错误
 func writeJXRSeparateFileAt(ctx context.Context, w io.WriteSeeker, raster *Raster, options EncodeOptions, directory uint64) (uint64, uint64, error) {
 	if directory < 8 || directory&1 != 0 || directory > math.MaxUint32 {
@@ -557,7 +557,7 @@ func writeJXRSeparateFileAt(ctx context.Context, w io.WriteSeeker, raster *Raste
 }
 
 // writeJXRSeparatePacketsAt 共用双流文件前缀、偶数边界及三个字段的全文件回填，具体样本源由编码器提供
-// 入参: ctx 当前上下文, w 当前可定位输出, file 双流布局和资源, directory 当前目录位置, encode 按序提交主图或透明度包的编码器
+// 入参: ctx Context, w 当前可定位输出, file 双流布局和资源, directory 当前目录位置, encode 按序提交主图或透明度包的编码器
 // 返回: uint64 图像结束位置, uint64 当前目录链接位置, error 元数据、资源、取消或I/O错误
 func writeJXRSeparatePacketsAt(ctx context.Context, w io.WriteSeeker, file jxrSeparateOutput, directory uint64, encode func(int, uint64) error) (uint64, uint64, error) {
 	if directory < 8 || directory&1 != 0 || directory > math.MaxUint32 || encode == nil {
@@ -644,7 +644,7 @@ func writeJXRSeparatePacketsAt(ctx context.Context, w io.WriteSeeker, file jxrSe
 }
 
 // makeJXRSeparateTileInput 在常驻元数据预算后建立两个仅布局计划，浮点参数已由逐块入口显式校验
-// 入参: ctx 当前上下文, info 已复制原生元数据, options 已校验文件选项, retained 原始元数据及ICC容量
+// 入参: ctx Context, info 已复制原生元数据, options 已校验文件选项, retained 原始元数据及ICC容量
 // 返回: jxrSeparateTileInput 两个真实码流的布局, error 参数、能力、资源或取消错误
 func makeJXRSeparateTileInput(ctx context.Context, info Info, options EncodeOptions, retained uint64) (jxrSeparateTileInput, error) {
 	result := jxrSeparateTileInput{mirror: options.MirrorSeparateAlpha}
@@ -704,7 +704,7 @@ func makeJXRSeparateTileInput(ctx context.Context, info Info, options EncodeOpti
 }
 
 // encodeJXRSeparateTileFileTo 将有界提供器分两遍读取为独立主图和透明度，复用双流目录提交而不分配完整原图
-// 入参: ctx 当前上下文, w 起点为零的输出, info 独占原生元数据, options 已校验选项, retained 常驻描述容量, read 稳定逐块提供器
+// 入参: ctx Context, w 起点为零的输出, info 独占原生元数据, options 已校验选项, retained 常驻描述容量, read 稳定逐块提供器
 // 返回: error 元数据、布局、资源、提供器、取消或I/O错误
 func encodeJXRSeparateTileFileTo(ctx context.Context, w io.WriteSeeker, info Info, options EncodeOptions, retained uint64, read RasterTileReader) error {
 	input, err := makeJXRSeparateTileInput(ctx, info, options, retained)
@@ -716,7 +716,7 @@ func encodeJXRSeparateTileFileTo(ctx context.Context, w io.WriteSeeker, info Inf
 }
 
 // writeJXRSeparateTileAt 复用已校验且独占的双流逐块计划，在任意合法目录位置提交两个真实码流
-// 入参: ctx 当前上下文, w 当前可定位输出, input 双流元数据与计划, directory 当前目录位置, read 稳定提供器
+// 入参: ctx Context, w 当前可定位输出, input 双流元数据与计划, directory 当前目录位置, read 稳定提供器
 // 返回: uint64 图像结束位置, uint64 当前链接位置, error 资源、提供器、取消或I/O错误
 func writeJXRSeparateTileAt(ctx context.Context, w io.WriteSeeker, input *jxrSeparateTileInput, directory uint64, read RasterTileReader) (uint64, uint64, error) {
 	return writeJXRSeparatePacketsAt(ctx, w, input.file, directory, func(index int, maximum uint64) error {
@@ -727,7 +727,7 @@ func writeJXRSeparateTileAt(ctx context.Context, w io.WriteSeeker, input *jxrSep
 }
 
 // encodeJXRProjectedTilesTo 保留有界原始块供回调写入，再只复制当前码流需要的颜色或透明度
-// 入参: ctx 当前上下文, w 当前码流输出, original 回调原生描述, coded 当前码流原生描述, source 完整头部, options 除全局元数据外的额度, read 稳定提供器, alpha 是否只提取透明度, mirror 是否向辅助主平面复制透明度
+// 入参: ctx Context, w 当前码流输出, original 回调原生描述, coded 当前码流原生描述, source 完整头部, options 除全局元数据外的额度, read 稳定提供器, alpha 是否只提取透明度, mirror 是否向辅助主平面复制透明度
 // 返回: error 原生网格、容量、样本、提供器、取消或I/O错误
 func encodeJXRProjectedTilesTo(ctx context.Context, w io.WriteSeeker, original, coded Info, source *jxrStream, options jxrStreamOutput, read RasterTileReader, alpha, mirror bool) error {
 	tiles := (len(source.header.columns) - 1) * (len(source.header.rows) - 1)

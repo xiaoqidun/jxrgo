@@ -40,7 +40,7 @@ type jxrNativeOutput struct {
 	stream      jxrStreamOutput
 }
 
-// jxrForwardPacket 保存首遍得到的包偏移、长度及内容身份，第二遍不能悄然写出不同索引对应的包
+// jxrForwardPacket 保存首遍得到的包偏移、长度及内容校验摘要
 type jxrForwardPacket struct {
 	offset uint64
 	length uint64
@@ -75,10 +75,9 @@ func Encode(w io.Writer, m image.Image, opts *EncodeOptions) error {
 	return wrapJXRError("Encode", encodeContextCore(context.Background(), w, m, opts))
 }
 
-// EncodeContext 保留标准图像的可读颜色精度及预乘状态，输出原点归零
-// 自定义图像与YCbCr按Color.RGBA转换为十六位预乘颜色，原生分量应使用EncodeRaster
-// 工作内存包含内部原生副本而不包含调用方标准图像的存储，不关闭输出流
-// 入参: ctx 取消上下文，nil采用Background, w 输出流, m 标准图像, opts 编码选项
+// EncodeContext 编码标准图像并保留颜色精度与预乘状态，自定义图像与YCbCr按Color.RGBA转为十六位预乘色，输出原点归零
+// opts为nil时默认无损JXR，工作内存计入内部原生副本但不含调用方图像存储，不关闭输出流
+// 入参: ctx Context，nil采用Background, w 输出流, m 标准图像, opts 编码选项
 // 返回: error 图像、资源、精度、取消或写入错误
 func EncodeContext(ctx context.Context, w io.Writer, m image.Image, opts *EncodeOptions) error {
 	if ctx == nil {
@@ -88,7 +87,7 @@ func EncodeContext(ctx context.Context, w io.Writer, m image.Image, opts *Encode
 }
 
 // encodeContextCore 执行标准图像编码核心流程，由外层公开入口统一包装错误操作名
-// 入参: ctx 已规范化取消上下文, w 输出流, m 标准图像, opts 编码选项
+// 入参: ctx 已规范化Context, w 输出流, m 标准图像, opts 编码选项
 // 返回: error 图像、资源、精度、取消或写入错误
 func encodeContextCore(ctx context.Context, w io.Writer, m image.Image, opts *EncodeOptions) error {
 	if err := ctx.Err(); err != nil {
@@ -112,7 +111,7 @@ func encodeContextCore(ctx context.Context, w io.Writer, m image.Image, opts *En
 }
 
 // standardImageRaster 将标准图像读取为独立原生样本，不通过八位RGBA缩减十六位精度
-// 入参: ctx 取消上下文, m 标准图像, limits 内部原生图像资源限制
+// 入参: ctx Context, m 标准图像, limits 内部原生图像资源限制
 // 返回: *Raster 原点为零的原生图像, error 颜色、资源或取消错误
 func standardImageRaster(ctx context.Context, m image.Image, limits Limits) (*Raster, error) {
 	bounds := m.Bounds()
@@ -228,7 +227,7 @@ func checkStandardPix(pixLen, stride, offset0, width, height, bpp int) error {
 }
 
 // copyStandardGray8 按行直接读取八位灰度像素写入单通道原生存储
-// 入参: ctx 取消上下文, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 入参: ctx Context, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
 // 返回: error 缓冲校验或取消错误
 func copyStandardGray8(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
 	if err := checkStandardPix(len(pix), stride, offset0, width, height, 1); err != nil {
@@ -260,7 +259,7 @@ func copyStandardGray8(ctx context.Context, pix []byte, stride, offset0, width, 
 }
 
 // copyStandardGray16 按行直接读取大端十六位灰度像素写入单通道原生存储
-// 入参: ctx 取消上下文, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 入参: ctx Context, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
 // 返回: error 缓冲校验或取消错误
 func copyStandardGray16(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
 	if err := checkStandardPix(len(pix), stride, offset0, width, height, 2); err != nil {
@@ -293,7 +292,7 @@ func copyStandardGray16(ctx context.Context, pix []byte, stride, offset0, width,
 }
 
 // copyStandardRGBA8 按行直接读取四通道八位像素写入原生平面存储
-// 入参: ctx 取消上下文, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 入参: ctx Context, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
 // 返回: error 缓冲校验或取消错误
 func copyStandardRGBA8(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
 	if err := checkStandardPix(len(pix), stride, offset0, width, height, 4); err != nil {
@@ -335,7 +334,7 @@ func copyStandardRGBA8(ctx context.Context, pix []byte, stride, offset0, width, 
 }
 
 // copyStandardRGBA16 按行直接读取大端四通道十六位像素写入原生平面存储
-// 入参: ctx 取消上下文, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 入参: ctx Context, pix 源像素字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
 // 返回: error 缓冲校验或取消错误
 func copyStandardRGBA16(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
 	if err := checkStandardPix(len(pix), stride, offset0, width, height, 8); err != nil {
@@ -389,9 +388,8 @@ func jxrInputTransform(info Info, color, transform uint8) uint8 {
 	return transform
 }
 
-// newJXRInputStream 从原生图像建立编码头部，布局控制窗口、分块及平面数值和量化参数
-// 尺寸、输出颜色、位深、预乘和色度位置来自图像，未指定的内部颜色采用对应的可逆格式
-// 入参: ctx 已规范化取消上下文, raster 显示方向的原生图像, layout 编码布局, maxPixels 像素上限, maxMemory 新头部内存上限
+// newJXRInputStream 从原生图像及布局建立编码头部与包索引空间，未指定的内部颜色采用对应可逆格式
+// 入参: ctx 已规范化Context, raster 显示方向的原生图像, layout 编码布局, maxPixels 像素上限, maxMemory 新头部内存上限
 // 返回: jxrStream 独立头部与包索引空间, error 格式、布局、资源或取消错误
 func newJXRInputStream(ctx context.Context, raster *Raster, layout jxrStream, maxPixels, maxMemory uint64) (jxrStream, error) {
 	if raster == nil {
@@ -420,7 +418,7 @@ func newJXRInputStream(ctx context.Context, raster *Raster, layout jxrStream, ma
 }
 
 // newJXRInputHeader 按已明确来源的完整元数据建立编码头，不触碰不存在于逐块源中的整图样本
-// 入参: ctx 已规范化取消上下文, info 原生元数据, layout 编码布局, maxPixels 像素上限, maxMemory 新头部内存上限
+// 入参: ctx 已规范化Context, info 原生元数据, layout 编码布局, maxPixels 像素上限, maxMemory 新头部内存上限
 // 返回: jxrStream 独立头部及包目录, error 元数据、布局、资源或取消错误
 func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixels, maxMemory uint64) (jxrStream, error) {
 	if err := ctx.Err(); err != nil {
@@ -619,7 +617,7 @@ func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixe
 }
 
 // makeJXREncodingPlan 校验公开选项，在扣除原图后的剩余预算内生成内部编码参数，不修改调用方配置
-// 入参: ctx 取消上下文, raster 原生图像, opts 编码选项
+// 入参: ctx Context, raster 原生图像, opts 编码选项
 // 返回: jxrStream 编码头部, jxrNativeOutput 输出参数, error 选项、资源或取消错误
 func makeJXREncodingPlan(ctx context.Context, raster *Raster, opts *EncodeOptions) (jxrStream, jxrNativeOutput, error) {
 	var o EncodeOptions
@@ -637,7 +635,7 @@ func makeJXREncodingPlan(ctx context.Context, raster *Raster, opts *EncodeOption
 }
 
 // makeJXREncodingPlanRetained 共用完整原图和有界分块源的布局规划，选项及常驻源容量由对应入口先行校验
-// 入参: ctx 已规范化取消上下文, raster 原图或仅含完整元数据的内部视图, opts 已校验编码选项, retained 常驻源和元数据容量
+// 入参: ctx 已规范化Context, raster 原图或仅含完整元数据的内部视图, opts 已校验编码选项, retained 常驻源和元数据容量
 // 返回: jxrStream 编码头部, jxrNativeOutput 输出参数, error 选项、资源或取消错误
 func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *EncodeOptions, retained uint64) (jxrStream, jxrNativeOutput, error) {
 	var o EncodeOptions
@@ -746,7 +744,7 @@ func checkJXREncodeOptions(o EncodeOptions) error {
 }
 
 // makeJXREncodePlane 按原生数值编码建立图像级共用参数，量化切片只读取不共享
-// 入参: ctx 取消上下文, raster 原生图像, o 平面选项, alpha 透明度平面, includeAlpha 自动浮点偏置是否同时覆盖透明度, lossy 是否允许精度损失
+// 入参: ctx Context, raster 原生图像, o 平面选项, alpha 透明度平面, includeAlpha 自动浮点偏置是否同时覆盖透明度, lossy 是否允许精度损失
 // 返回: jxrPlane 平面参数, error 选项、精度或取消错误
 func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alpha, includeAlpha, lossy bool) (jxrPlane, error) {
 	p := jxrPlane{bands: uint8(o.Band), scaled: o.Scaled, shift: o.Shift, dcUniform: true, lpUniform: true, hpUniform: true}
@@ -828,7 +826,7 @@ func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alp
 }
 
 // jxrQuantizationWork 计算公开量化配置持有的数组容量，不把裁短切片视为释放底层数据
-// 入参: ctx 当前上下文, q 可选量化配置, maximum 活动容量上限
+// 入参: ctx Context, q 可选量化配置, maximum 活动容量上限
 // 返回: uint64 配置存储容量, error 资源或取消错误
 func jxrQuantizationWork(ctx context.Context, q *Quantization, maximum uint64) (uint64, error) {
 	if err := ctx.Err(); err != nil {
@@ -869,7 +867,7 @@ func jxrQuantizationWork(ctx context.Context, q *Quantization, maximum uint64) (
 }
 
 // snapshotJXRQuantization 按实际长度复制公开配置，可为继承透明度只保留每组首分量
-// 入参: ctx 当前上下文, q 原始配置, maximum 副本额度, first 是否提取首分量
+// 入参: ctx Context, q 原始配置, maximum 副本额度, first 是否提取首分量
 // 返回: *Quantization 独占配置, uint64 副本存储容量, error 资源或取消错误
 func snapshotJXRQuantization(ctx context.Context, q *Quantization, maximum uint64, first bool) (*Quantization, uint64, error) {
 	if err := ctx.Err(); err != nil {
@@ -986,7 +984,7 @@ func snapshotJXRQuantization(ctx context.Context, q *Quantization, maximum uint6
 }
 
 // planJXRQuantization 按最终分块网格统一预检并复制双平面量化，默认透明度继承主平面首分量
-// 入参: ctx 当前上下文, source 已校验最终网格, options 公开选项, maximum 包含布局和设置的额度
+// 入参: ctx Context, source 已校验最终网格, options 公开选项, maximum 包含布局和设置的额度
 // 返回: []jxrTileSetting 独占设置, uint64 仍活动的公开配置容量, error 参数、资源或取消错误
 func planJXRQuantization(ctx context.Context, source *jxrStream, options EncodeOptions, maximum uint64) ([]jxrTileSetting, uint64, error) {
 	configuration := [2]*Quantization{options.Quantization, nil}
@@ -1090,7 +1088,7 @@ func planJXRQuantization(ctx context.Context, source *jxrStream, options EncodeO
 }
 
 // checkJXRQuantTile 校验单块集合、复用及核心索引，并计算精确容量的私有参数存储
-// 入参: ctx 当前上下文, values 公开分块参数, plane 目标平面, channels 来源向量允许的分量数, macros 核心宏块数
+// 入参: ctx Context, values 公开分块参数, plane 目标平面, channels 来源向量允许的分量数, macros 核心宏块数
 // 返回: uint64 私有参数容量, uint8 改写的频带标志, error 参数或取消错误
 func checkJXRQuantTile(ctx context.Context, values TileQuantization, plane *jxrPlane, channels int, macros uint64) (uint64, uint8, error) {
 	if err := ctx.Err(); err != nil {
@@ -1150,7 +1148,7 @@ func checkJXRQuantTile(ctx context.Context, values TileQuantization, plane *jxrP
 }
 
 // copyJXRQuantTile 在已完成容量预检后复制单块参数，宏块索引只属于核心而不包含软重叠邻域
-// 入参: ctx 当前上下文, values 公开分块参数, plane 目标平面, adaptive 是否来自公开分块配置
+// 入参: ctx Context, values 公开分块参数, plane 目标平面, adaptive 是否来自公开分块配置
 // 返回: jxrTileQuant 独占参数, error 取消错误
 func copyJXRQuantTile(ctx context.Context, values TileQuantization, plane *jxrPlane, adaptive bool) (jxrTileQuant, error) {
 	q := jxrTileQuant{adaptive: adaptive, useDC: values.UseDC, useLP: values.UseLowpass}
@@ -1214,7 +1212,7 @@ func expandJXRQuantVector(values, fallback []uint8, channels int) []uint8 {
 }
 
 // copyJXRQuantIndex 分段复制已预留额度的宏块索引，避免大表复制长时间忽略取消
-// 入参: ctx 当前上下文, source 来源索引
+// 入参: ctx Context, source 来源索引
 // 返回: []uint8 精确容量副本, error 取消错误
 func copyJXRQuantIndex(ctx context.Context, source []uint8) ([]uint8, error) {
 	if source == nil {
@@ -1231,7 +1229,7 @@ func copyJXRQuantIndex(ctx context.Context, source []uint8) ([]uint8, error) {
 }
 
 // checkJXRQuantizationGeometry 无分块参数分配地预检多图配置，保证后图错误不在首图提交后才发现
-// 入参: ctx 当前上下文, info 已规范化原生描述, options 含明确分块尺寸的选项
+// 入参: ctx Context, info 已规范化原生描述, options 含明确分块尺寸的选项
 // 返回: error 网格、集合、索引或取消错误
 func checkJXRQuantizationGeometry(ctx context.Context, info Info, options EncodeOptions) error {
 	configuration := [2]*Quantization{options.Quantization, nil}
@@ -1296,9 +1294,8 @@ func checkJXRQuantizationGeometry(ctx context.Context, info Info, options Encode
 	return ctx.Err()
 }
 
-// encodeJXRNative 完成原生图像的头部、变换、分块编码及文件封装，阶段间共用输出容量预算
-// 独立码流不携带分辨率或ICC，不将缺少文件GUID的原生格式隐式转换为RGB
-// 入参: ctx 已规范化取消上下文, raster 原生图像, layout 编码布局, options 输出参数，内存上限包含原图存储
+// encodeJXRNative 完成原生图像的头部、变换、分块编码及文件封装，独立码流不携带分辨率或ICC
+// 入参: ctx 已规范化Context, raster 原生图像, layout 编码布局, options 输出参数，内存上限包含原图存储
 // 返回: []byte 完整文件或独立码流, error 格式、精度、资源或取消错误
 func encodeJXRNative(ctx context.Context, raster *Raster, layout jxrStream, options jxrNativeOutput) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
@@ -1384,7 +1381,7 @@ func encodeJXRNative(ctx context.Context, raster *Raster, layout jxrStream, opti
 }
 
 // forwardJXRNative 共用原生编码的量化预检、样本装载及正变换，不生成完整压缩输出
-// 入参: ctx 已规范化上下文, raster 原生图像, s 已校验头部, options 精度及分块参数, available 除原图外可用容量
+// 入参: ctx 已规范化Context, raster 原生图像, s 已校验头部, options 精度及分块参数, available 除原图外可用容量
 // 返回: jxrCoefficientImage 完整系数图像, error 格式、精度、资源或取消错误
 func forwardJXRNative(ctx context.Context, raster *Raster, s *jxrStream, options *jxrStreamOutput, available uint64) (jxrCoefficientImage, error) {
 	var planes [2]*jxrCoefficients
@@ -1392,7 +1389,7 @@ func forwardJXRNative(ctx context.Context, raster *Raster, s *jxrStream, options
 }
 
 // forwardJXRNativeWindowStorage 共用样本容量及参数预检，可选择完整变换或仅软重叠核心
-// 入参: ctx 当前上下文, raster 原生输入, s 已校验布局, options 编码精度, available 活跃容量, planes 独占缓冲, window 为空时完整变换
+// 入参: ctx Context, raster 原生输入, s 已校验布局, options 编码精度, available 活跃容量, planes 独占缓冲, window 为空时完整变换
 // 返回: jxrCoefficientImage 当前系数视图, error 参数、容量、数值或取消错误
 func forwardJXRNativeWindowStorage(ctx context.Context, raster *Raster, s *jxrStream, options *jxrStreamOutput, available uint64, planes *[2]*jxrCoefficients, window *jxrForwardWindow) (jxrCoefficientImage, error) {
 	if s == nil || options == nil || planes == nil || s.alpha == nil && planes[1] != nil {
@@ -1595,7 +1592,7 @@ func jxrPlanLimitError(err error, limit, retained uint64) error {
 
 // EncodeRaster 编码原生分量，不进行ICC转换、解除预乘或隐式重采样
 // 编码失败不写入输出流，底层写入失败可能已输出部分字节；不关闭调用方输出流
-// 入参: ctx 取消上下文，nil采用Background, w 输出流, raster 原生图像, opts 编码选项，nil采用无损JXR
+// 入参: ctx Context，nil采用Background, w 输出流, raster 原生图像, opts 编码选项，nil采用无损JXR
 // 返回: error 格式、精度、资源、取消或写入错误
 func EncodeRaster(ctx context.Context, w io.Writer, raster *Raster, opts *EncodeOptions) error {
 	if ctx == nil {
@@ -1605,7 +1602,7 @@ func EncodeRaster(ctx context.Context, w io.Writer, raster *Raster, opts *Encode
 }
 
 // encodeRasterCore 执行原生图像编码与写入核心逻辑，由外层公开入口统一包装错误操作名
-// 入参: ctx 已规范化取消上下文, w 输出流, raster 原生图像, opts 编码选项
+// 入参: ctx 已规范化Context, w 输出流, raster 原生图像, opts 编码选项
 // 返回: error 格式、精度、资源、取消或写入错误
 func encodeRasterCore(ctx context.Context, w io.Writer, raster *Raster, opts *EncodeOptions) error {
 	if err := ctx.Err(); err != nil {
@@ -1625,7 +1622,7 @@ func encodeRasterCore(ctx context.Context, w io.Writer, raster *Raster, opts *En
 }
 
 // encodeRasterData 编码一幅完整原生图像，是否为多图文件中的预览图由外层容器操作校验
-// 入参: ctx 已规范化的取消上下文, raster 原生图像, opts 编码选项
+// 入参: ctx 已规范化Context, raster 原生图像, opts 编码选项
 // 返回: []byte 独占编码缓冲, error 格式、精度、资源或取消错误
 func encodeRasterData(ctx context.Context, raster *Raster, opts *EncodeOptions) ([]byte, error) {
 	if opts != nil && opts.SeparateAlpha {
@@ -1643,7 +1640,7 @@ func encodeRasterData(ctx context.Context, raster *Raster, opts *EncodeOptions) 
 }
 
 // writeEncoderOutput 分段写入完整编码数据，保留底层错误并拒绝无错误的短写入
-// 入参: ctx 取消上下文, w 输出流, data 完整编码数据
+// 入参: ctx Context, w 输出流, data 完整编码数据
 // 返回: error 写入协议、底层或取消错误
 func writeEncoderOutput(ctx context.Context, w io.Writer, data []byte) error {
 	for len(data) != 0 {
@@ -1666,8 +1663,8 @@ func writeEncoderOutput(ctx context.Context, w io.Writer, data []byte) error {
 	return ctx.Err()
 }
 
-// sameInterfaceTarget 比较两个接口值是否指向同一底层对象，不可比较类型安全返回false
-// 入参: a, b 接口值
+// sameInterfaceTarget 比较两个Interface值是否指向同一底层对象，不可比较类型安全返回false
+// 入参: a, b Interface值
 // 返回: bool 是否为同一对象
 func sameInterfaceTarget(a, b any) (same bool) {
 	defer func() {
@@ -1679,7 +1676,7 @@ func sameInterfaceTarget(a, b any) (same bool) {
 }
 
 // encodeJXRCodestreamTilesSequential 从可重读提供器两遍编码独立码流到普通Writer，不持有整幅原图或拼接完整压缩结果
-// 入参: ctx 已规范化上下文, w 顺序输出, info 原生描述, read 可重读逐块提供器, opts 明确分块参数
+// 入参: ctx 已规范化Context, w 顺序输出, info 原生描述, read 可重读逐块提供器, opts 明确分块参数
 // 返回: error 参数、能力、精度、资源、源、取消或写入错误
 func encodeJXRCodestreamTilesSequential(ctx context.Context, w io.Writer, info Info, read RasterTileReader, opts *EncodeOptions) error {
 	var settings EncodeOptions
@@ -1713,7 +1710,7 @@ func encodeJXRCodestreamTilesSequential(ctx context.Context, w io.Writer, info I
 }
 
 // newJXRForwardPlan 共用整图及提供器输入的有界包目录规划，并预留仍活动的源描述和原编码参数
-// 入参: ctx 当前上下文, source 完整编码几何, options 当前输出参数, retained 源图或描述容量
+// 入参: ctx Context, source 完整编码几何, options 当前输出参数, retained 源图或描述容量
 // 返回: *jxrForwardPlan 两遍共享目录, jxrStreamOutput 扣除规划后的参数, error 几何或容量错误
 func newJXRForwardPlan(ctx context.Context, source *jxrStream, options jxrStreamOutput, retained uint64) (*jxrForwardPlan, jxrStreamOutput, error) {
 	if source == nil || len(source.header.columns) < 2 || len(source.header.rows) < 2 || len(source.header.columns) > 4097 || len(source.header.rows) > 4097 || source.primary.bands > 3 {
@@ -1745,7 +1742,7 @@ func newJXRForwardPlan(ctx context.Context, source *jxrStream, options jxrStream
 }
 
 // encodeJXRForwardPasses 先测量并校验完整包目录，再以只前进的Writer提交相同内容，不重用上一遍的系数或包缓存
-// 入参: ctx 当前上下文, w 顺序输出, plan 共享目录, encode 每遍重新创建独占状态的编码器
+// 入参: ctx Context, w 顺序输出, plan 共享目录, encode 每遍重新创建独占状态的编码器
 // 返回: error 任一遍资源、数据、源、取消或输出错误
 func encodeJXRForwardPasses(ctx context.Context, w io.Writer, plan *jxrForwardPlan, encode func(io.WriteSeeker) error) error {
 	counting := jxrCountingSeeker{}

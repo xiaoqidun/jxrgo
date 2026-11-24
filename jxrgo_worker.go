@@ -101,8 +101,8 @@ func jxrMacroChunkPlan(total, minChunk, requested int) (int, int, int) {
 }
 
 // runJXRWorkers 使用有界并发池执行独立任务，单核或单任务时在当前Goroutine零分配顺序执行
-// 入参: ctx 已规范化取消上下文, workers 最大并发数, tasks 任务总数, fn 单任务回调
-// 返回: error 首个真实错误或上下文取消错误
+// 入参: ctx 已规范化Context, workers 最大并发数, tasks 任务总数, fn 单任务回调
+// 返回: error 首个真实错误或Context取消错误
 func runJXRWorkers(ctx context.Context, workers, tasks int, fn func(context.Context, int) error) error {
 	if tasks <= 0 {
 		return ctx.Err()
@@ -123,10 +123,9 @@ func runJXRWorkers(ctx context.Context, workers, tasks int, fn func(context.Cont
 	})
 }
 
-// runJXRWorkerSlots 使用有界并发池执行独立任务并为每个工作协程提供独占槽位编号
-// 子协程发生内部panic时取消其余任务并等待全部工作协程退出后在主协程原样重新panic
-// 入参: ctx 已规范化取消上下文, workers 最大并发数, tasks 任务总数, fn 接收上下文、槽位号与任务号的回调
-// 返回: error 首个真实错误或上下文取消错误
+// runJXRWorkerSlots 使用有界并发池为各工作Goroutine分配独占槽位执行任务，子Goroutine发生panic时取消其余任务并在等待退出后重抛
+// 入参: ctx 已规范化Context, workers 最大并发数, tasks 任务总数, fn 接收Context、槽位号与任务号的回调
+// 返回: error 首个真实错误或Context取消错误
 func runJXRWorkerSlots(ctx context.Context, workers, tasks int, fn func(context.Context, int, int) error) error {
 	if err := ctx.Err(); err != nil {
 		return err

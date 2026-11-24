@@ -59,8 +59,7 @@ type jxrLowFrequencyRows struct {
 	bands   int
 }
 
-// jxrLowGrid 将低频阶段映射为带原编码坐标中心的粗网格，不分配像素阵列
-// 代表值采用正方向平局舍入；不等同于执行细网格逆变换及重叠后的图像均值
+// jxrLowGrid 将低频阶段映射为带原编码坐标中心的粗网格，代表值采用正方向平局舍入
 type jxrLowGrid struct {
 	data       []int64
 	columns    int
@@ -140,16 +139,9 @@ type jxrLowTileRows struct {
 	activeRow int
 }
 
-// DecodeReduced 从压缩域的必要重建阶段生成独立粗图，divisor支持二、四、八及十六
-// 二倍消费全部频带并完成固定邻行内的两级逆变换和重叠，格式化前合并二乘二原生工作样本，不构造完整原尺寸Raster
-// 四倍采用首级DC加LP重建值除四，八倍先合并二乘二首级格再除四；十六倍采用宏块DC的变换增益归一化
-// 代表值最近舍入且平局取正方向，不等同于完整显示图box均值；四倍及以上不含HP贡献、细网格逆变换或细重叠滤波
-// 可见编码格中心为min(x*divisor+(divisor-1)/2,原宽-1)，裁剪偏移随后加入，再按已知相位选择最近粗样点
-// 色度及alpha同步定位各自原生支持中心，最近邻平局选较大坐标，输出所有分量为完整采样格，未知色度相位返回错误
-// 保留原生数值类型、颜色解释、ICC和预乘状态，不执行ICC转换或解除预乘；方向作用于缩减后的编码格
-// 四倍及以上的频率布局只消费DC或DC加LP包，未选频带不校验；空间布局消费全部熵语法，但不重建未选频带样本
-// 逐行有界工作不含最终粗图；NewDecoder仍持有完整输入，NewDecoderAt才按需读取；成功前完成全部所选包
-// 入参: ctx 取消上下文，nil采用Background, divisor 缩减分母
+// DecodeReduced 按二、四、八或十六缩减分母从必要重建阶段生成全采样独立原生粗图，保留原生数值、颜色、ICC及预乘状态
+// 未知色度相位返回错误，四倍及以上仅重建低频带并忽略未选频率包，逐行有界工作内存不含输出粗图，NewDecoderAt按需读取
+// 入参: ctx Context，nil采用Background, divisor 缩减分母（二、四、八或十六）
 // 返回: *Raster 独立完整采样原生粗图, error 参数、能力、数据、资源、关闭、读取或取消错误
 func (d *Decoder) DecodeReduced(ctx context.Context, divisor int) (*Raster, error) {
 	if d == nil {
@@ -205,7 +197,7 @@ func jxrReducedInfo(original Info, divisor int, maximum uint64) (Info, uint64, e
 }
 
 // decodeReducedLocked 在独占锁内预检总活动额度，再以各自两条粗行配对主流及独立透明度
-// 入参: ctx 已规范化取消上下文, divisor 二、四、八或十六
+// 入参: ctx 已规范化Context, divisor 二、四、八或十六
 // 返回: *Raster 独立原生粗图, error 参数、数据、资源、能力或生命周期错误
 func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster, error) {
 	if d.closed {
@@ -413,7 +405,7 @@ func jxrReducedRowWork(source *jxrStream, divisor int) uint64 {
 }
 
 // newJXRReducedRows 预检总额度后建立必要频带的重建游标及两行缓存，保留未知相位而不自行补中心
-// 入参: ctx 当前上下文, data 可选原始流切片, source 完整流, divisor 缩减分母, maximum 总阶段额度
+// 入参: ctx Context, data 可选原始流切片, source 完整流, divisor 缩减分母, maximum 总阶段额度
 // 返回: *jxrReducedRows 固定邻行缓存, error 资源、结构、能力或取消错误
 func newJXRReducedRows(ctx context.Context, data []byte, source *jxrStream, divisor int, maximum uint64) (*jxrReducedRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -461,7 +453,7 @@ func newJXRReducedRows(ctx context.Context, data []byte, source *jxrStream, divi
 }
 
 // ensure 单向推进到所需宏块行并复制已归一化值，不在移动低频窗口后继续引用旧系数
-// 入参: ctx 当前上下文, row 包含在图内的目标宏块行
+// 入参: ctx Context, row 包含在图内的目标宏块行
 // 返回: error 行序、熵、数值或取消错误
 func (r *jxrReducedRows) ensure(ctx context.Context, row int) error {
 	if row < 0 || row >= r.height || row < r.next-2 {
@@ -541,8 +533,8 @@ func (r *jxrReducedRows) at(component, x, y int) (int64, error) {
 	return r.cache[row%2][r.offsets[component]+y%v.height*v.width+x], nil
 }
 
-// newJXRLowFrequencyPlan 在既有频率索引上建立选择性读取计划，不承诺校验被跳过频带的熵或数值
-// 入参: ctx 当前上下文, source 完整原始频率流, bands 一或二，分别选择DC及DC加LP, maximum 排序目录及源头额度
+// newJXRLowFrequencyPlan 在既有频率索引上建立选择性读取计划，跳过未选频带
+// 入参: ctx Context, source 完整原始频率流, bands 一或二，分别选择DC及DC加LP, maximum 排序目录及源头额度
 // 返回: *jxrLowFrequencyPlan 独立操作计划, error 参数、索引、能力、资源或取消错误
 func newJXRLowFrequencyPlan(ctx context.Context, source *jxrStream, bands int, maximum uint64) (*jxrLowFrequencyPlan, error) {
 	if err := ctx.Err(); err != nil {
@@ -580,7 +572,7 @@ func newJXRLowFrequencyPlan(ctx context.Context, source *jxrStream, bands int, m
 }
 
 // packet 为选中包建立严格物理上界的独立窗口，索引可非单调，预取也不能越过下一物理包
-// 入参: ctx 当前上下文, data 可选原始切片, index 原逻辑包序号
+// 入参: ctx Context, data 可选原始切片, index 原逻辑包序号
 // 返回: jxrBits 包内读取器, error 索引、范围或取消错误
 func (p *jxrLowFrequencyPlan) packet(ctx context.Context, data []byte, index int) (jxrBits, error) {
 	if err := ctx.Err(); err != nil {
@@ -661,7 +653,7 @@ func (p *jxrLowFrequencyPlan) rowWork(tile int) uint64 {
 }
 
 // newJXRLowFrequencyRows 在总额度内创建当前块的低频行状态，原始每块包数始终用于索引
-// 入参: ctx 当前上下文, data 可选切片, plan 低频操作计划, tile 原块序号, maximum 行状态及目标额度
+// 入参: ctx Context, data 可选切片, plan 低频操作计划, tile 原块序号, maximum 行状态及目标额度
 // 返回: *jxrLowFrequencyRows 连续读取器, error 参数、包、模型、资源或取消错误
 func newJXRLowFrequencyRows(ctx context.Context, data []byte, plan *jxrLowFrequencyPlan, tile int, maximum uint64) (*jxrLowFrequencyRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -716,7 +708,7 @@ func newJXRLowFrequencyRows(ctx context.Context, data []byte, plan *jxrLowFreque
 }
 
 // readRow 读取一行选中频带并恢复真实预测及反量化，目标只含低通，未选频带不被解释或验证
-// 入参: ctx 当前上下文
+// 入参: ctx Context
 // 返回: error 包、数值、序列或取消错误，结果位于读取器的当前image行
 func (r *jxrLowFrequencyRows) readRow(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -917,7 +909,7 @@ func jxrLowGridRowWork(source *jxrStream, divisor int) uint64 {
 }
 
 // newJXRLowGridRows 在任何输入读取前预留全部阶段工作额度，粗网格中心仍采用原编码坐标
-// 入参: ctx 当前上下文, data 可选原始流切片, source 完整流, divisor 四、八或十六, maximum 总阶段额度
+// 入参: ctx Context, data 可选原始流切片, source 完整流, divisor 四、八或十六, maximum 总阶段额度
 // 返回: *jxrLowGridRows 可重试建立的独立游标, error 参数、资源、能力或取消错误
 func newJXRLowGridRows(ctx context.Context, data []byte, source *jxrStream, divisor int, maximum uint64) (*jxrLowGridRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -947,7 +939,7 @@ func newJXRLowGridRows(ctx context.Context, data []byte, source *jxrStream, divi
 }
 
 // next 交出一个宏块行内的粗网格借用视图，下一次调用会覆盖系数及描述，透明度与主平面同步
-// 入参: ctx 当前上下文
+// 入参: ctx Context
 // 返回: []jxrLowGrid 主分量, []jxrLowGrid 交织透明度或nil, int 全图宏块行号, error 结束或读取错误
 func (r *jxrLowGridRows) next(ctx context.Context) ([]jxrLowGrid, []jxrLowGrid, int, error) {
 	row, index, err := r.inverse.next(ctx)
@@ -983,7 +975,7 @@ func (r *jxrLowGridRows) next(ctx context.Context) ([]jxrLowGrid, []jxrLowGrid, 
 }
 
 // newJXRHalfReducedRows 在完整频带的固定重建邻行之外只分配两条半速代表行，不分配整幅原尺寸样本
-// 入参: ctx 取消上下文, data 可选码流切片, source 完整码流, maximum 总行工作额度
+// 入参: ctx Context, data 可选码流切片, source 完整码流, maximum 总行工作额度
 // 返回: *jxrReducedRows 半速游标, error 结构、能力、资源或取消错误
 func newJXRHalfReducedRows(ctx context.Context, data []byte, source *jxrStream, maximum uint64) (*jxrReducedRows, error) {
 	work := jxrReducedRowWork(source, 2)
@@ -1041,7 +1033,7 @@ func newJXRHalfReducedRows(ctx context.Context, data []byte, source *jxrStream, 
 }
 
 // readHalf 将一条完成所有实际逆变换和重叠的原生行直接合并到粗缓存，之后不保留原行视图
-// 入参: ctx 取消上下文
+// 入参: ctx Context
 // 返回: error 行序、熵、数值或取消错误
 func (r *jxrReducedRows) readHalf(ctx context.Context) error {
 	coeff, index, err := r.half.next(ctx)
@@ -1106,7 +1098,7 @@ func jxrLowInverseRowWork(source *jxrStream, bands int) uint64 {
 }
 
 // newJXRLowInverseRows 在读取前建立固定低频窗口，DC输出仍为反量化系数，LP输出为首级逆变换后的粗网格
-// 入参: ctx 当前上下文, data 可选原流切片, source 完整原始流, bands 一或二, maximum 读取和重建总额度
+// 入参: ctx Context, data 可选原流切片, source 完整原始流, bands 一或二, maximum 读取和重建总额度
 // 返回: *jxrLowInverseRows 低频阶段游标, error 参数、资源、模型、能力或取消错误
 func newJXRLowInverseRows(ctx context.Context, data []byte, source *jxrStream, bands int, maximum uint64) (*jxrLowInverseRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1145,7 +1137,7 @@ func newJXRLowInverseRows(ctx context.Context, data []byte, source *jxrStream, b
 }
 
 // next 逐行交出未格式化粗系数，保留真实软硬边界，仅在首级重叠模式需要时读取下一邻行
-// 入参: ctx 当前上下文
+// 入参: ctx Context
 // 返回: *jxrCoefficientImage 借用低通窗口，其top定位目标行, int 全图宏块行号, error 结束时io.EOF
 func (r *jxrLowInverseRows) next(ctx context.Context) (*jxrCoefficientImage, int, error) {
 	if err := ctx.Err(); err != nil {
@@ -1237,7 +1229,7 @@ func jxrLowSpatialRowWork(s *jxrStream, tile int) uint64 {
 }
 
 // newJXRLowSpatialRows 建立空间交错低带读取器，保留真实主alpha频带声明与单独预测状态
-// 入参: ctx 当前上下文, data 原始切片, s 原始空间流, tile 原块序号, bands 一或二，选择DC或DC加LP, maximum 合计工作额度
+// 入参: ctx Context, data 原始切片, s 原始空间流, tile 原块序号, bands 一或二，选择DC或DC加LP, maximum 合计工作额度
 // 返回: *jxrLowSpatialRows 连续行读取器, error 参数、模型、容量、包或取消错误
 func newJXRLowSpatialRows(ctx context.Context, data []byte, s *jxrStream, tile, bands int, maximum uint64) (*jxrLowSpatialRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1294,7 +1286,7 @@ func newJXRLowSpatialRows(ctx context.Context, data []byte, s *jxrStream, tile, 
 }
 
 // readRow 推进完整空间行语法并丢弃高通结果，不执行高通反量化或空间逆变换，结果仍非最终缩减像素
-// 入参: ctx 当前上下文
+// 入参: ctx Context
 // 返回: error 熵、低带数值、序列或取消错误
 func (r *jxrLowSpatialRows) readRow(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -1422,7 +1414,7 @@ func jxrLowTileRowsWork(s *jxrStream, bands int) uint64 {
 }
 
 // newJXRLowTileRows 读取前预检全宽额度，原始索引和当前低通目标分别保留而不创建整图系数
-// 入参: ctx 当前上下文, data 可选原流切片, source 完整原始流, bands 一或二, maximum 当前行总额度
+// 入参: ctx Context, data 可选原流切片, source 完整原始流, bands 一或二, maximum 当前行总额度
 // 返回: *jxrLowTileRows 跨分块连续低通行, error 资源、模型、能力或取消错误
 func newJXRLowTileRows(ctx context.Context, data []byte, source *jxrStream, bands int, maximum uint64) (*jxrLowTileRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1467,7 +1459,7 @@ func newJXRLowTileRows(ctx context.Context, data []byte, source *jxrStream, band
 }
 
 // readRow 惰性切换原块行并拼接当前所有列，包行状态仍按各原块独立推进，结果不含高通行
-// 入参: ctx 当前上下文
+// 入参: ctx Context
 // 返回: error 序列、包、数值或取消错误
 func (r *jxrLowTileRows) readRow(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {

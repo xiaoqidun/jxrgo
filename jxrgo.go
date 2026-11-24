@@ -162,8 +162,7 @@ var ErrLimit = errors.New("image resource limit exceeded")
 var ErrClosed = errors.New("decoder is closed")
 
 // Limits 限制输入字节、像素数量及工作内存，零值采用默认上限
-// MaxInputBytes限制压缩输入字节数，MaxPixels限制可见像素总数，MaxMemoryBytes限制工作内存字节数
-// 工作内存额度还受宿主地址容量约束，不代表操作系统可用内存或进程峰值保证
+// MaxInputBytes限制压缩输入字节数，MaxPixels限制可见像素总数，MaxMemoryBytes限制受宿主地址容量约束的工作内存字节数
 type Limits struct {
 	MaxInputBytes  uint64
 	MaxPixels      uint64
@@ -171,9 +170,8 @@ type Limits struct {
 }
 
 // DecodeOptions 指定解码并发上限、资源上限及兼容选项
-// Workers限制并发工作协程上限，零值按CPU核数和分块规模自动选择
-// 默认按ITU-T T.835及Windows WIC事实标准以反量化前的低通系数确定高通预测方向
-// LegacyHighpassPrediction按ITU-T T.832-2009第9.4节文本用反量化后的低通系数确定高通预测方向
+// Workers限制并发Goroutine上限，零值按CPU核数和分块规模自动选择
+// 默认按反量化前低通系数确定高通预测方向，LegacyHighpassPrediction启用按反量化后低通系数预测的旧版模式
 type DecodeOptions struct {
 	Workers                  int
 	Limits                   Limits
@@ -181,19 +179,8 @@ type DecodeOptions struct {
 }
 
 // EncodeOptions 指定编码格式、布局、精度、并发与资源上限，零值采用无损JXR及全部频带
-// Orientation指定编码网格到显示网格的变换，不改变输入图像的显示方向
-// TileSize以编码方向的像素为单位，Encode、EncodeContext与EncodeRaster中两轴为零时不分块，EncodeRows中两轴为零时默认采用image.Pt(256, 16)，EncodeTiles须显式指定正的十六倍数；非零时两轴均须为十六的正整数倍
-// Alpha为nil时沿用主平面参数，非nil时独立指定；仅Lossy允许量化、浮点、整数移位或精细位的精度损失
-// 整数Shift按算术右移丢弃低位，负数向下取整；不能表示为合法解码输出的参数仍返回错误
-// SeparateAlpha仅用于带透明度的JXR文件，将透明度写入独立码流而不改变样本或预乘状态
-// MirrorSeparateAlpha仅与SeparateAlpha合用，在辅助主平面复制透明度，供从该平面读取透明度的解码器使用
-// 独立码流分别选择未指定的浮点偏置，透明度默认量化沿用主平面的首分量
-// 默认按ITU-T T.835及Windows WIC事实标准编码高通残差与预测方向
-// LegacyHighpassPrediction按ITU-T T.832-2009第9.4节文本使用反量化后低通方向与量化前残差顺序
-// Workers限制并发工作协程上限，零值自动选择，负值返回*FormatError
-// MaxOutputBytes为零时采用64MiB；编码工作内存包括原生图像、变换及输出缓冲
-// Scratch仅供行流式编码暂存独立透明度，nil时采用计入工作额度的内存缓存；其他入口不访问
-// 外部暂存从起点读写，不关闭或截断，不得与输出共用存储，其容量和I/O由调用方约束
+// TileSize以编码网格像素计且须为十六倍数，仅Lossy允许精度损失，SeparateAlpha写入独立透明度码流，LegacyHighpassPrediction启用旧版高通预测
+// Workers限制并发Goroutine上限（零值自动，负值报错），MaxOutputBytes零值采用64MiB，Scratch仅供行流式编码暂存独立透明度
 type EncodeOptions struct {
 	Format                   Format
 	Layout                   Layout
@@ -236,7 +223,7 @@ type FloatOptions struct {
 }
 
 // Quantization 指定各频带的逐分量量化参数，空切片采用零，单值共用，否则按内部颜色分量排列
-// RGB内部采用亮度及两个色度分量，透明度仅有一个分量；非零索引不保证无损恢复
+// RGB内部采用亮度及两个色度分量，透明度仅有一个分量，非零量化索引会引入精度损失
 // Tiles为空时整平面共用，否则须按最终编码网格顺序逐块指定，调用期间不得修改配置
 type Quantization struct {
 	DC       []uint8
@@ -245,11 +232,9 @@ type Quantization struct {
 	Tiles    []TileQuantization
 }
 
-// TileQuantization 指定一个编码分块的量化集合及核心宏块索引，空值继承平面默认参数
-// Lowpass和Highpass各允许一至十六组，内层向量沿用Quantization的分量排列规则
-// UseDC令低通复用直流，UseLowpass令高通复用低通及其宏块索引，不得同时给出被复用的集合
-// 索引为空时全取零，否则长度须等于该分块填充后的十六乘十六核心宏块数，按行排列
-// 索引采用编码方向，不包含软重叠邻域；高通复用低通时不得另外指定HighpassIndex
+// TileQuantization 指定单个编码分块的量化集合及核心宏块索引，空值继承平面默认参数
+// Lowpass和Highpass各允许一至十六组，UseDC与UseLowpass分别复用直流或低通集合，不得重复指定被复用集合或HighpassIndex
+// 索引为空时全取零，否则长度须等于编码方向填充后的十六乘十六核心宏块数并按行排列
 type TileQuantization struct {
 	DC            []uint8
 	Lowpass       [][]uint8
@@ -278,9 +263,8 @@ type ColorSpace uint8
 // ColorHint 表示文件COLOR_SPACE标签，零值表示未指定而非未知颜色通道
 type ColorHint uint16
 
-// ColorEncoding 保存PTM_COLOR_INFO的基色、传递特性、矩阵及范围声明，不替代原始分量或ICC配置
-// Primaries表示颜色基色代码，Transfer表示电光传递特性代码，Matrix表示颜色矩阵系数代码，FullRange表示是否满范围编码
-// 各数值采用T.832表A.8至表A.10及CICP标准标识，保留值不推断为已知颜色解释
+// ColorEncoding 保存PTM_COLOR_INFO的基色、传递特性、矩阵及范围声明，原始分量与ICC配置保持独立
+// Primaries、Transfer、Matrix及FullRange采用CICP标准编码标识，保留值保持未解释状态
 type ColorEncoding struct {
 	Primaries uint8
 	Transfer  uint8
@@ -291,8 +275,8 @@ type ColorEncoding struct {
 // Format 区分JPEG XR文件容器与独立图像码流
 type Format uint8
 
-// ImageType 保存表A.4的IMAGE_TYPE低两位，预览图及页序列标志可以组合
-// 预览图按目录顺序与非预览图一一对应，不表示JPEG XR样本的颜色或数值格式
+// ImageType 保存IMAGE_TYPE低两位标志，可组合预览图与页序列标记
+// 预览图按目录顺序与非预览图一一对应，与样本颜色或数值格式无关
 type ImageType uint8
 
 // SampleFormat 表示样本位模式的数值编码，定点和浮点不按无符号整数解释
@@ -305,9 +289,8 @@ type Resolution struct {
 }
 
 // Info 保存方向变换后的图像范围、像素格式及颜色信息
-// Channels不包含透明度；Premultiplied表示颜色已乘透明度，不在原生解码时解除预乘
-// Linear表示扩展范围数值格式，ICCProfile保留原配置数据，ColorSpace单独说明颜色解释
-// ColorHint和ColorEncoding保留文件颜色声明，独立码流不携带这些文件元数据
+// Channels不含透明度，Premultiplied保持原样不解除预乘，Linear表示扩展范围数值格式，ColorSpace单独说明颜色解释
+// ICCProfile、ColorHint及ColorEncoding保留文件颜色元数据，独立码流不携带这些字段
 type Info struct {
 	Format        Format
 	ImageType     ImageType
@@ -809,8 +792,7 @@ func jxrColorSpace(color uint8) ColorSpace {
 }
 
 // NewRaster 创建样本全零的原生图像并复制元数据，输入元数据不计入新图像内存预算
-// Channels为零时由分量数量推定，零采样间隔采用一，未指定的分量范围按采样间隔确定
-// Linear及全采样分量的定位由数值编码和网格确定，空像素格式名称由分量描述生成
+// 缺省的Channels、采样间隔、分量范围、全采样定位及像素格式名称均由分量与数值编码自动补齐
 // 入参: info 图像及完整数值编码信息, limits 新图像资源限制，零值采用默认上限
 // 返回: *Raster 独立原生图像, error 元数据或资源错误
 func NewRaster(info Info, limits Limits) (*Raster, error) {
@@ -822,7 +804,7 @@ func NewRaster(info Info, limits Limits) (*Raster, error) {
 }
 
 // newRasterContext 在分配前检查全部样本及元数据容量，分配和复制期间检查取消状态
-// 入参: ctx 已规范化取消上下文, info 图像信息, limits 新图像资源限制
+// 入参: ctx 已规范化Context, info 图像信息, limits 新图像资源限制
 // 返回: *Raster 独立原生图像, error 元数据、资源或取消错误
 func newRasterContext(ctx context.Context, info Info, limits Limits) (*Raster, error) {
 	if err := ctx.Err(); err != nil {
@@ -896,7 +878,7 @@ func newRasterContext(ctx context.Context, info Info, limits Limits) (*Raster, e
 }
 
 // Clone 复制元数据及原生样本，原图内存不计入副本资源限制
-// 入参: ctx 取消上下文，nil采用Background, limits 副本资源限制
+// 入参: ctx Context，nil采用Background, limits 副本资源限制
 // 返回: *Raster 独立图像副本, error 图像、资源或取消错误
 func (r *Raster) Clone(ctx context.Context, limits Limits) (*Raster, error) {
 	if ctx == nil {
@@ -910,7 +892,7 @@ func (r *Raster) Clone(ctx context.Context, limits Limits) (*Raster, error) {
 }
 
 // clone 执行原生图像元数据及样本的完整深拷贝，由公开入口统一归一化错误
-// 入参: ctx 已规范化取消上下文, limits 副本资源限制
+// 入参: ctx 已规范化Context, limits 副本资源限制
 // 返回: *Raster 独立图像副本, error 图像、资源或取消错误
 func (r *Raster) clone(ctx context.Context, limits Limits) (*Raster, error) {
 	if err := ctx.Err(); err != nil {
@@ -1270,7 +1252,7 @@ func cloneColorEncoding(encoding *ColorEncoding) *ColorEncoding {
 	return &value
 }
 
-// checkJXRColorMetadata 按T.832 A.7.17及A.7.21校验文件颜色声明的像素格式与矩阵约束
+// checkJXRColorMetadata 校验文件颜色声明的像素格式与矩阵约束
 // 入参: format 原生像素格式, hint 文件颜色提示, encoding 可选PTM声明
 // 返回: error 颜色元数据错误
 func checkJXRColorMetadata(format jxrPixelFormat, hint ColorHint, encoding *ColorEncoding) error {

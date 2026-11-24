@@ -21,11 +21,9 @@ import (
 	"io"
 )
 
-// RasterStripWriter 同步消费按编码宏块行产生的原生行带，region为完整显示网格中的位置，source为零起点临时图像
-// 方向变换后行带可能为竖带或逆序；仅在回调期间读取source，不得修改、保留引用或重入当前Decoder
-// 需要保留时可在回调内显式Clone，其外部存储由调用方约束；错误原样返回，已消费行带不回滚
-// 入参: ctx 当前取消上下文, region 显示位置, source 临时原生分量及完整颜色元数据
-// 返回: error 消费者错误
+// RasterStripWriter 同步消费按编码宏块行产生的原生行带，region为完整显示位置，source为零起点只读临时图像
+// 方向变换后行带可能为竖带或逆序，仅回调期间可读取source，不得修改、保留引用或重入当前Decoder（如需保留请显式Clone）
+// 接收Context、显示位置及临时行带并返回消费者错误，返回非nil错误时立即中止且不回滚已消费行带
 type RasterStripWriter func(ctx context.Context, region image.Rectangle, source *Raster) error
 
 // jxrStripRowOutput 复用一条显示行带及其独立描述，将最终样本窗口投影给同步消费者
@@ -91,9 +89,7 @@ type jxrFrequencyRows struct {
 	trim     uint8
 }
 
-// jxrReconstructedRow 只读接收已完成两级逆变换及重叠滤波的一宏块行，视图不得修改或保留到回调之后
-// 入参: ctx 取消上下文, h 当前样本窗口且top定位目标行, views 主分量, alpha 透明度, row 原始宏块行号
-// 返回: error 消费者错误，原样向上传递并停止后续熵读取
+// jxrReconstructedRow 定义只读消费已完成两级逆变换及重叠滤波宏块行的回调函数类型
 type jxrReconstructedRow func(ctx context.Context, h *jxrHeader, views []jxrComponentView, alpha *jxrComponentView, row int) error
 
 // jxrReconstructedRows 以固定邻行状态按需交出最终样本行，允许不同裁剪及分块的主流与透明度流同步推进
@@ -148,7 +144,7 @@ type jxrSampleRowOutput struct {
 }
 
 // planDecodeRows 只在行工作量可能更小时预检完整输出并计入调用方额外输出预留容量，不修改解码器上限
-// 入参: ctx 当前上下文, full 原整幅路径的总工作容量, extra 额外预留字节数
+// 入参: ctx Context, full 原整幅路径的总工作容量, extra 额外预留字节数
 // 返回: jxrStripPlan 可采用的行布局, uint64 完整输出容量，零表示不采用, error 取消错误
 func (d *Decoder) planDecodeRows(ctx context.Context, full, extra uint64) (jxrStripPlan, uint64, error) {
 	var empty jxrStripPlan
@@ -191,7 +187,7 @@ func (d *Decoder) planDecodeRows(ctx context.Context, full, extra uint64) (jxrSt
 }
 
 // decodeRows 用已预算的行布局填充完整原生图像，全部包成功后才返回独立结果
-// 入参: ctx 当前上下文, plan 包含完整目标容量的有效布局, work 完整图像存储容量
+// 入参: ctx Context, plan 包含完整目标容量的有效布局, work 完整图像存储容量
 // 返回: *Raster 完整原生图像, error 存储、数据、读取或取消错误
 func (d *Decoder) decodeRows(ctx context.Context, plan jxrStripPlan, work uint64) (*Raster, error) {
 	target, err := newRasterContext(ctx, d.info, Limits{MaxPixels: d.limits.MaxPixels, MaxMemoryBytes: work})
@@ -220,7 +216,7 @@ func (d *Decoder) decodeRows(ctx context.Context, plan jxrStripPlan, work uint64
 }
 
 // decodeRowsHardTiles 在全内存多独立分块且预算充足时按分块并行重建并写入互不相交的目标区域
-// 入参: ctx 当前上下文, target 独占完整原生输出图像, plan 已预检的行带预算布局
+// 入参: ctx Context, target 独占完整原生输出图像, plan 已预检的行带预算布局
 // 返回: bool 是否已由多核分块路径完成, error 解码、数值或取消错误
 func (d *Decoder) decodeRowsHardTiles(ctx context.Context, target *Raster, plan jxrStripPlan) (bool, error) {
 	if d.workers <= 1 || d.source.primary.input != nil || d.source.alpha != nil && d.source.alpha.input != nil {
@@ -312,7 +308,7 @@ func (d *Decoder) decodeRowsHardTiles(ctx context.Context, target *Raster, plan 
 }
 
 // decodeRowsFullParallel 在预算可容纳完整系数时执行并行熵解码、两级重建与行分片像素写入
-// 入参: ctx 当前上下文, target 独占完整原生输出图像, plan 已预检的行带预算布局
+// 入参: ctx Context, target 独占完整原生输出图像, plan 已预检的行带预算布局
 // 返回: bool 是否已由多核整图系数路径完成, error 解码、数值或取消错误
 func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, plan jxrStripPlan) (bool, error) {
 	if d.workers <= 1 || d.source.primary.input != nil || d.source.alpha != nil && d.source.alpha.input != nil {
@@ -453,7 +449,7 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 }
 
 // copyJXRDecodedStrip 按显示方向及各分量网格复制借用行带，不保留临时样本引用
-// 入参: ctx 当前上下文, target 独占完整图像, region 行带显示区域, strip 临时平面样本
+// 入参: ctx Context, target 独占完整图像, region 行带显示区域, strip 临时平面样本
 // 返回: error 取消错误
 func copyJXRDecodedStrip(ctx context.Context, target *Raster, region image.Rectangle, strip *Raster) error {
 	for index, info := range target.info.Components {
@@ -480,11 +476,9 @@ func copyJXRDecodedStrip(ctx context.Context, target *Raster, region image.Recta
 	return ctx.Err()
 }
 
-// DecodeStrips 单遍推进首图各有效包，以固定重建邻行和一条可复用原生行带输出，不分配整幅系数或样本图
-// 支持两布局、软硬重叠、交织及独立alpha和八方向；多分块须有索引，未对齐原生子采样裁剪暂不支持
-// 全速420保留真实最终样本邻行，元数据不触发ICC转换；所有有效包在成功返回前完成熵及数值检查
-// NewDecoder仍持有完整输入，NewDecoderAt才按需有界读取；回调可能先于后续损坏或取消发生，不保证原子输出
-// 入参: ctx 取消上下文，nil采用Background, write 同步行带消费者，不得重入当前Decoder
+// DecodeStrips 单遍推进首图有效包并以固定邻行与单条可复用原生行带输出，不分配整幅系数或样本图
+// 成功返回前校验全部有效包且不触发ICC转换，已回调行带在后续出错或取消时不回滚，NewDecoderAt按需读取
+// 入参: ctx Context，nil采用Background, write 同步行带消费者，不得重入当前Decoder
 // 返回: error 数据、能力、资源、关闭、读取、取消或消费者错误
 func (d *Decoder) DecodeStrips(ctx context.Context, write RasterStripWriter) error {
 	if d == nil {
@@ -508,7 +502,7 @@ func (d *Decoder) DecodeStrips(ctx context.Context, write RasterStripWriter) err
 }
 
 // decodeStripsLocked 在持锁状态下预检总容量和原生网格，创建一次熵行状态并同步推进最终样本消费者
-// 入参: ctx 已规范化取消上下文, write 同步消费者
+// 入参: ctx 已规范化Context, write 同步消费者
 // 返回: error 数据、能力、资源、关闭、读取、取消或消费者错误
 func (d *Decoder) decodeStripsLocked(ctx context.Context, write RasterStripWriter) error {
 	if d.closed {
@@ -528,7 +522,7 @@ func (d *Decoder) decodeStripsLocked(ctx context.Context, write RasterStripWrite
 }
 
 // planStrips 在读取熵包前校验行网格，并将调用方额外保留容量纳入同一预算
-// 入参: ctx 当前上下文, retained 本次操作另行持有的存储字节数
+// 入参: ctx Context, retained 本次操作另行持有的存储字节数
 // 返回: jxrStripPlan 行带布局及剩余额度, error 网格、资源、能力或取消错误
 func (d *Decoder) planStrips(ctx context.Context, retained uint64) (jxrStripPlan, error) {
 	var plan jxrStripPlan
@@ -604,7 +598,7 @@ func (d *Decoder) planStrips(ctx context.Context, retained uint64) (jxrStripPlan
 }
 
 // walkStrips 按已预算的行布局推进所有有效包，不重复预检或在失败后切换解码策略
-// 入参: ctx 当前上下文, write 同步行带消费者, plan 同一解码器的有效行布局
+// 入参: ctx Context, write 同步行带消费者, plan 同一解码器的有效行布局
 // 返回: error 数据、资源、读取、取消或消费者错误
 func (d *Decoder) walkStrips(ctx context.Context, write RasterStripWriter, plan jxrStripPlan) error {
 	source := &d.source
@@ -670,7 +664,7 @@ func (d *Decoder) walkStrips(ctx context.Context, write RasterStripWriter, plan 
 }
 
 // newJXRStreamRows 根据完整流几何选择单块或跨块熵状态，单块构造会读取有效初始包头
-// 入参: ctx 取消上下文, data 可选完整流切片, s 已校验码流, maximum 可用工作容量
+// 入参: ctx Context, data 可选完整流切片, s 已校验码流, maximum 可用工作容量
 // 返回: jxrCoefficientRows 连续状态, error 资源、结构或取消错误
 func newJXRStreamRows(ctx context.Context, data []byte, s *jxrStream, maximum uint64) (jxrCoefficientRows, error) {
 	if len(s.header.columns) != 2 || len(s.header.rows) != 2 {
@@ -683,7 +677,7 @@ func newJXRStreamRows(ctx context.Context, data []byte, s *jxrStream, maximum ui
 }
 
 // copy 复用独立行带描述及样本容量，转换完成后才调用消费者，并在返回后撤销临时Raster外壳
-// 入参: ctx 取消上下文, h 最终样本窗口, views 主分量样本, alpha 透明度, row 原始宏块行号
+// 入参: ctx Context, h 最终样本窗口, views 主分量样本, alpha 透明度, row 原始宏块行号
 // 返回: error 转换、网格、取消或消费者错误
 func (output *jxrStripRowOutput) copy(ctx context.Context, h *jxrHeader, views []jxrComponentView, alpha *jxrComponentView, row int) error {
 	if err := ctx.Err(); err != nil {
@@ -737,7 +731,7 @@ func (output *jxrStripRowOutput) copy(ctx context.Context, h *jxrHeader, views [
 }
 
 // copy 将独立透明度按其自身裁剪、位移和量化元数据转换到主流当前行带，最多保留一条借用最终行
-// 入参: ctx 取消上下文, output 已转换主流行带, first, last 主图可见纵向范围
+// 入参: ctx Context, output 已转换主流行带, first, last 主图可见纵向范围
 // 返回: error 透明度数据、数值、资源或取消错误
 func (a *jxrStripAlphaRows) copy(ctx context.Context, output *jxrRegionRowOutput, first, last int) error {
 	var storage [1]jxrComponentView
@@ -797,7 +791,7 @@ func jxrSpatialRowWork(s *jxrStream, tile int) uint64 {
 }
 
 // newJXRSpatialRows 在总额度内建立空间包的连续读取状态，不分配整块系数
-// 入参: ctx 取消上下文, data 码流字节视图, s 已校验空间流, tile 分块序号, maximum 行处理预算
+// 入参: ctx Context, data 码流字节视图, s 已校验空间流, tile 分块序号, maximum 行处理预算
 // 返回: *jxrSpatialRows 有状态行读取器, error 参数、数据、资源或取消错误
 func newJXRSpatialRows(ctx context.Context, data []byte, s *jxrStream, tile int, maximum uint64) (*jxrSpatialRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -848,7 +842,7 @@ func newJXRSpatialRows(ctx context.Context, data []byte, s *jxrStream, tile int,
 }
 
 // readRow 按原包顺序读取一宏块行，保留未反量化预测值并覆盖调用方指定的系数行
-// 入参: ctx 取消上下文, target 单行或整图系数目标, start 目标首宏块下标
+// 入参: ctx Context, target 单行或整图系数目标, start 目标首宏块下标
 // 返回: error 数据、目标容量、数值或取消错误，末行同时校验包尾对齐
 func (r *jxrSpatialRows) readRow(ctx context.Context, target *jxrCoefficientImage, start int) error {
 	if err := ctx.Err(); err != nil {
@@ -966,7 +960,7 @@ func jxrFrequencyRowWork(s *jxrStream, tile int) uint64 {
 }
 
 // newJXRFrequencyRows 在总额度内建立独立频带状态，按DC到精细位的顺序解析量化复用关系
-// 入参: ctx 取消上下文, data 码流字节视图, s 已校验频率流, tile 分块序号, maximum 总工作额度
+// 入参: ctx Context, data 码流字节视图, s 已校验频率流, tile 分块序号, maximum 总工作额度
 // 返回: *jxrFrequencyRows 连续行状态, error 数据、模型、资源或取消错误
 func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile int, maximum uint64) (*jxrFrequencyRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1036,7 +1030,7 @@ func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile in
 }
 
 // readRow 依次恢复当前宏块行的各频带，各频带预测缓存不与其他频带或反变换后的目标混用
-// 入参: ctx 取消上下文, target 单行或环形系数目标, start 目标首宏块下标
+// 入参: ctx Context, target 单行或环形系数目标, start 目标首宏块下标
 // 返回: error 数据、目标容量、数值或取消错误，末行校验所有包尾对齐
 func (r *jxrFrequencyRows) readRow(ctx context.Context, target *jxrCoefficientImage, start int) error {
 	if err := ctx.Err(); err != nil {
@@ -1136,8 +1130,8 @@ func (r *jxrFrequencyRows) readRow(ctx context.Context, target *jxrCoefficientIm
 }
 
 // walkJXRReconstructedRows 从已预检的连续熵状态单遍恢复最终原生行，不构造整幅样本图或进行色度上采样
-// 入参: ctx 取消上下文, s 原始分块几何, reader 连续熵读取器, maximum 重建额度, emit 同步行消费者
-// 返回: error 数据、数值、资源、取消或消费者错误；已消费行不承诺回滚
+// 入参: ctx Context, s 原始分块几何, reader 连续熵读取器, maximum 重建额度, emit 同步行消费者
+// 返回: error 数据、数值、资源、取消或消费者错误，已消费行不回滚
 func walkJXRReconstructedRows(ctx context.Context, s *jxrStream, reader jxrCoefficientRows, maximum uint64, emit jxrReconstructedRow) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1175,7 +1169,7 @@ func walkJXRReconstructedRows(ctx context.Context, s *jxrStream, reader jxrCoeff
 }
 
 // newJXRReconstructedRows 在熵读取前检查额度并创建固定重建窗口，不提前读取任何包
-// 入参: ctx 取消上下文, s 原始几何及平面, reader 连续熵状态, maximum 重建额度
+// 入参: ctx Context, s 原始几何及平面, reader 连续熵状态, maximum 重建额度
 // 返回: *jxrReconstructedRows 按需行状态, error 资源、参数或取消错误
 func newJXRReconstructedRows(ctx context.Context, s *jxrStream, reader jxrCoefficientRows, maximum uint64) (*jxrReconstructedRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1209,7 +1203,7 @@ func newJXRReconstructedRows(ctx context.Context, s *jxrStream, reader jxrCoeffi
 }
 
 // next 推进到下一最终行，借用结果仅在下次推进前有效，最后两行只执行一次真实末边界刷新
-// 入参: ctx 取消上下文
+// 入参: ctx Context
 // 返回: *jxrCoefficientImage 最终样本窗口, int 原宏块行号, error 完结时为io.EOF，其他错误立即停止
 func (r *jxrReconstructedRows) next(ctx context.Context) (*jxrCoefficientImage, int, error) {
 	if err := ctx.Err(); err != nil {
@@ -1293,7 +1287,7 @@ func jxrInverseRowWork(s *jxrStream) uint64 {
 }
 
 // newJXRInverseRows 在额度内建立独立系数及样本环，色度低通及样本按各自网格处理
-// 入参: ctx 取消上下文, s 单分块码流, maximum 行重建工作额度
+// 入参: ctx Context, s 单分块码流, maximum 行重建工作额度
 // 返回: *jxrInverseRows 行重建状态, error 布局、资源或取消错误
 func newJXRInverseRows(ctx context.Context, s *jxrStream, maximum uint64) (*jxrInverseRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1335,7 +1329,7 @@ func jxrCoefficientRow(source *jxrCoefficients, first, count int) jxrCoefficient
 }
 
 // inverseFirst 仅对刚读入的原始环形行执行首级逆变换，低通结果保留给相邻行后滤波
-// 入参: ctx 取消上下文, row 全块宏块行号
+// 入参: ctx Context, row 全块宏块行号
 // 返回: error 数值范围、行号或取消错误
 func (r *jxrInverseRows) inverseFirst(ctx context.Context, row int) error {
 	if row < 0 || row >= r.height {
@@ -1355,7 +1349,7 @@ func (r *jxrInverseRows) inverseFirst(ctx context.Context, row int) error {
 }
 
 // prepareWindow 复制目标行及相邻原始值到独立工作区，人工上下边缘不会冒充真实图像边缘
-// 入参: ctx 取消上下文, row 全块宏块行号, samples 是否复制二级样本而非首级系数
+// 入参: ctx Context, row 全块宏块行号, samples 是否复制二级样本而非首级系数
 // 返回: image.Rectangle 局部目标宏块行, [4]bool 左上右下真实边缘, error 行号或取消错误
 func (r *jxrInverseRows) prepareWindow(ctx context.Context, row int, samples bool) (image.Rectangle, [4]bool, error) {
 	if row < 0 || row >= r.height {
@@ -1401,7 +1395,7 @@ func (r *jxrInverseRows) prepareWindow(ctx context.Context, row int, samples boo
 }
 
 // inverseSecond 在首级邻行可用后恢复目标行样本，结果保留到独立样本环等待二级后滤波
-// 入参: ctx 取消上下文, row 全块宏块行号
+// 入参: ctx Context, row 全块宏块行号
 // 返回: error 邻域、数值范围或取消错误
 func (r *jxrInverseRows) inverseSecond(ctx context.Context, row int) error {
 	core, edges, err := r.prepareWindow(ctx, row, false)
@@ -1435,7 +1429,7 @@ func (r *jxrInverseRows) inverseSecond(ctx context.Context, row int) error {
 }
 
 // outputRow 在二级邻行可用后执行样本后滤波，返回的窗口视图仅在下一次状态操作前有效
-// 入参: ctx 取消上下文, row 全块宏块行号
+// 入参: ctx Context, row 全块宏块行号
 // 返回: *jxrCoefficientImage 已重建样本窗口，header.top指向目标行, error 邻域、数值范围或取消错误
 func (r *jxrInverseRows) outputRow(ctx context.Context, row int) (*jxrCoefficientImage, error) {
 	core, edges, err := r.prepareWindow(ctx, row, true)
@@ -1464,7 +1458,7 @@ func jxrNeighborhoodRowWork(s *jxrStream) uint64 {
 	return jxrTileRowsWork(s)
 }
 
-// jxrTileRowsWork 按表20十二位分块数量计算当前整行的独立熵容量，不按分块行累计已结束状态
+// jxrTileRowsWork 计算当前分块整行的独立熵容量，不按分块行累计已结束状态
 // 入参: s 已校验的完整或局部码流
 // 返回: uint64 描述及熵状态容量，无效几何或溢出返回最大值
 func jxrTileRowsWork(s *jxrStream) uint64 {
@@ -1494,10 +1488,9 @@ func jxrTileRowsWork(s *jxrStream) uint64 {
 	return work
 }
 
-// jxrRowReconstructionStream 为连续重建建立全宽行几何，原始分块几何仍由独立熵状态保留
-// 该视图仅用于容量和连续存储布局，硬重叠滤波必须另行保留原始分块边界
+// jxrRowReconstructionStream 建立用于行容量与连续存储布局的全宽行几何视图，不改写包字节或原始分块边界
 // 入参: s 已校验的局部码流，至少各有两个列行端点
-// 返回: jxrStream 共享原码流描述及全宽连续行几何，不改写任何包字节
+// 返回: jxrStream 共享原码流描述及全宽连续行几何
 func jxrRowReconstructionStream(s *jxrStream) jxrStream {
 	local := *s
 	if len(s.header.columns) != 2 || len(s.header.rows) != 2 {
@@ -1508,7 +1501,7 @@ func jxrRowReconstructionStream(s *jxrStream) jxrStream {
 }
 
 // newJXRNeighborhoodRows 在读取任何包前检查合计工作，实际各列状态延迟至对应原分块行才创建
-// 入参: ctx 取消上下文, data 可选完整字节, s 已校验局部码流, maximum 合计行额度
+// 入参: ctx Context, data 可选完整字节, s 已校验局部码流, maximum 合计行额度
 // 返回: *jxrTileRows 连续局部行读取器, error 几何、模型、资源或取消错误
 func newJXRNeighborhoodRows(ctx context.Context, data []byte, s *jxrStream, maximum uint64) (*jxrTileRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1521,7 +1514,7 @@ func newJXRNeighborhoodRows(ctx context.Context, data []byte, s *jxrStream, maxi
 }
 
 // newJXRTileRows 在完整网格行额度内创建惰性熵调度器，构造期间不读取包或分配所有分块行状态
-// 入参: ctx 取消上下文, data 可选完整字节, s 已校验完整或局部流, maximum 当前行总额度
+// 入参: ctx Context, data 可选完整字节, s 已校验完整或局部流, maximum 当前行总额度
 // 返回: *jxrTileRows 连续行读取器, error 几何、模型、资源或取消错误
 func newJXRTileRows(ctx context.Context, data []byte, s *jxrStream, maximum uint64) (*jxrTileRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1547,8 +1540,8 @@ func newJXRTileRows(ctx context.Context, data []byte, s *jxrStream, maximum uint
 }
 
 // readRow 保持每个原始分块内的行和频带顺序，将各列系数写入同一连续目标行的独立区间
-// 入参: ctx 取消上下文, target 单行或环形系数缓冲, start 目标首宏块下标
-// 返回: error 行序列、容量、包、数值或取消错误；失败状态不承诺原地复用
+// 入参: ctx Context, target 单行或环形系数缓冲, start 目标首宏块下标
+// 返回: error 行序列、容量、包、数值或取消错误，失败后不可原地复用
 func (r *jxrTileRows) readRow(ctx context.Context, target *jxrCoefficientImage, start int) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1600,7 +1593,7 @@ func (r *jxrTileRows) readRow(ctx context.Context, target *jxrCoefficientImage, 
 }
 
 // copy 将最终样本同步交给唯一具体目标，不保存借用的行视图
-// 入参: ctx 取消上下文, h 最终窗口, views 主分量, alpha 透明度, row 原宏块行号
+// 入参: ctx Context, h 最终窗口, views 主分量, alpha 透明度, row 原宏块行号
 // 返回: error 输出数据、数值或取消错误
 func (output jxrSampleRowOutput) copy(ctx context.Context, h *jxrHeader, views []jxrComponentView, alpha *jxrComponentView, row int) error {
 	if output.strip != nil {
@@ -1679,7 +1672,7 @@ func jxrStreamingRowWork(s *jxrStream) uint64 {
 }
 
 // newJXRUpsampleRows 在附加预算内创建独立最终样本缓存，不分配低通系数或宏块预测元数据
-// 入参: ctx 取消上下文, s 单块420全速输出码流, maximum 当前块总额度
+// 入参: ctx Context, s 单块420全速输出码流, maximum 当前块总额度
 // 返回: *jxrUpsampleRows 最终样本状态, error 格式、资源或取消错误
 func newJXRUpsampleRows(ctx context.Context, s *jxrStream, maximum uint64) (*jxrUpsampleRows, error) {
 	if err := ctx.Err(); err != nil {
@@ -1705,7 +1698,7 @@ func newJXRUpsampleRows(ctx context.Context, s *jxrStream, maximum uint64) (*jxr
 }
 
 // accept 保存连续最终样本行并在下一行已完成时输出前一行，始终保留真实上下插值邻域
-// 入参: ctx 取消上下文, output 区域输出, h 当前样本窗口, views 主平面样本, alpha 透明度样本, row 原块行号
+// 入参: ctx Context, output 区域输出, h 当前样本窗口, views 主平面样本, alpha 透明度样本, row 原块行号
 // 返回: error 行序列、容量、数值或取消错误
 func (r *jxrUpsampleRows) accept(ctx context.Context, output jxrSampleRowOutput, h *jxrHeader, views []jxrComponentView, alpha *jxrComponentView, row int) error {
 	if err := ctx.Err(); err != nil {
@@ -1744,7 +1737,7 @@ func (r *jxrUpsampleRows) accept(ctx context.Context, output jxrSampleRowOutput,
 }
 
 // emit 在已完成的邻域中按原始扩展网格插值，局部top只定位当前行而不改变可见裁剪相位
-// 入参: ctx 取消上下文, output 区域输出, row 原块行号, local 缓存内目标行号
+// 入参: ctx Context, output 区域输出, row 原块行号, local 缓存内目标行号
 // 返回: error 数值、输出或取消错误
 func (r *jxrUpsampleRows) emit(ctx context.Context, output jxrSampleRowOutput, row, local int) error {
 	r.rows[1] = uint32(min(r.count, 3))
@@ -1760,7 +1753,7 @@ func (r *jxrUpsampleRows) emit(ctx context.Context, output jxrSampleRowOutput, r
 }
 
 // finish 仅在全部原始行已校验后刷新最后一行，末边界由真实编码网格长度延拓
-// 入参: ctx 取消上下文, output 区域输出
+// 入参: ctx Context, output 区域输出
 // 返回: error 缺行、数值、输出或取消错误
 func (r *jxrUpsampleRows) finish(ctx context.Context, output jxrSampleRowOutput) error {
 	if r.count != r.height || r.count < 1 {

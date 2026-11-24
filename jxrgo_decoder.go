@@ -55,9 +55,9 @@ type jxrRasterSource struct {
 	workers   int
 }
 
-// NewDecoder 读取有界输入并检查附录A文件或独立码流的头部，不重建像素
+// NewDecoder 读取有界输入并检查容器文件或独立码流的头部，不重建像素
 // 返回前预留常驻输入、索引和一份Info副本的总容量，不计调用方继续持有的既往返回值
-// 入参: ctx 取消上下文，nil采用Background, r 输入流, opts 解码选项，nil采用默认上限
+// 入参: ctx Context，nil采用Background, r 输入流, opts 解码选项，nil采用默认上限
 // 返回: *Decoder 解码器, error 输入、结构、能力、资源或取消错误
 func NewDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder, error) {
 	if ctx == nil {
@@ -71,7 +71,7 @@ func NewDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder
 }
 
 // newDecoder 执行NewDecoder的核心读取与头部解析逻辑，由公开入口统一归一化错误
-// 入参: ctx 已规范化上下文, r 输入流, opts 解码选项
+// 入参: ctx 已规范化Context, r 输入流, opts 解码选项
 // 返回: *Decoder 解码器, error 输入、结构、能力、资源或取消错误
 func newDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder, error) {
 	if err := ctx.Err(); err != nil {
@@ -155,10 +155,9 @@ func (d *Decoder) checkInfoCopy() error {
 	return nil
 }
 
-// Decode 在工作预算内重建分量，不进行ICC转换、解除预乘或显示范围裁剪
-// 熵解码、逆变换、滤波及输出阶段响应取消，取消后可重新解码
-// 行重建的总活动容量更小时保留完整输出及固定邻行，不保留整幅系数
-// 入参: ctx 取消上下文，nil采用Background
+// Decode 在工作预算内重建原生分量，不进行ICC转换、解除预乘或显示范围裁剪
+// 各解码阶段响应取消且取消后可重新解码，按工作内存预算自动选择整帧或行流重建
+// 入参: ctx Context，nil采用Background
 // 返回: *Raster 原生分量图像, error 数据、能力、资源、关闭或取消错误
 func (d *Decoder) Decode(ctx context.Context) (*Raster, error) {
 	if d == nil {
@@ -177,7 +176,7 @@ func (d *Decoder) Decode(ctx context.Context) (*Raster, error) {
 }
 
 // decodeReserved 在工作预算内预留额外输出容量后重建首图，不修改解码器自身上限
-// 入参: ctx 已规范化取消上下文, extra 额外预留字节数
+// 入参: ctx 已规范化Context, extra 额外预留字节数
 // 返回: *Raster 原生分量图像, error 数据、能力、资源、关闭或取消错误
 func (d *Decoder) decodeReserved(ctx context.Context, extra uint64) (*Raster, error) {
 	d.mu.Lock()
@@ -186,7 +185,7 @@ func (d *Decoder) decodeReserved(ctx context.Context, extra uint64) (*Raster, er
 }
 
 // decodeLocked 在调用方持有解码器锁时重建首图，供显式图像选择与显示路径共用相同资源规则
-// 入参: ctx 已规范化取消上下文, extra 额外预留字节数
+// 入参: ctx 已规范化Context, extra 额外预留字节数
 // 返回: *Raster 原生图像, error 结构、资源、取消或关闭错误
 func (d *Decoder) decodeLocked(ctx context.Context, extra uint64) (*Raster, error) {
 	if d.closed {
@@ -420,7 +419,7 @@ func (parser *jxrParser) bindContainerSource(source jxrRasterSource, maxPixels u
 }
 
 // reconstructContext 执行主平面及透明度的两级重建，不分配整幅中间样本图像
-// 入参: ctx 取消上下文
+// 入参: ctx Context
 // 返回: []jxrComponentView 主平面视图, *jxrComponentView 透明度视图, error 数值、数据或取消错误
 func (c *jxrCoefficientImage) reconstructContext(ctx context.Context) ([]jxrComponentView, *jxrComponentView, error) {
 	primary, err := c.primary.reconstructContext(ctx, &c.header)
@@ -438,7 +437,7 @@ func (c *jxrCoefficientImage) reconstructContext(ctx context.Context) ([]jxrComp
 }
 
 // reconstructContext 按标准顺序执行两级逆变换及重叠滤波，各阶段响应取消
-// 入参: ctx 取消上下文, h 当前图像头
+// 入参: ctx Context, h 当前图像头
 // 返回: []jxrComponentView 原地重建样本视图, error 数值、数据或取消错误
 func (c *jxrCoefficients) reconstructContext(ctx context.Context, h *jxrHeader) ([]jxrComponentView, error) {
 	if _, err := c.inverseFirstContext(ctx, h); err != nil {
@@ -493,7 +492,7 @@ func (source *jxrRasterSource) decodeWork() uint64 {
 }
 
 // decodeContext 从已校验索引重建像素，复用头部及分块索引并响应取消
-// 入参: ctx 取消上下文, maxPixels 剩余RGBA64等价输出容量, maxWork 重建及原生输出的工作字节上限
+// 入参: ctx Context, maxPixels 剩余RGBA64等价输出容量, maxWork 重建及原生输出的工作字节上限
 // 返回: *Raster 原生分量图像, error 重建、数据、资源或取消错误
 func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, maxWork uint64) (*Raster, error) {
 	if err := ctx.Err(); err != nil {
@@ -631,7 +630,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 }
 
 // decodeUnsignedFast 对无旋转无子采样的常规八位与十六位无符号整数格式直接重建像素存储
-// 入参: ctx 取消上下文, state 主码流重建状态, views 主平面样本视图, alphaView 透明度样本视图, alphaHeader 透明度图像头, alphaPlane 透明度平面, embedded 是否内嵌透明度, opacityNumber 透明度数值格式, pixels 目标像素存储
+// 入参: ctx Context, state 主码流重建状态, views 主平面样本视图, alphaView 透明度样本视图, alphaHeader 透明度图像头, alphaPlane 透明度平面, embedded 是否内嵌透明度, opacityNumber 透明度数值格式, pixels 目标像素存储
 // 返回: bool 是否已由快路径完成, error 数值范围或取消错误
 func (source *jxrRasterSource) decodeUnsignedFast(ctx context.Context, state *jxrCoefficientImage, views []jxrComponentView, alphaView *jxrComponentView, alphaHeader *jxrHeader, alphaPlane *jxrCoefficients, embedded bool, opacityNumber uint8, pixels *imageComponents) (bool, error) {
 	c := &source.container
@@ -930,7 +929,7 @@ func jxrHalfValue(bits uint16) float64 {
 	return value
 }
 
-// jxrRasterPosition 按表21映射容器方向，文件容器中的从属方向不参与变换
+// jxrRasterPosition 按方向枚举映射坐标，文件容器中的从属方向不参与变换
 // 入参: x, y 可见源坐标, width, height 源尺寸, transform 容器方向
 // 返回: int 目标横坐标, int 目标纵坐标
 func jxrRasterPosition(x, y, width, height int, transform uint8) (int, int) {
@@ -963,10 +962,9 @@ func Decode(r io.Reader) (image.Image, error) {
 	return img, nil
 }
 
-// DecodeContext 在资源上限内解码并转换为标准sRGB图像，不关闭调用方输入流
-// 未配置ICC的常规CMYK采用简单设备转换，已支持的CICP颜色编码和文件颜色提示使用对应规范
-// BT.2100 PQ及HLG采用BT.2446方法A，按1000至100 cd/m²转换并裁切超出输入峰值的显示光
-// 入参: ctx 取消上下文，nil采用Background, r 输入流, opts 解码选项
+// DecodeContext 在资源上限内解码并转换为非预乘十六位sRGB图像，不关闭调用方输入流
+// 支持CICP、文件颜色提示及未配置ICC的常规CMYK转换，BT.2100 PQ与HLG按BT.2446方法A映射到100 cd/m²
+// 入参: ctx Context，nil采用Background, r 输入流, opts 解码选项，nil采用默认上限
 // 返回: image.Image 非预乘十六位标准图像, error 输入、颜色、资源或取消错误
 func DecodeContext(ctx context.Context, r io.Reader, opts *DecodeOptions) (image.Image, error) {
 	if ctx == nil {
@@ -980,7 +978,7 @@ func DecodeContext(ctx context.Context, r io.Reader, opts *DecodeOptions) (image
 }
 
 // decodeContextImage 执行标准sRGB图像解码及显示映射，不修改解码器资源上限
-// 入参: ctx 已规范化取消上下文, r 输入流, opts 解码选项
+// 入参: ctx 已规范化Context, r 输入流, opts 解码选项
 // 返回: image.Image 非预乘十六位标准图像, error 输入、颜色、资源或取消错误
 func decodeContextImage(ctx context.Context, r io.Reader, opts *DecodeOptions) (image.Image, error) {
 	d, err := newDecoder(ctx, r, opts)
@@ -1023,8 +1021,8 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 	return cfg, nil
 }
 
-// DecodeConfigContext 在资源上限内检查头部，显示配置不代表ICC或多通道转换已受支持
-// 入参: ctx 取消上下文，nil采用Background, r 输入流, opts 解码选项
+// DecodeConfigContext 在资源上限内校验头部并返回十六位显示配置，不校验ICC或多通道显示转换支持
+// 入参: ctx Context，nil采用Background, r 输入流, opts 解码选项，nil采用默认上限
 // 返回: image.Config 十六位显示配置, error 输入、头部、资源或取消错误
 func DecodeConfigContext(ctx context.Context, r io.Reader, opts *DecodeOptions) (image.Config, error) {
 	if ctx == nil {
@@ -1038,7 +1036,7 @@ func DecodeConfigContext(ctx context.Context, r io.Reader, opts *DecodeOptions) 
 }
 
 // decodeConfigContext 执行头部校验与显示配置提取，由公开入口唯一归一化错误
-// 入参: ctx 已规范化取消上下文, r 输入流, opts 解码选项
+// 入参: ctx 已规范化Context, r 输入流, opts 解码选项
 // 返回: image.Config 十六位显示配置, error 输入、头部、资源或取消错误
 func decodeConfigContext(ctx context.Context, r io.Reader, opts *DecodeOptions) (image.Config, error) {
 	d, err := newDecoder(ctx, r, opts)

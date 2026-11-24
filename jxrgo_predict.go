@@ -406,7 +406,7 @@ func jxrPredictionRowWork(width uint64, channels int) uint64 {
 }
 
 // newJXRTileRow 在预算内一次分配预测行，所有缓存持有互不重叠的分量存储
-// 入参: ctx 取消上下文, width 宏块宽度, channels 分量数, maximum 新行存储上限
+// 入参: ctx Context, width 宏块宽度, channels 分量数, maximum 新行存储上限
 // 返回: *jxrTileRow 预测行, error 参数、资源或取消错误
 func newJXRTileRow(ctx context.Context, width, channels int, maximum uint64) (*jxrTileRow, error) {
 	if err := ctx.Err(); err != nil {
@@ -493,9 +493,8 @@ func (r *jxrTileRow) advance(x int, current *jxrTileNeighbor) error {
 	return nil
 }
 
-// prepareMacro 按规范性解码顺序的逆过程准备宏块残差，不修改原始变换系数
-// 高通扫描采用反量化前方向。系数预测按平面配置选择T.832或T.835顺序。输出缓冲由调用方复用
-// 入参: ctx 取消上下文, q 分块量化集合, lpIndex, hpIndex 当前量化索引, m 宏块及相邻缓存, exact 是否要求精确恢复, output 独立且可复用的残差缓冲
+// prepareMacro 按解码逆过程在复用输出缓冲中准备宏块残差，不修改原始变换系数
+// 入参: ctx Context, q 分块量化集合, lpIndex, hpIndex 当前量化索引, m 宏块及相邻缓存, exact 是否要求精确恢复, output 独立且可复用的残差缓冲
 // 返回: error 布局、容量、索引、精度、数值或取消错误
 func (c *jxrCoefficients) prepareMacro(ctx context.Context, q *jxrTileQuant, lpIndex, hpIndex int, m jxrMacroContext, exact bool, output *jxrEncodedMacro) error {
 	if err := ctx.Err(); err != nil {
@@ -623,7 +622,7 @@ func (c *jxrCoefficients) prepareMacro(ctx context.Context, q *jxrTileQuant, lpI
 }
 
 // prepareHighpass 计算熵扫描和重建方向，并按对应解码过程准备有界残差
-// 入参: ctx 取消上下文, q 分块量化集合, lpIndex 低通量化索引, hpIndex 高通量化索引, exact 是否精确恢复, output 宏块编码输出缓冲
+// 入参: ctx Context, q 分块量化集合, lpIndex 低通量化索引, hpIndex 高通量化索引, exact 是否精确恢复, output 宏块编码输出缓冲
 // 返回: error 预测、量化、残差范围或取消错误
 func (c *jxrCoefficients) prepareHighpass(ctx context.Context, q *jxrTileQuant, lpIndex, hpIndex int, exact bool, output *jxrEncodedMacro) error {
 	p := &c.plane
@@ -658,7 +657,7 @@ func (c *jxrCoefficients) prepareHighpass(ctx context.Context, q *jxrTileQuant, 
 }
 
 // checkQuantizedHighResidual 确认参考顺序的残差可在声明的字长内反量化
-// 入参: ctx 取消上下文, values 高通量化残差, hp 各分量高通量化参数
+// 入参: ctx Context, values 高通量化残差, hp 各分量高通量化参数
 // 返回: error 残差越界或取消错误
 func (c *jxrCoefficients) checkQuantizedHighResidual(ctx context.Context, values []int64, hp []uint8) error {
 	low, high := jxrWordBounds(c.longWord)

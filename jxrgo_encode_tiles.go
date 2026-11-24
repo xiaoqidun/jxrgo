@@ -36,12 +36,9 @@ type jxrHardTileInput struct {
 	window  jxrForwardWindow
 }
 
-// RasterRowReader 从上到下提供整行原生样本，y为显示网格中的起始行，target为零起点临时行带
-// 完整采样时行带高一，存在纵向二倍采样时高二；每个原生样本只请求一次，未写位置采用零
-// 回调期间才能使用target及其分量，不得保留引用、并发修改、替换元数据或重入当前输出
-// 源回调自己的存储和I/O由调用方约束，不计入编码工作额度
-// 入参: ctx 当前取消上下文, y 本次起始显示行, target 整宽临时原生行带
-// 返回: error 源读取错误，原样向上传递
+// RasterRowReader 从上到下单次提供整宽原生行带，y为显示网格起始行，target为零起点临时行带（未写位置为零）
+// 完整采样时行带高1、纵向二倍采样时高2；回调内不得保留target引用、并发修改、替换元数据或重入输出
+// 回调自身存储和I/O由调用方约束不计入工作预算，返回错误将原样向上传递
 type RasterRowReader func(ctx context.Context, y int, target *Raster) error
 
 // jxrRowInput 保存单遍行源的环形样本缓存，描述和行视图不保留完整原图
@@ -57,12 +54,9 @@ type jxrRowInput struct {
 	maxWork uint64
 }
 
-// RasterTileReader 按显示方向的全图窗口提供原生样本，target为零起点局部网格且每次调用前样本清零
-// 软重叠窗口包含相邻宏块且可能彼此重叠，所有调用须提供同一稳定原图的对应样本
-// 仅在调用期间使用target及其分量，不得保留引用、并发修改或替换元数据；未写位置按零样本编码
-// 不得在回调内重入当前输出；回调自己的存储和I/O资源由调用方单独约束，不计入编码工作预算
-// 入参: ctx 当前取消上下文, region 完整图像显示方向的样本窗口, target 本次局部原生图像
-// 返回: error 样本读取或取消错误，原样向上传递
+// RasterTileReader 按全图显示窗口region提供局部原生样本，target为零起点临时网格且每次调用前清零
+// 软重叠窗口可能彼此重叠，各次调用须返回同一稳定原图；回调内不得保留引用、修改元数据或重入输出
+// 回调自身存储和I/O由调用方约束不计入工作预算，返回错误将原样向上传递
 type RasterTileReader func(ctx context.Context, region image.Rectangle, target *Raster) error
 
 // planJXRHardTile 计算独立分块或软重叠邻域的局部几何及有界存储，不读取或复制原始像素
@@ -115,7 +109,7 @@ func planJXRHardTile(info Info, source *jxrStream, tile int) (jxrHardTileInput, 
 }
 
 // copyJXRHardTile 在预留容量中复制局部原始分量，可复用内部样本存储，不复制ICC或保留其他分块样本引用
-// 入参: ctx 当前上下文, raster 完整原始图像, plan 局部计划, maximum 局部原图及描述容量, local 可复用独占图像，nil时创建
+// 入参: ctx Context, raster 完整原始图像, plan 局部计划, maximum 局部原图及描述容量, local 可复用独占图像，nil时创建
 // 返回: *Raster 有界局部原生图像, error 采样、资源或取消错误
 func copyJXRHardTile(ctx context.Context, raster *Raster, plan jxrHardTileInput, maximum uint64, local *Raster) (*Raster, error) {
 	local, err := resizeJXRHardTile(ctx, raster.info, plan, maximum, local)
@@ -152,7 +146,7 @@ func copyJXRHardTile(ctx context.Context, raster *Raster, plan jxrHardTileInput,
 }
 
 // resizeJXRHardTile 共用局部原始分量的有界构造与容量复用，不读取任何原图样本
-// 入参: ctx 当前上下文, input 完整图像元数据, plan 局部计划, maximum 局部样本和描述容量, local 可复用独占图像
+// 入参: ctx Context, input 完整图像元数据, plan 局部计划, maximum 局部样本和描述容量, local 可复用独占图像
 // 返回: *Raster 局部图像，已复用的样本尚未清空或填充, error 布局、容量或取消错误
 func resizeJXRHardTile(ctx context.Context, input Info, plan jxrHardTileInput, maximum uint64, local *Raster) (*Raster, error) {
 	if err := ctx.Err(); err != nil {
@@ -211,7 +205,7 @@ func resizeJXRHardTile(ctx context.Context, input Info, plan jxrHardTileInput, m
 }
 
 // encodeJXRHardTileSourceTo 共用完整原图与逐块提供器的局部变换，预检最大容量后每次只装载当前分块
-// 入参: ctx 当前上下文, w 可定位输出, info 完整原生元数据, source 完整编码头, options 除源元数据外的工作上限, load 当前分块装载器
+// 入参: ctx Context, w 可定位输出, info 完整原生元数据, source 完整编码头, options 除源元数据外的工作上限, load 当前分块装载器
 // 返回: error 预检、样本提供、变换、编码、取消或I/O错误
 func encodeJXRHardTileSourceTo(ctx context.Context, w io.WriteSeeker, info Info, source *jxrStream, options jxrStreamOutput, load func(jxrHardTileInput, uint64, *Raster) (*Raster, error)) error {
 	settingsWork, err := options.tileWork(ctx, options.maxMemory)
@@ -349,10 +343,9 @@ func jxrForwardWindowEdges(storage *[4]uint32, extent uint32, left, right int) (
 	return storage[:count:count], index
 }
 
-// EncodeRows 从上到下单遍读取原生行带并按Format写入JXR文件或独立码流
-// 零Format默认输出FormatJXR，支持八方向、两种布局、软硬重叠及原生子采样
-// w须位于目标起点且支持绝对定位，不关闭或截断输出；失败可留下未完成数据
-// 入参: ctx 取消上下文，nil采用Background, w 可定位输出, info 原生描述, read 顺序行源, opts 编码选项
+// EncodeRows 从上到下单遍读取原生行带并按Format写入JXR文件或独立码流，零Format默认输出FormatJXR
+// w须位于目标起点且支持绝对定位，不关闭或截断输出；失败可能残留未完成数据
+// 入参: ctx Context，nil采用Background, w 可定位输出, info 原生描述, read 顺序行源, opts 编码选项
 // 返回: error 参数、能力、资源、源、取消、定位或写入错误
 func EncodeRows(ctx context.Context, w io.WriteSeeker, info Info, read RasterRowReader, opts *EncodeOptions) error {
 	if ctx == nil {
@@ -375,7 +368,7 @@ func EncodeRows(ctx context.Context, w io.WriteSeeker, info Info, read RasterRow
 }
 
 // encodeJXRRows 预检顺序行约束并从逐块编码总额度中预留环形样本及全部行描述容量
-// 入参: ctx 已规范化上下文, w 可定位输出, info 源描述, read 顺序行源, opts 编码选项, file 是否写附录A
+// 入参: ctx 已规范化Context, w 可定位输出, info 源描述, read 顺序行源, opts 编码选项, file 是否写JXR容器文件
 // 返回: error 参数、能力、资源、源或I/O错误
 func encodeJXRRows(ctx context.Context, w io.WriteSeeker, info Info, read RasterRowReader, opts *EncodeOptions, file bool) error {
 	var settings EncodeOptions
@@ -460,7 +453,7 @@ func encodeJXRRows(ctx context.Context, w io.WriteSeeker, info Info, read Raster
 }
 
 // load 将逐块需要的显示窗口从行环形缓存投影到目标，源回调只按递增行号读取一次
-// 入参: ctx 当前上下文, region 已校验的完整图像显示窗口, target 当前局部原生图像
+// 入参: ctx Context, region 已校验的完整图像显示窗口, target 当前局部原生图像
 // 返回: error 资源、顺序、源或取消错误
 func (source *jxrRowInput) load(ctx context.Context, region image.Rectangle, target *Raster) error {
 	if source.cache == nil {
@@ -510,7 +503,7 @@ func (source *jxrRowInput) load(ctx context.Context, region image.Rectangle, tar
 }
 
 // readNext 将下一条原生行带直接填入环形存储，清零行视图且不为每行分配样本
-// 入参: ctx 当前上下文
+// 入参: ctx Context
 // 返回: error 源、顺序或取消错误
 func (source *jxrRowInput) readNext(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -548,7 +541,7 @@ func (source *jxrRowInput) readNext(ctx context.Context) error {
 
 // EncodeTiles 从有界逐块样本源按Format写入JXR文件或独立码流，自动适配可定位输出与顺序输出
 // opts须给出正的十六倍数TileSize；w实现io.WriteSeeker时走单遍回填路径，否则走两遍顺序路径
-// 入参: ctx 取消上下文，nil采用Background, w 输出流, info 完整原生图像描述, read 逐块样本提供器, opts 编码选项
+// 入参: ctx Context，nil采用Background, w 输出流, info 完整原生图像描述, read 逐块样本提供器, opts 编码选项
 // 返回: error 元数据、布局、能力、精度、资源、提供器、取消或写入错误
 func EncodeTiles(ctx context.Context, w io.Writer, info Info, read RasterTileReader, opts *EncodeOptions) error {
 	if ctx == nil {
@@ -583,7 +576,7 @@ func EncodeTiles(ctx context.Context, w io.Writer, info Info, read RasterTileRea
 }
 
 // encodeJXRFileTileInput 共用文件窗口及顺序行源入口，保持普通窗口源原有包顺序及独立透明度规则
-// 入参: ctx 已规范化上下文, w 可定位输出, info 原生描述, read 样本提供器, opts 编码选项, rowOrder 是否按显示行调度
+// 入参: ctx 已规范化Context, w 可定位输出, info 原生描述, read 样本提供器, opts 编码选项, rowOrder 是否按显示行调度
 // 返回: error 预检、样本、编码、资源或I/O错误
 func encodeJXRFileTileInput(ctx context.Context, w io.WriteSeeker, info Info, read RasterTileReader, opts *EncodeOptions, rowOrder bool) error {
 	var settings EncodeOptions
@@ -620,7 +613,7 @@ func encodeJXRFileTileInput(ctx context.Context, w io.WriteSeeker, info Info, re
 }
 
 // encodeJXRCodestreamTileInput 共用随机窗口及顺序行源入口，行源仅改变有索引包的物理提交顺序
-// 入参: ctx 已规范化上下文, w 可定位输出, info 原生描述, read 样本提供器, opts 编码选项, rowOrder 是否按显示行调度
+// 入参: ctx 已规范化Context, w 可定位输出, info 原生描述, read 样本提供器, opts 编码选项, rowOrder 是否按显示行调度
 // 返回: error 预检、样本、编码、资源或I/O错误
 func encodeJXRCodestreamTileInput(ctx context.Context, w io.WriteSeeker, info Info, read RasterTileReader, opts *EncodeOptions, rowOrder bool) error {
 	var settings EncodeOptions
@@ -649,7 +642,7 @@ func encodeJXRCodestreamTileInput(ctx context.Context, w io.WriteSeeker, info In
 }
 
 // prepareJXRTileInfo 预检并复制逐块源描述，文件路径保留ICC而独立码流明确丢弃文件元数据
-// 入参: ctx 取消上下文, info 原始描述, settings 已校验的逐块编码选项
+// 入参: ctx Context, info 原始描述, settings 已校验的逐块编码选项
 // 返回: Info 独占描述快照, uint64 常驻元数据额度, error 采样、资源、能力或取消错误
 func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) (Info, uint64, error) {
 	limits := settings.Limits.normalized()
@@ -710,7 +703,7 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 }
 
 // encodeJXRProvidedTilesTo 共用文件与独立码流的逐块样本装载，局部缓冲每次清零且提供器只看到临时视图
-// 入参: ctx 当前上下文, w 可定位输出, info 独占元数据, source 编码布局, options 不含常驻元数据的额度, read 样本提供器
+// 入参: ctx Context, w 可定位输出, info 独占元数据, source 编码布局, options 不含常驻元数据的额度, read 样本提供器
 // 返回: error 提供器、精度、资源、取消或I/O错误
 func encodeJXRProvidedTilesTo(ctx context.Context, w io.WriteSeeker, info Info, source *jxrStream, options jxrStreamOutput, read RasterTileReader) error {
 	return encodeJXRHardTileSourceTo(ctx, w, info, source, options, func(plan jxrHardTileInput, maximum uint64, local *Raster) (*Raster, error) {

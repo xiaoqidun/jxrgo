@@ -26,9 +26,8 @@ import (
 // jxrTileImagePlanWork 为每幅逐块源的固定描述、原选项值和独占平面选项保留容量，ICC及量化数组另计
 const jxrTileImagePlanWork uint64 = 4096
 
-// ImageInput 指定多图文件中的一幅原生图像及其编码选项，nil选项采用无损JXR
-// Raster与Tiles二选一：传入Raster时按整图输入，传入Info与Tiles时按逐块流式提供器输入
-// 同一次EncodeImages调用中所有条目须同为Raster或同为Tiles，不得混用
+// ImageInput 指定多图文件中的一幅原生图像及其编码选项，Options为nil采用无损JXR
+// Raster与Tiles二选一，且同次EncodeImages调用中所有条目须同为整图或同为逐块提供器
 // Info或Raster.Info中的ImageType控制预览及页序列语义
 type ImageInput struct {
 	Raster  *Raster
@@ -60,9 +59,9 @@ type jxrTileImagePlan struct {
 	identifier [16]byte
 }
 
-// ImageCount 计数JPEG XR附录A目录链中的图像数量，独立码流固定返回一，不重建像素或校验各图像全部码流
+// ImageCount 计数JPEG XR容器目录链中的图像数量，独立码流固定返回一，不重建像素或校验各图像全部码流
 // 顺序遍历并检测目录环路，确保目录链接完整有效
-// 入参: ctx 取消上下文，nil采用Background
+// 入参: ctx Context，nil采用Background
 // 返回: int 图像数量, error 目录、取消或关闭错误
 func (d *Decoder) ImageCount(ctx context.Context) (int, error) {
 	if d == nil {
@@ -81,8 +80,8 @@ func (d *Decoder) ImageCount(ctx context.Context) (int, error) {
 }
 
 // ImageInfo 按ImageCount的索引顺序读取指定图像的独立信息，不改变默认首图及其缓存
-// ImageType保留预览及页序列标志，预览图的对应关系仍按A.7.20的目录顺序解释
-// 入参: ctx 取消上下文，nil采用Background, index 从零开始的目录序号
+// ImageType保留预览及页序列标志，预览图的对应关系按目录顺序解释
+// 入参: ctx Context，nil采用Background, index 从零开始的目录序号
 // 返回: Info 独立元数据副本, error 序号、数据、资源、取消或关闭错误
 func (d *Decoder) ImageInfo(ctx context.Context, index int) (Info, error) {
 	if d == nil {
@@ -109,7 +108,7 @@ func (d *Decoder) ImageInfo(ctx context.Context, index int) (Info, error) {
 
 // DecodeImage 校验目录链接并重建指定图像，主图及独立透明度使用该目录自己的字段及码流
 // 不把整幅输入复制为单图文件，内存预算包含仍保留的首图索引和元数据
-// 入参: ctx 取消上下文，nil采用Background, index 从零开始的目录序号
+// 入参: ctx Context，nil采用Background, index 从零开始的目录序号
 // 返回: *Raster 独立原生图像, error 序号、数据、能力、资源、取消或关闭错误
 func (d *Decoder) DecodeImage(ctx context.Context, index int) (*Raster, error) {
 	if d == nil {
@@ -128,7 +127,7 @@ func (d *Decoder) DecodeImage(ctx context.Context, index int) (*Raster, error) {
 }
 
 // decodeImageLocked 在持有父解码器锁时解码明确图像，保持首图和临时视图的预算规则
-// 入参: ctx 操作上下文, index 图像序号
+// 入参: ctx Context, index 图像序号
 // 返回: *Raster 独占图像, error 解码或资源错误
 func (d *Decoder) decodeImageLocked(ctx context.Context, index int) (*Raster, error) {
 	selected, err := d.imageDecoder(ctx, index)
@@ -141,8 +140,8 @@ func (d *Decoder) decodeImageLocked(ctx context.Context, index int) (*Raster, er
 	return selected.decodeLocked(ctx, 0)
 }
 
-// imageDirectory 逐个检查目录并以常量空间检测链接环路，显式图像接口不忽略后续坏链接
-// 入参: ctx 已规范化取消上下文, index 目标序号，负一表示只计数
+// imageDirectory 逐个检查目录并以常量空间检测链接环路，显式图像查询不忽略后续坏链接
+// 入参: ctx 已规范化Context, index 目标序号，负一表示只计数
 // 返回: jxrDirectory 目标目录视图, int 总数, error 目录、序号、取消或关闭错误
 func (d *Decoder) imageDirectory(ctx context.Context, index int) (jxrDirectory, int, error) {
 	if d.closed {
@@ -179,8 +178,8 @@ func (d *Decoder) imageDirectory(ctx context.Context, index int) (jxrDirectory, 
 	})
 }
 
-// jxrScanImageDirectories 顺序校验附录A目录链，并保留指定目录的视图
-// 入参: ctx 取消上下文, current 首目录视图, anchor 环路检测锚点偏移, available 可用临时容量, index 目标序号, read 目录读取回调
+// jxrScanImageDirectories 顺序校验容器目录链，并保留指定目录的视图
+// 入参: ctx Context, current 首目录视图, anchor 环路检测锚点偏移, available 可用临时容量, index 目标序号, read 目录读取回调
 // 返回: jxrDirectory 选中目录视图, int 目录总数, error 目录、序号、资源或取消错误
 func jxrScanImageDirectories(ctx context.Context, current jxrDirectory, anchor, available uint64, index int, read func(uint64, uint64) (jxrDirectory, error)) (jxrDirectory, int, error) {
 	length := current.dataSize()
@@ -239,7 +238,7 @@ func (d *Decoder) retainedHeaderWork() uint64 {
 }
 
 // imageDecoder 在首图锁保护下建立临时独占目标视图，共享输入但不缓存其他图像或忽略其预算
-// 入参: ctx 已规范化取消上下文, index 从零开始的目录序号
+// 入参: ctx 已规范化Context, index 从零开始的目录序号
 // 返回: *Decoder 首图自身或独占临时解码器, error 目录、数据、资源、取消或关闭错误
 func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error) {
 	if d.closed {
@@ -292,11 +291,9 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	return selected, nil
 }
 
-// EncodeImages 逐图编码并写入附录A多图文件，支持整图Raster或有界分块Tiles提供器
-// 整图与逐块路径均按逐包流式回填写出，不缓存当前图像的完整压缩输出
-// w须位于文件起点且支持绝对定位，函数不关闭或截断调用方输出；后续编码或写入失败可能已有输出
-// 每幅图写入完成后才链接前一目录；原生图像及编码选项在调用期间不得并发修改
-// 入参: ctx 取消上下文，nil采用Background, w 可定位输出, images 按目录顺序排列的图像, opts 全文件资源上限
+// EncodeImages 逐图流式编码并写入JXR多图容器文件，支持整图Raster或有界分块Tiles提供器，每图写完后才链接前一目录
+// w须位于文件起点且支持绝对定位，不关闭或截断输出，失败可能残留部分数据；调用期间不得并发修改输入图像及选项
+// 入参: ctx Context，nil采用Background, w 可定位输出, images 按目录顺序排列的图像, opts 全文件资源上限
 // 返回: error 容器关系、格式、精度、资源、取消、定位或写入错误
 func EncodeImages(ctx context.Context, w io.WriteSeeker, images []ImageInput, opts *FileEncodeOptions) error {
 	if ctx == nil {
@@ -339,7 +336,7 @@ func EncodeImages(ctx context.Context, w io.WriteSeeker, images []ImageInput, op
 }
 
 // encodeJXRImages 执行多图预检、资源合并与逐包增量写出，不保留单幅完整压缩缓冲
-// 入参: ctx 已规范化取消上下文, w 可定位输出, images 按目录顺序的输入, limits 全文件资源上限, maximum 全文件输出上限
+// 入参: ctx 已规范化Context, w 可定位输出, images 按目录顺序的输入, limits 全文件资源上限, maximum 全文件输出上限
 // 返回: error 元数据、关系、能力、精度、资源、取消或I/O错误
 func encodeJXRImages(ctx context.Context, w io.WriteSeeker, images []ImageInput, limits Limits, maximum uint64) error {
 	if maximum < 8 {
@@ -381,8 +378,8 @@ func encodeJXRImages(ctx context.Context, w io.WriteSeeker, images []ImageInput,
 	return ctx.Err()
 }
 
-// planJXRImageFile 预检全部原生存储、累计像素及A.7.20的预览和页序列约束
-// 入参: ctx 取消上下文, images 图像输入, limits 全文件资源, state 计划及固定工作容量, maximum 全文件字节上限
+// planJXRImageFile 预检全部原生存储、累计像素及预览和页序列约束
+// 入参: ctx Context, images 图像输入, limits 全文件资源, state 计划及固定工作容量, maximum 全文件字节上限
 // 返回: []jxrFileImagePlan 固定计划, uint64 全部输入容量, error 元数据、关系、资源或取消错误
 func planJXRImageFile(ctx context.Context, images []ImageInput, limits Limits, state, maximum uint64) ([]jxrFileImagePlan, uint64, error) {
 	plans := make([]jxrFileImagePlan, len(images))
@@ -436,7 +433,7 @@ func planJXRImageFile(ctx context.Context, images []ImageInput, limits Limits, s
 	return plans, inputs, nil
 }
 
-// jxrPreviewFormat 检查A.7.20允许用于不同原始格式图像的预览GUID，完全相同GUID由调用方先行允许
+// jxrPreviewFormat 检查允许用于不同原始格式图像的预览GUID，完全相同GUID由调用方先行允许
 // 入参: id 标准GUID末字节
 // 返回: bool 是否为明确列出的预览格式
 func jxrPreviewFormat(id byte) bool {
@@ -484,7 +481,7 @@ func jxrFileImageOptions(original *EncodeOptions, limits Limits, memory, output 
 }
 
 // writeJXRFileImageTo 在全文件额度内逐包写一幅原图，完成索引、长度和偶数填充后才链接前图
-// 入参: ctx 当前上下文, w 可定位输出, raster 当前原生图像, options 已合并的图像资源, start 当前目录位置, previous 前一链接位置, maximum 全文件字节上限, last 是否最后图像
+// 入参: ctx Context, w 可定位输出, raster 当前原生图像, options 已合并的图像资源, start 当前目录位置, previous 前一链接位置, maximum 全文件字节上限, last 是否最后图像
 // 返回: uint64 文件结束位置, uint64 当前链接位置, error 格式、精度、资源、取消或I/O错误
 func writeJXRFileImageTo(ctx context.Context, w io.WriteSeeker, raster *Raster, options *EncodeOptions, start, previous, maximum uint64, last bool) (uint64, uint64, error) {
 	if start < 8 || start > maximum || options == nil {
@@ -565,7 +562,7 @@ func relocateJXRImageDirectory(data []byte, start uint64) (uint64, error) {
 }
 
 // finishJXRImageOutput 完成当前图像偶数填充并最后提交前一目录链接，不在未完成图像上提前建立链接
-// 入参: ctx 当前上下文, w 可定位输出, start 当前目录, end 已计入填充的结束位置, previous 前一链接位置, link 当前链接位置, padding 是否待写一个零字节
+// 入参: ctx Context, w 可定位输出, start 当前目录, end 已计入填充的结束位置, previous 前一链接位置, link 当前链接位置, padding 是否待写一个零字节
 // 返回: uint64 文件结束位置, uint64 当前链接位置, error 取消、定位或写入错误
 func finishJXRImageOutput(ctx context.Context, w io.WriteSeeker, start, end, previous, link uint64, padding bool) (uint64, uint64, error) {
 	if padding {
@@ -590,7 +587,7 @@ func finishJXRImageOutput(ctx context.Context, w io.WriteSeeker, start, end, pre
 }
 
 // seekJXRImageOutput 检查输出定位结果，保留底层错误并响应取消
-// 入参: ctx 取消上下文, w 可定位输出, position 文件绝对位置
+// 入参: ctx Context, w 可定位输出, position 文件绝对位置
 // 返回: error 定位协议、底层或取消错误
 func seekJXRImageOutput(ctx context.Context, w io.WriteSeeker, position uint64) error {
 	if err := ctx.Err(); err != nil {
@@ -606,8 +603,8 @@ func seekJXRImageOutput(ctx context.Context, w io.WriteSeeker, position uint64) 
 	return nil
 }
 
-// checkJXRImageSequence 共用附录A页序列和预览对应规则，不要求源已持有完整样本或建立全部编码索引
-// 入参: ctx 当前上下文, count 图像数, describe 按序返回已校验且调用期间不变的描述、GUID和请求方向
+// checkJXRImageSequence 共用容器页序列和预览对应规则，不要求源已持有完整样本或建立全部编码索引
+// 入参: ctx Context, count 图像数, describe 按序返回已校验且调用期间不变的描述、GUID和请求方向
 // 返回: error 页标志、实际编码尺寸、预览对应、格式或取消错误
 func checkJXRImageSequence(ctx context.Context, count int, describe func(int) (Info, [16]byte, Orientation)) error {
 	var dimensions [2]image.Point
@@ -673,8 +670,8 @@ func checkJXRImageSequence(ctx context.Context, count int, describe func(int) (I
 	return ctx.Err()
 }
 
-// encodeJXRImagesTiles 从有界原生提供器逐图逐包写附录A文件，预检并复制全部描述、ICC及完整量化配置
-// 入参: ctx 已规范化取消上下文, w 可定位输出, images 按目录顺序的原生逐块源, limits 全文件资源上限, maximum 全文件输出上限
+// encodeJXRImagesTiles 从有界原生提供器逐图逐包写JXR容器文件，预检并复制全部描述、ICC及完整量化配置
+// 入参: ctx 已规范化Context, w 可定位输出, images 按目录顺序的原生逐块源, limits 全文件资源上限, maximum 全文件输出上限
 // 返回: error 参数、描述、对应关系、能力、精度、资源、提供器、取消或I/O错误
 func encodeJXRImagesTiles(ctx context.Context, w io.WriteSeeker, images []ImageInput, limits Limits, maximum uint64) error {
 	state := uint64(4096) + uint64(len(images))*jxrTileImagePlanWork
@@ -712,7 +709,7 @@ func encodeJXRImagesTiles(ctx context.Context, w io.WriteSeeker, images []ImageI
 }
 
 // planJXRTileImageFile 在任何回调及输出前快照全部描述和量化索引，先为共存的原配置及副本预检容量
-// 入参: ctx 当前上下文, images 原始逐块源, limits 全文件上限, state 固定描述容量, maximum 全文件输出上限
+// 入参: ctx Context, images 原始逐块源, limits 全文件上限, state 固定描述容量, maximum 全文件输出上限
 // 返回: []jxrTileImagePlan 独占快照, uint64 全部快照的额外常驻容量, error 描述、选项、关系、资源或取消错误
 func planJXRTileImageFile(ctx context.Context, images []ImageInput, limits Limits, state, maximum uint64) ([]jxrTileImagePlan, uint64, error) {
 	if state >= limits.MaxMemoryBytes {
@@ -802,7 +799,7 @@ func planJXRTileImageFile(ctx context.Context, images []ImageInput, limits Limit
 }
 
 // jxrTileOptionsQuantizationWork 计算主平面及显式透明度配置的完整容量，为批量快照预检共用额度
-// 入参: ctx 当前上下文, options 编码选项, maximum 两份原始配置共同容量上限
+// 入参: ctx Context, options 编码选项, maximum 两份原始配置共同容量上限
 // 返回: uint64 原配置的保守容量, error 资源或取消错误
 func jxrTileOptionsQuantizationWork(ctx context.Context, options EncodeOptions, maximum uint64) (uint64, error) {
 	work, err := jxrQuantizationWork(ctx, options.Quantization, maximum)
@@ -820,7 +817,7 @@ func jxrTileOptionsQuantizationWork(ctx context.Context, options EncodeOptions, 
 }
 
 // snapshotJXRTileOptions 在共同容量内复制完整量化配置，不让首图回调改变后图的集合、复用和索引
-// 入参: ctx 当前上下文, info 已校验原生描述, options 已合并基本选项, maximum 原配置与副本共同容量
+// 入参: ctx Context, info 已校验原生描述, options 已合并基本选项, maximum 原配置与副本共同容量
 // 返回: EncodeOptions 独占选项, uint64 量化原配置与副本的保守常驻容量, error 平面、量化、资源或取消错误
 func snapshotJXRTileOptions(ctx context.Context, info Info, options EncodeOptions, maximum uint64) (EncodeOptions, uint64, error) {
 	if (options.Alpha != nil || options.SeparateAlpha) && !info.Alpha {
@@ -878,7 +875,7 @@ func snapshotJXRTileOptions(ctx context.Context, info Info, options EncodeOption
 }
 
 // writeJXRTileFileImageTo 在全文件坐标中只构建当前源的计划，完整包及字段完成后才链接前图
-// 入参: ctx 当前上下文, w 当前输出, plan 当前独占描述, options 当前合并额度, start 当前目录, previous 前链接, maximum 全文件字节上限, last 是否末图
+// 入参: ctx Context, w 当前输出, plan 当前独占描述, options 当前合并额度, start 当前目录, previous 前链接, maximum 全文件字节上限, last 是否末图
 // 返回: uint64 文件末尾, uint64 当前链接位置, error 布局、资源、提供器、取消或I/O错误
 func writeJXRTileFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTileImagePlan, options EncodeOptions, start, previous, maximum uint64, last bool) (uint64, uint64, error) {
 	var end, link uint64

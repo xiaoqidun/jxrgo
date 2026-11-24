@@ -39,7 +39,7 @@ type UnsupportedError struct {
 
 // LimitError 表示输入、输出、像素或工作内存超出上限
 // Resource说明受限资源名称，Limit和Required在非零时分别表示上限与需求量，单位按Resource语义为字节、像素或数量
-// Detail补充具体超限操作或上下文
+// Detail补充具体超限操作或场景说明
 type LimitError struct {
 	Resource string
 	Limit    uint64

@@ -41,16 +41,9 @@ type jxrRegionRowOutput struct {
 	samples   *jxrUpsampleRows
 }
 
-// DecodeRegion 按显示方向读取指定区域，逐块重建所需局部窗口，不分配整幅系数图像
-// 软分块重叠和跨块色度上采样会包含有界相邻分块，独立分块只重建自身
-// 独立局部块及软分块邻域可连续读取所需全部包，保留有界列预测状态和固定重建邻行
-// 原生420/422行路径要求填充裁剪对齐采样网格，不进行色度上采样
-// 全速输出的422仅需同一行水平邻样本，420保留额外三行已完成后滤波样本用于垂直上采样
-// 频率、重叠、420上采样及多块行路径仅在总容量较整块小时采用；硬分块滤波保持原始边缘
-// 区域须非空且在Info范围内，边界须与各分量采样网格对齐；返回图像坐标从零开始
-// 主平面和独立透明度分别定位分块，未涉及的包不进行熵或样本校验；NewDecoder持有完整输入
-// NewDecoderAt按需读取独立码流，固定窗口的预取可能包含相邻未选择包的字节
-// 入参: ctx 取消上下文，nil采用Background, region 显示方向的像素区域
+// DecodeRegion 按显示方向逐块重建指定区域为原点归零的独立原生图像，不分配整幅系数图像
+// region须非空、位于Info范围内且边界对齐各分量采样网格，仅解码相交分块及必要重叠邻域，NewDecoderAt按需读取
+// 入参: ctx Context，nil采用Background, region 显示方向的像素区域
 // 返回: *Raster 独立原生区域图像, error 区域、数据、能力、资源、取消或关闭错误
 func (d *Decoder) DecodeRegion(ctx context.Context, region image.Rectangle) (*Raster, error) {
 	if d == nil {
@@ -69,7 +62,7 @@ func (d *Decoder) DecodeRegion(ctx context.Context, region image.Rectangle) (*Ra
 }
 
 // decodeRegionLocked 在调用方持有锁时重建区域，供显式图像选择共用相同窗口及预算规则
-// 入参: ctx 已规范化取消上下文, region 显示方向区域
+// 入参: ctx 已规范化Context, region 显示方向区域
 // 返回: *Raster 原生区域, error 区域、数据、资源、取消或关闭错误
 func (d *Decoder) decodeRegionLocked(ctx context.Context, region image.Rectangle) (*Raster, error) {
 	if d.closed {
@@ -268,7 +261,7 @@ func jxrRegionPosition(bounds image.Rectangle, width, height int, transform uint
 }
 
 // copyRegionTile 重建单块并复制所需样本，局部图像引用不跨越下一块的分配
-// 入参: ctx 取消上下文, target 区域输出, origin 分块编码网格原点, region 显示区域, width, height 原编码尺寸, transform 显示方向, alphaOnly 是否只复制独立透明度, maximum 单块工作预算
+// 入参: ctx Context, target 区域输出, origin 分块编码网格原点, region 显示区域, width, height 原编码尺寸, transform 显示方向, alphaOnly 是否只复制独立透明度, maximum 单块工作预算
 // 返回: error 重建、网格、样本或取消错误
 func (source *jxrRasterSource) copyRegionTile(ctx context.Context, target *Raster, origin image.Point, region image.Rectangle, width, height int, transform uint8, alphaOnly bool, maximum uint64) error {
 	if source.coefficientRegionRows() {
@@ -326,10 +319,7 @@ func (source *jxrRasterSource) copyRegionTile(ctx context.Context, target *Raste
 	return nil
 }
 
-// regionNeighborhood 保留完整原始分块的预测上下文，在目标块外增加两宏块的重建依赖窗口
-// 表180抽头、表159后滤波及表158逆变换分别至多跨2、6、6个亮度位置
-// 表153至156低通滤波含色度角部残差至多再跨16个位置，合计不超过32，首级逆变换保持宏块内
-// 局部边缘位于所需依赖之外，原始硬分块边界不变；只裁输出描述，不改写码流窗口或包内容
+// regionNeighborhood 保留原始分块预测边界并在目标块外扩展两宏块重叠重建邻域，仅裁剪输出描述
 // 入参: tile 原分块编号, selected 目标分块视图, coded 原编码可见区域
 // 返回: jxrRasterSource 含邻块的局部重建源, image.Rectangle 目标可见区域, error 索引错误
 func (source *jxrRasterSource) regionNeighborhood(tile int, selected jxrRasterSource, coded image.Rectangle) (jxrRasterSource, image.Rectangle, error) {
@@ -405,9 +395,8 @@ func (source *jxrRasterSource) regionDecodeWork() uint64 {
 	return work + auxiliary
 }
 
-// copyCoefficientRegionRows 连续解所需局部块的完整空间包或全部频带包，仅将目标区域码值写入已预算的最终图像
-// 所有选中块的熵、可见样本及数值保护仍被检查，不为跳过行重置模型或猜测包内偏移
-// 入参: ctx 取消上下文, target 区域输出, origin 局部块编码原点, region 显示区域, width, height 原编码尺寸, transform 显示方向, alphaOnly 是否只复制独立透明度, maximum 当前块预算
+// copyCoefficientRegionRows 逐行解码局部块全部选中包并校验熵与可见样本，仅向目标区域写入原生码值
+// 入参: ctx Context, target 区域输出, origin 局部块编码原点, region 显示区域, width, height 原编码尺寸, transform 显示方向, alphaOnly 是否只复制独立透明度, maximum 当前块预算
 // 返回: error 数据、数值、资源或取消错误
 func (source *jxrRasterSource) copyCoefficientRegionRows(ctx context.Context, target *Raster, origin image.Point, region image.Rectangle, width, height int, transform uint8, alphaOnly bool, maximum uint64) error {
 	if source.regionDecodeWork() > min(maximum, uint64(^uint(0)>>1)) {
@@ -442,7 +431,7 @@ func (source *jxrRasterSource) copyCoefficientRegionRows(ctx context.Context, ta
 }
 
 // accept 将已完成后滤波的样本行交给必要色度邻域缓存，无垂直上采样时直接复制区域
-// 入参: ctx 取消上下文, h 当前样本窗口, views 主分量样本, alpha 透明度样本, row 原块行号
+// 入参: ctx Context, h 当前样本窗口, views 主分量样本, alpha 透明度样本, row 原块行号
 // 返回: error 行缓存、样本转换、输出或取消错误
 func (output *jxrRegionRowOutput) accept(ctx context.Context, h *jxrHeader, views []jxrComponentView, alpha *jxrComponentView, row int) error {
 	if output.samples != nil {
@@ -452,7 +441,7 @@ func (output *jxrRegionRowOutput) accept(ctx context.Context, h *jxrHeader, view
 }
 
 // finish 在熵和重建全部成功后刷新延迟的色度输出，不允许尾包失败返回部分图像
-// 入参: ctx 取消上下文
+// 入参: ctx Context
 // 返回: error 最后一行输出、数值或取消错误
 func (output *jxrRegionRowOutput) finish(ctx context.Context) error {
 	if output.samples != nil {
@@ -462,7 +451,7 @@ func (output *jxrRegionRowOutput) finish(ctx context.Context) error {
 }
 
 // copy 将完整重建行的可见原生码值复制到目标区域，数值检查仍覆盖该块的全部可见样本
-// 入参: ctx 取消上下文, h 当前样本窗口及目标行偏移, views 主平面样本, alpha 透明度视图, macroY 原块宏块行号
+// 入参: ctx Context, h 当前样本窗口及目标行偏移, views 主平面样本, alpha 透明度视图, macroY 原块宏块行号
 // 返回: error 输出数值、分量或取消错误
 func (output *jxrRegionRowOutput) copy(ctx context.Context, h *jxrHeader, views []jxrComponentView, alpha *jxrComponentView, macroY int) error {
 	if color := output.source.container.format.color; color == 1 || color == 2 {
@@ -528,7 +517,7 @@ func (output *jxrRegionRowOutput) copy(ctx context.Context, h *jxrHeader, views 
 }
 
 // copyNative 按各原生分量采样网格转换已重建行，不进行色度插值、RGB转换或相位推断
-// 入参: ctx 取消上下文, h 当前样本窗口, views 主平面样本视图, alpha 透明度视图, macroY 原块宏块行号
+// 入参: ctx Context, h 当前样本窗口, views 主平面样本视图, alpha 透明度视图, macroY 原块宏块行号
 // 返回: error 输出数值、透明度布局或取消错误
 func (output *jxrRegionRowOutput) copyNative(ctx context.Context, h *jxrHeader, views []jxrComponentView, alpha *jxrComponentView, macroY int) error {
 	source, target := output.source, output.target

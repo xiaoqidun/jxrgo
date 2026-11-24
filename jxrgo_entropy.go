@@ -25,16 +25,16 @@ const (
 	jxrLongWordMax = int64(1)<<31 - 1
 )
 
-// jxrLevelBase 保存T.832表50规定的绝对值初值
+// jxrLevelBase 保存绝对值编码初值
 var jxrLevelBase = [6]int64{2, 3, 4, 6, 10, 14}
 
 // jxrLevelBits 保存绝对值初值对应的细化位数
 var jxrLevelBits = [6]uint8{0, 0, 1, 2, 2, 2}
 
-// jxrDCFlagsWriteCode 保存T.832表51规定的联合非零标志码
+// jxrDCFlagsWriteCode 保存DC联合非零标志前缀码
 var jxrDCFlagsWriteCode = jxrMakeWriteVLC(jxrMakeVLC([]string{"10", "001", "00001", "0001", "11", "010", "00000", "011"}))
 
-// jxrAbsoluteWriteCode 保存T.832表52的双绝对值前缀码
+// jxrAbsoluteWriteCode 保存双绝对值前缀码
 var jxrAbsoluteWriteCode = [2][16]jxrWriteCode{
 	jxrMakeWriteVLC(jxrMakeVLC([]string{"01", "10", "11", "001", "0001", "00000", "00001"})),
 	jxrMakeWriteVLC(jxrMakeVLC([]string{"1", "01", "001", "0001", "00001", "000000", "000001"})),
@@ -46,7 +46,7 @@ var jxrLPTranspose = [3][16]uint8{{0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7,
 // jxrLPChromaRemap 保存抽样色度联合编码的系数映射
 var jxrLPChromaRemap = [7]uint8{4, 1, 2, 3, 5, 6, 7}
 
-// jxrLPPatternWriteCode 保存T.832表55及表56的联合低通标志码
+// jxrLPPatternWriteCode 保存低通联合非零标志前缀码
 var jxrLPPatternWriteCode = [2][16]jxrWriteCode{
 	jxrMakeWriteVLC(jxrMakeVLC([]string{"0", "100", "1010", "1011", "1100", "1101", "1110", "1111"})),
 	jxrMakeWriteVLC(jxrMakeVLC([]string{"0", "10", "110", "111"})),
@@ -88,13 +88,13 @@ var jxrCBPGroupWriteCode = [2][16]jxrWriteCode{jxrMakeWriteVLC(jxrCBPGroupCode[0
 // jxrCBPChromaWriteCode 保存亮色联合高通块标志的逐符号编码
 var jxrCBPChromaWriteCode = [2][16]jxrWriteCode{jxrMakeWriteVLC(jxrCBPChromaCode[0]), jxrMakeWriteVLC(jxrCBPChromaCode[1])}
 
-// jxrThirdWriteCode 保存T.832表62的三符号前缀码
+// jxrThirdWriteCode 保存三符号前缀码
 var jxrThirdWriteCode = jxrMakeWriteVLC(jxrMakeVLC([]string{"1", "01", "00"}))
 
-// jxrChromaCountWriteCode 保存T.832表63的色度非零块数量码
+// jxrChromaCountWriteCode 保存色度非零块数量前缀码
 var jxrChromaCountWriteCode = jxrMakeWriteVLC(jxrMakeVLC([]string{"1", "01", "000", "001"}))
 
-// jxrCBPRefineWriteCode 保存T.832表64的双非零块位置码
+// jxrCBPRefineWriteCode 保存双非零块位置前缀码
 var jxrCBPRefineWriteCode = [16]jxrWriteCode{3: {0, 2}, 5: {1, 2}, 6: {4, 3}, 9: {5, 3}, 10: {6, 3}, 12: {7, 3}}
 
 // jxrCBPNibbleClass 保存四位掩码对应的标准位置细化类别
@@ -103,7 +103,7 @@ var jxrCBPNibbleClass = [16]uint8{0, 1, 1, 2, 1, 3, 3, 4, 1, 3, 3, 4, 2, 4, 4, 5
 // jxrCBPNibbleRef 保存四位掩码在对应细化类别中的索引
 var jxrCBPNibbleRef = [16]uint8{0, 0, 1, 0, 2, 0, 1, 0, 3, 2, 3, 1, 1, 2, 3, 0}
 
-// jxrRunBase 保存T.832表73的游程初值
+// jxrRunBase 保存游程初值
 var jxrRunBase = [15]uint8{1, 2, 3, 5, 7, 1, 2, 3, 5, 7, 1, 2, 3, 4, 5}
 
 // jxrRunBits 保存游程细化位数
@@ -112,10 +112,10 @@ var jxrRunBits = [15]uint8{0, 0, 1, 1, 3, 0, 0, 1, 1, 2, 0, 0, 0, 0, 1}
 // jxrRunBin 保存按最大游程选择的编码区间
 var jxrRunBin = [15]int8{-1, -1, -1, -1, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0}
 
-// jxrRunWriteCode 保存T.832表79的游程索引前缀码
+// jxrRunWriteCode 保存游程索引前缀码
 var jxrRunWriteCode = jxrMakeWriteVLC(jxrMakeVLC([]string{"1", "01", "001", "0000", "0001"}))
 
-// jxrLastIndexWriteCode 保存T.832表81的倒数第二位置索引码
+// jxrLastIndexWriteCode 保存倒数第二位置索引前缀码
 var jxrLastIndexWriteCode = jxrMakeWriteVLC(jxrMakeVLC([]string{"0", "110", "10", "111"}))
 
 // jxrRunCombinedCode 保存按最大游程与游程值直接索引的合并游程编码表
@@ -254,7 +254,7 @@ func (c *jxrDC) readResidualChecked(b *jxrBits, p *jxrPlane, values []int64) [2]
 	return mean
 }
 
-// readJXRDCFlags 按T.832表51读取亮度和双路色度的联合非零标志
+// readJXRDCFlags 读取亮度和双路色度的联合非零标志
 // 入参: b 码流读取器
 // 返回: uint8 三分量标志，错误保存在读取器中
 func readJXRDCFlags(b *jxrBits) uint8 {
@@ -296,7 +296,7 @@ func readJXRDCValue(b *jxrBits, level *jxrPairVLC, bits uint8, present bool) int
 	return value
 }
 
-// absolute 按T.832表50及表52读取绝对值，并累计编码表选择的判别值
+// absolute 读取系数绝对值并累计编码表选择的判别值
 // 入参: b 码流读取器
 // 返回: int64 系数绝对值，错误保存在读取器中
 func (v *jxrPairVLC) absolute(b *jxrBits) int64 {
@@ -342,7 +342,7 @@ func (v *jxrPairVLC) absolute(b *jxrBits) int64 {
 	return 2 + (int64(1) << bits) + int64(b.read(uint(bits)))
 }
 
-// adapt 按T.832表101切换双编码表，未切换时限制累积判别值
+// adapt 根据判别值切换双编码表，未切换时限制累积判别值
 func (v *jxrPairVLC) adapt() {
 	if v.discriminant < -8 && v.table != 0 {
 		v.table, v.discriminant = 0, 0
@@ -381,7 +381,7 @@ func (c *jxrDC) writeComponents(b *jxrBitWriter, p *jxrPlane, values []int64, ad
 	}
 }
 
-// writeResidualChecked 在平面分量和上下文已校验前提下写入逐分量DC残差语法
+// writeResidualChecked 在平面分量和Context已校验前提下写入逐分量DC残差语法
 // 入参: b 写入器, p 已校验平面格式, values 逐分量残差
 // 返回: [2]int 亮度及其他分量的非零计数，错误保存在写入器中
 func (c *jxrDC) writeResidualChecked(b *jxrBitWriter, p *jxrPlane, values []int64) [2]int {
@@ -672,7 +672,7 @@ func (c *jxrLP) readResidualChecked(b *jxrBits, p *jxrPlane, reset bool, values 
 	return mean
 }
 
-// readJXRLPPattern 按T.832表55及表56读取联合低通非零标志
+// readJXRLPPattern 读取联合低通非零标志
 // 入参: b 码流读取器, subsampled 是否采用抽样色度的二组编码
 // 返回: uint32 联合标志，错误保存在读取器中
 func readJXRLPPattern(b *jxrBits, subsampled bool) uint32 {
@@ -736,7 +736,7 @@ func (c *jxrLP) writeComponents(b *jxrBitWriter, p *jxrPlane, values [][16]int64
 	}
 }
 
-// writeResidualChecked 在平面分量和上下文已校验前提下写入低通残差语法
+// writeResidualChecked 在平面分量和Context已校验前提下写入低通残差语法
 // 入参: b 写入器, p 已校验平面格式, values 逐分量残差, reset 是否重置扫描累计, flags 标志工作缓冲
 // 返回: [2]int 亮度及其他分量非零数量，错误保存在写入器中
 func (c *jxrLP) writeResidualChecked(b *jxrBitWriter, p *jxrPlane, values [][16]int64, reset bool, flags []bool) [2]int {
@@ -1509,7 +1509,7 @@ func refineJXRCBP(b *jxrBits, count uint8) uint8 {
 	}
 }
 
-// readJXRThird 读取T.832表62的三符号前缀码
+// readJXRThird 读取三符号前缀码
 // 入参: b 码流读取器
 // 返回: uint8 零至二的符号，错误保存在读取器中
 func readJXRThird(b *jxrBits) uint8 {
@@ -1751,7 +1751,7 @@ func writeJXRCBPRefinement(b *jxrBitWriter, pattern uint8) {
 	}
 }
 
-// newJXRBlock 初始化一个频带的亮色及上下文编码表
+// newJXRBlock 初始化一个频带的亮色及自适应编码表
 // 返回: jxrBlock 初始状态
 func newJXRBlock() jxrBlock {
 	var c jxrBlock
@@ -1855,7 +1855,7 @@ func (c *jxrBlock) adapt() {
 	c.level[1].adapt()
 }
 
-// readJXRRun 按T.832表73及表76至表79读取非零游程并校验范围
+// readJXRRun 读取非零游程并校验范围
 // 入参: b 码流读取器, maximum 当前扫描位置允许的最大游程
 // 返回: uint8 游程，错误保存在读取器中
 func readJXRRun(b *jxrBits, maximum int) uint8 {
@@ -1922,7 +1922,7 @@ func jxrMakeRunWriteTable() [15][15]jxrWriteCode {
 	return table
 }
 
-// write 写入非零系数的游程、符号及幅值，并累计上下文编码表状态
+// write 写入非零系数的游程、符号及幅值，并累计自适应编码表状态
 // 入参: b 位写入器, chroma 是否使用色度状态, start 起始扫描位置, values 非空游程系数序列
 func (c *jxrBlock) write(b *jxrBitWriter, chroma bool, start int, values []jxrRunValue) {
 	if b.err != nil {

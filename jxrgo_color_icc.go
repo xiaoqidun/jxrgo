@@ -133,7 +133,7 @@ type jxrICCFloatSegment struct {
 	function     uint16
 }
 
-// jxrICCStages 保存ICC.1:2022第10.12节的曲线和仿射矩阵
+// jxrICCStages 保存mAB查表元素的曲线与仿射矩阵
 type jxrICCStages struct {
 	a      [jxrICCMaxChannels]jxrICCCurve
 	b, m   [3]jxrICCCurve
@@ -155,7 +155,7 @@ type jxrICCStageLayout struct {
 }
 
 // jxrReadICCTransform 在预算内读取ICC设备到PCS的矩阵曲线或查表转换
-// 入参: ctx 已规范化上下文, profile 原始ICC, info 解码分量, maximum 活动工作内存
+// 入参: ctx 已规范化Context, profile 原始ICC, info 解码分量, maximum 活动工作内存
 // 返回: jxrICCTransform 转换, error 配置格式、转换能力、资源或取消错误
 func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum uint64) (jxrICCTransform, error) {
 	var result jxrICCTransform
@@ -242,7 +242,7 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 	return result, ctx.Err()
 }
 
-// jxrICCColorants 读取ICC.1 F.3的三个PCS XYZ矩阵列
+// jxrICCColorants 读取三个PCS XYZ色度矩阵列
 // 入参: profile ICC配置字节, tags 已排序标签目录
 // 返回: [3][3]float64 RGB到PCS XYZ矩阵, error 标签或数值错误
 func jxrICCColorants(profile []byte, tags []jxrICCTag) ([3][3]float64, error) {
@@ -309,7 +309,7 @@ func jxrICCDeviceChannels(device string, info Info) int {
 }
 
 // jxrReadICCDirectory 校验标签边界与重叠，允许多个签名引用同一完整标签
-// 入参: ctx 已规范化上下文, profile 已限定的ICC范围, maximum 工作额度
+// 入参: ctx 已规范化Context, profile 已限定的ICC范围, maximum 工作额度
 // 返回: []jxrICCTag 按签名排序的目录, error 格式、资源或取消错误
 func jxrReadICCDirectory(ctx context.Context, profile []byte, maximum uint64) ([]jxrICCTag, error) {
 	count := uint64(binary.BigEndian.Uint32(profile[128:]))
@@ -419,7 +419,7 @@ func jxrICCXYZToSRGB() [3][3]float64 {
 }
 
 // color 应用ICC转换及目标sRGB传递函数
-// 入参: ctx 取消上下文, values 已解除预乘的源通道
+// 入参: ctx Context, values 已解除预乘的源通道
 // 返回: float64 非预乘红、绿、蓝sRGB值, error 数值或取消错误
 func (transform *jxrICCTransform) color(ctx context.Context, values []float64) (float64, float64, float64, error) {
 	if transform.lut == nil && transform.floating == nil && transform.channels == 1 {
@@ -463,7 +463,7 @@ func jxrBasicRasterDisplay(info Info) (jxrDisplayMapping, error) {
 }
 
 // jxrManagedRasterDisplay 启用支持的ICC模型，缺少ICC时沿用基本显示策略
-// 入参: ctx 已规范化上下文, info 原生元数据, maximum 色彩转换工作额度
+// 入参: ctx 已规范化Context, info 原生元数据, maximum 色彩转换工作额度
 // 返回: jxrDisplayMapping 显示转换, error 颜色、格式、资源或取消错误
 func jxrManagedRasterDisplay(ctx context.Context, info Info, maximum uint64) (jxrDisplayMapping, error) {
 	if len(info.ICCProfile) == 0 {
@@ -474,7 +474,7 @@ func jxrManagedRasterDisplay(ctx context.Context, info Info, maximum uint64) (jx
 }
 
 // color 在输入设备域解除预乘，再应用ICC或已有基本显示策略
-// 入参: ctx 取消上下文, info 原生描述, samples 可复用颜色工作值, alpha 原透明度
+// 入参: ctx Context, info 原生描述, samples 可复用颜色工作值, alpha 原透明度
 // 返回: float64 非预乘红、绿、蓝sRGB值, error 数值或取消错误
 func (mapping *jxrDisplayMapping) color(ctx context.Context, info Info, samples []float64, alpha float64) (float64, float64, float64, error) {
 	if mapping.cicp.transfer != 0 {
@@ -520,7 +520,7 @@ func jxrICCCurveSize(data []byte) (int, error) {
 	return int(size), nil
 }
 
-// jxrReadICCCurve 读取ICC.1:2022的curveType及parametricCurveType函数0至4
+// jxrReadICCCurve 读取ICC的curveType及parametricCurveType函数0至4
 // 入参: data 指定曲线的完整标签
 // 返回: jxrICCCurve 已校验曲线, error 格式或函数能力错误
 func jxrReadICCCurve(data []byte) (jxrICCCurve, error) {
@@ -552,7 +552,7 @@ func jxrReadICCCurve(data []byte) (jxrICCCurve, error) {
 	return curve, nil
 }
 
-// checkDomain 验证表68的幂函数在实际输入区间中有定义
+// checkDomain 验证参数化曲线幂函数在实际输入区间中有定义
 // 返回: error 参数域错误
 func (curve *jxrICCCurve) checkDomain() error {
 	g, a, b := curve.params[0], curve.params[1], curve.params[2]
@@ -638,7 +638,7 @@ func jxrICCFixed(data []byte) float64 {
 	return float64(int32(binary.BigEndian.Uint32(data))) / 65536
 }
 
-// jxrReadICCLUT 按ICC.1:2022读取A到B方向的三种整数查表模型
+// jxrReadICCLUT 读取ICC中A到B方向的三种整数查表模型
 // 入参: data 完整标签, channels 源设备通道数, lab 是否为Lab PCS, maximum 查表工作额度
 // 返回: *jxrICCLUT 已验证查表, error 格式、能力或额度错误
 func jxrReadICCLUT(data []byte, channels int, lab bool, maximum uint64) (*jxrICCLUT, error) {
@@ -731,8 +731,7 @@ func jxrReadICCGrid(data []byte, points []byte, outputs, precision int) (jxrICCG
 	return grid, nil
 }
 
-// value 在前四个额外输入轴上线性插值，其余轴采用单纯形插值
-// 三通道采用四面体，四至七通道以最多十六个四面体插值，更多通道保持有界计算量
+// value 对多维网格执行分轴线性与单纯形插值并写入输出工作区
 // 入参: input 已裁剪的单位设备分量, result 输出工作区
 func (grid *jxrICCGrid) value(input, result []float64) {
 	var axes [jxrICCMaxGridAxes]jxrICCGridAxis
@@ -880,8 +879,8 @@ func jxrICCLabInverse(value float64) float64 {
 	return 3 * delta * delta * (value - 4.0/29.0)
 }
 
-// jxrReadICCFloatTransform 读取ICC.1:2022第10.16节媒体相对色度管线
-// 入参: ctx 取消上下文, data 完整mpet标签, channels 设备输入数, lab 是否为Lab PCS, maximum 工作额度
+// jxrReadICCFloatTransform 读取ICC多处理元素媒体相对色度管线
+// 入参: ctx Context, data 完整mpet标签, channels 设备输入数, lab 是否为Lab PCS, maximum 工作额度
 // 返回: *jxrICCFloatTransform 已验证模型, error 结构、能力、资源或取消错误
 func jxrReadICCFloatTransform(ctx context.Context, data []byte, channels int, lab bool, maximum uint64) (*jxrICCFloatTransform, error) {
 	if len(data) < 16 || string(data[:4]) != "mpet" || binary.BigEndian.Uint32(data[4:]) != 0 ||
@@ -1051,7 +1050,7 @@ func jxrReadICCFloatStage(p *jxrParser, data []byte) (jxrICCFloatStage, error) {
 	return stage, nil
 }
 
-// jxrCheckICCFloat32 按ICC.1第4.3节拒绝储存的非规格化数、无穷大和NaN
+// jxrCheckICCFloat32 校验ICC大端单精度浮点字节并拒绝非规格化数、无穷大和NaN
 // 入参: p 取消状态, data 对齐的IEEE二进制32位数值
 // 返回: error 数值编码或取消错误
 func jxrCheckICCFloat32(p *jxrParser, data []byte) error {
@@ -1077,7 +1076,7 @@ func jxrICCFloat32(data []byte) float64 {
 }
 
 // xyz 执行浮点元素并按实际PCS数值转换到D50 XYZ
-// 入参: ctx 取消上下文, input 解除预乘后的设备通道
+// 入参: ctx Context, input 解除预乘后的设备通道
 // 返回: [3]float64 D50 XYZ, error 数值或取消错误
 func (transform *jxrICCFloatTransform) xyz(ctx context.Context, input []float64) ([3]float64, error) {
 	var xyz [3]float64
@@ -1172,7 +1171,7 @@ func jxrReadICCSegmentedCurves(p *jxrParser, data []byte, count int) ([]jxrICCSe
 	return curves, nil
 }
 
-// jxrReadICCSegmentedCurve 读取ICC.1表58至61的分段和隐含采样端点
+// jxrReadICCSegmentedCurve 读取ICC浮点分段曲线的分段定义及隐含采样端点
 // 入参: p 工作预算, data 完整curf数据
 // 返回: jxrICCSegmentedCurve 已验证曲线, error 格式、能力、资源或取消错误
 func jxrReadICCSegmentedCurve(p *jxrParser, data []byte) (jxrICCSegmentedCurve, error) {

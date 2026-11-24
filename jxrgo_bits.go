@@ -27,7 +27,7 @@ const (
 	jxrSafeLongLimit  = uint64(1 << 26)
 )
 
-// jxrFirstCode 保存T.832表82的五组首系数前缀码
+// jxrFirstCode 保存五组首系数前缀码
 var jxrFirstCode = [5][256]jxrCode{
 	jxrMakeVLC([]string{"00001", "000001", "0000000", "0000001", "00100", "010", "00101", "1", "00110", "0001", "00111", "011"}),
 	jxrMakeVLC([]string{"0010", "00010", "000000", "000001", "0011", "010", "00011", "11", "011", "100", "00001", "101"}),
@@ -36,7 +36,7 @@ var jxrFirstCode = [5][256]jxrCode{
 	jxrMakeVLC([]string{"010", "1", "0000001", "0001", "0000010", "011", "00000000", "0010", "0000011", "0011", "00000001", "00001"}),
 }
 
-// jxrIndexCode 保存T.832表80的四组后续系数前缀码
+// jxrIndexCode 保存四组后续系数前缀码
 var jxrIndexCode = [4][256]jxrCode{
 	jxrMakeVLC([]string{"1", "00000", "001", "00001", "01", "0001"}),
 	jxrMakeVLC([]string{"01", "0000", "10", "0001", "11", "001"}),
@@ -286,7 +286,7 @@ func (s *jxrSharedWriteBudget) release(amount uint64) {
 }
 
 // newJXRBitWriter 创建有界位写入器，缓冲增长同时计入旧、新容量
-// 入参: ctx 已规范化取消上下文, maxBytes 输出字节上限, maxMemory 缓冲内存上限
+// 入参: ctx 已规范化Context, maxBytes 输出字节上限, maxMemory 缓冲内存上限
 // 返回: jxrBitWriter 空写入器，错误保存在err字段中
 func newJXRBitWriter(ctx context.Context, maxBytes, maxMemory uint64) jxrBitWriter {
 	noCancel := ctx == context.Background() || ctx == context.TODO()
@@ -699,7 +699,7 @@ func readJXRVLCSlow(b *jxrBits, table *[256]jxrCode) uint8 {
 	return code.value
 }
 
-// newJXRMultiVLC 按T.832表97初始化多编码表选择状态
+// newJXRMultiVLC 初始化多编码表选择状态
 // 返回: jxrMultiVLC 初始状态
 func newJXRMultiVLC() jxrMultiVLC {
 	return jxrMultiVLC{table: 1, delta: [2]uint8{0, 1}}
@@ -729,7 +729,7 @@ func (v *jxrMultiVLC) index(b *jxrBits) uint8 {
 	return value
 }
 
-// adapt 按T.832表102调整编码表，切换时重新指定相邻判别增量表
+// adapt 自适应调整编码表，切换时重新指定相邻判别增量表
 // 入参: maximum 最大编码表索引
 func (v *jxrMultiVLC) adapt(maximum uint8) {
 	changed := false
@@ -755,7 +755,7 @@ func (v *jxrMultiVLC) adapt(maximum uint8) {
 	}
 }
 
-// checkJXRModelComponents 检查归一化模型的分量支持范围，不推断表116未明确的权重
+// checkJXRModelComponents 检查归一化模型的分量支持范围
 // 入参: p 已通过分量布局校验的平面
 // 返回: error 尚未支持的归一化模型错误
 func checkJXRModelComponents(p *jxrPlane) error {
@@ -765,7 +765,7 @@ func checkJXRModelComponents(p *jxrPlane) error {
 	return nil
 }
 
-// newJXRModel 按T.832表115初始化频带归一化状态
+// newJXRModel 初始化频带归一化状态
 // 入参: band 已校验的DC、低通或高通频带索引
 // 返回: jxrModel 初始状态
 func newJXRModel(band uint8) jxrModel {
@@ -927,7 +927,7 @@ func checkJXRWords(values []int64, longWord bool) error {
 }
 
 // checkJXRWordsContext 分段校验大型系数缓冲，避免整幅扫描阻塞取消响应
-// 入参: ctx 取消上下文, values 待校验的数组值, longWord 是否使用三十二位数值范围
+// 入参: ctx Context, values 待校验的数组值, longWord 是否使用三十二位数值范围
 // 返回: error 数值范围或取消错误
 func checkJXRWordsContext(ctx context.Context, values []int64, longWord bool) error {
 	for len(values) != 0 {

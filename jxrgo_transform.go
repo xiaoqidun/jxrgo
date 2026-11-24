@@ -16,7 +16,7 @@ package jxrgo
 
 import "context"
 
-// jxrInversePermutation 保存T.832表164规定的逆变换系数位置
+// jxrInversePermutation 保存逆变换系数重排位置表
 var jxrInversePermutation = [16]uint8{0, 8, 4, 13, 2, 15, 3, 14, 1, 12, 5, 9, 7, 11, 6, 10}
 
 // jxrInverse4 执行四乘四整数逆变换，阶段内各子变换使用独立系数
@@ -218,7 +218,7 @@ func jxrT2Fast(a, b int64) (int64, int64) {
 }
 
 // inverseFirstContext 执行首级逆变换并恢复缩放色度，按宏块和分量响应取消
-// 入参: ctx 取消上下文, h 图像头
+// 入参: ctx Context, h 图像头
 // 返回: []jxrComponentView 首级重建系数视图, error 数值范围或取消错误
 func (c *jxrCoefficients) inverseFirstContext(ctx context.Context, h *jxrHeader) ([]jxrComponentView, error) {
 	if err := c.inverseFirstValuesContext(ctx, h); err != nil {
@@ -228,7 +228,7 @@ func (c *jxrCoefficients) inverseFirstContext(ctx context.Context, h *jxrHeader)
 }
 
 // inverseFirstValuesContext 原地执行首级数值步骤，不为不使用视图的连续行处理分配描述数组
-// 入参: ctx 取消上下文, h 图像头
+// 入参: ctx Context, h 图像头
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) inverseFirstValuesContext(ctx context.Context, h *jxrHeader) error {
 	total := len(c.info)
@@ -245,7 +245,7 @@ func (c *jxrCoefficients) inverseFirstValuesContext(ctx context.Context, h *jxrH
 }
 
 // inverseFirstRange 原地执行指定宏块区间的首级逆变换并恢复缩放色度
-// 入参: ctx 取消上下文, h 图像头, start 起始宏块, end 结束宏块
+// 入参: ctx Context, h 图像头, start 起始宏块, end 结束宏块
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) inverseFirstRange(ctx context.Context, h *jxrHeader, start, end int) error {
 	longWord := h.longWord
@@ -330,7 +330,7 @@ func (c *jxrCoefficients) inverseFirstRange(ctx context.Context, h *jxrHeader, s
 }
 
 // inverseSecondContext 组合首级重建值与高通系数，原地执行二级逆变换并响应取消
-// 入参: ctx 取消上下文, h 图像头
+// 入参: ctx Context, h 图像头
 // 返回: []jxrComponentView 二级重建样本视图, error 数值范围或取消错误
 func (c *jxrCoefficients) inverseSecondContext(ctx context.Context, h *jxrHeader) ([]jxrComponentView, error) {
 	if err := c.inverseSecondValuesContext(ctx, h); err != nil {
@@ -340,7 +340,7 @@ func (c *jxrCoefficients) inverseSecondContext(ctx context.Context, h *jxrHeader
 }
 
 // inverseSecondValuesContext 原地组合低通及高通执行二级数值步骤，调用方可复用既有样本视图
-// 入参: ctx 取消上下文, h 图像头
+// 入参: ctx Context, h 图像头
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) inverseSecondValuesContext(ctx context.Context, h *jxrHeader) error {
 	total := len(c.info)
@@ -357,7 +357,7 @@ func (c *jxrCoefficients) inverseSecondValuesContext(ctx context.Context, h *jxr
 }
 
 // inverseSecondRange 原地执行指定宏块区间的二级逆变换
-// 入参: ctx 取消上下文, h 图像头, start 起始宏块, end 结束宏块
+// 入参: ctx Context, h 图像头, start 起始宏块, end 结束宏块
 // 返回: error 数值范围或取消错误
 func (c *jxrCoefficients) inverseSecondRange(ctx context.Context, h *jxrHeader, start, end int) error {
 	longWord := h.longWord
@@ -431,7 +431,7 @@ func jxrForward4(values *[16]int64, check *jxrArithmetic) {
 	}
 }
 
-// jxrForwardOdd 执行表D.9的单奇频四点整数正变换
+// jxrForwardOdd 执行单奇频四点整数正变换
 // 入参: a, b, c, d 有界输入值, check 局部变量校验状态
 // 返回: int64 四个变换值
 func jxrForwardOdd(a, b, c, d int64, check *jxrArithmetic) (int64, int64, int64, int64) {
@@ -476,7 +476,7 @@ func jxrForwardOddOdd(a, b, c, d int64, pre bool, check *jxrArithmetic) (int64, 
 	return a, b, c, d
 }
 
-// jxrForward2 执行表163两点整数逆变换的可逆正向运算
+// jxrForward2 执行两点整数逆变换的可逆正向运算
 // 入参: a, b 有界输入值, check 局部变量校验状态
 // 返回: int64 两个变换值
 func jxrForward2(a, b int64, check *jxrArithmetic) (int64, int64) {

@@ -339,7 +339,7 @@ func jxrCoefficientRangeError(resource string, value int64) error {
 }
 
 // filterChromaRegion 在两乘二网格上预滤波或后滤波，422的纵向半宏块边界同样参与滤波
-// 入参: ctx 取消上下文, left, top, right, bottom 区域边界, pre 是否执行预滤波
+// 入参: ctx Context, left, top, right, bottom 区域边界, pre 是否执行预滤波
 // 返回: error 错误信息
 func (v *jxrComponentView) filterChromaRegion(ctx context.Context, left, top, right, bottom int, pre bool) error {
 	if right-left < 4 {
@@ -403,7 +403,7 @@ func (v *jxrComponentView) chromaCornerResidual(left, top, right, bottom int, di
 }
 
 // filterChromaPatch 执行子采样色度内部的四点滤波或边缘的两点滤波
-// 入参: ctx 取消上下文, x, y 区域起点, width, height 区域尺寸, pre 是否执行预滤波
+// 入参: ctx Context, x, y 区域起点, width, height 区域尺寸, pre 是否执行预滤波
 // 返回: error 计算容量错误
 func (v *jxrComponentView) filterChromaPatch(ctx context.Context, x, y, width, height int, pre bool) error {
 	if err := ctx.Err(); err != nil {
@@ -496,7 +496,7 @@ func (v *jxrComponentView) filterChromaPatch2(x, y, width, height int, pre bool)
 }
 
 // filterGrid 按分量及硬分块边界应用预滤波或后滤波，区域处理期间检查取消状态
-// 入参: ctx 取消上下文, h 图像头, samples 是否为完整样本网格, pre 是否执行预滤波
+// 入参: ctx Context, h 图像头, samples 是否为完整样本网格, pre 是否执行预滤波
 // 返回: error 数值范围、资源或取消错误
 func (c *jxrCoefficients) filterGrid(ctx context.Context, h *jxrHeader, samples, pre bool) error {
 	if err := ctx.Err(); err != nil {
@@ -569,7 +569,7 @@ func (c *jxrCoefficients) filterGrid(ctx context.Context, h *jxrHeader, samples,
 }
 
 // filterComponentRegion 按当前级别的分量网格选择普通或子采样色度滤波
-// 入参: ctx 取消上下文, left, top, right, bottom 区域边界, chroma 是否为子采样色度的低通网格, pre 是否执行预滤波
+// 入参: ctx Context, left, top, right, bottom 区域边界, chroma 是否为子采样色度的低通网格, pre 是否执行预滤波
 // 返回: error 错误信息
 func (v *jxrComponentView) filterComponentRegion(ctx context.Context, left, top, right, bottom int, chroma, pre bool) error {
 	if chroma {
@@ -579,7 +579,7 @@ func (v *jxrComponentView) filterComponentRegion(ctx context.Context, left, top,
 }
 
 // filterRegion 在四乘四块网格上预滤波或后滤波，软分块不形成额外边缘
-// 入参: ctx 取消上下文, left, top, right, bottom 滤波区域边界, pre 是否执行预滤波
+// 入参: ctx Context, left, top, right, bottom 滤波区域边界, pre 是否执行预滤波
 // 返回: error 错误信息
 func (v *jxrComponentView) filterRegion(ctx context.Context, left, top, right, bottom int, pre bool) error {
 	for y := top + 2; y < bottom-2; y += 4 {
@@ -623,7 +623,7 @@ func (v *jxrComponentView) filterRegion(ctx context.Context, left, top, right, b
 }
 
 // filterPatch 预滤波或后滤波一个内部、边缘或角部区域，先校验结果再写回
-// 入参: ctx 取消上下文, x, y 区域起点, width, height 区域尺寸, pre 是否执行预滤波
+// 入参: ctx Context, x, y 区域起点, width, height 区域尺寸, pre 是否执行预滤波
 // 返回: error 错误信息
 func (v *jxrComponentView) filterPatch(ctx context.Context, x, y, width, height int, pre bool) error {
 	if err := ctx.Err(); err != nil {
@@ -875,7 +875,7 @@ func jxrPrefilter2(a, b int64, check *jxrArithmetic) (int64, int64) {
 	return a, b
 }
 
-// jxrForwardRotate 执行表D.15的两点整数正旋转
+// jxrForwardRotate 执行两点整数正旋转
 // 入参: a, b 有界输入值, check 局部变量校验状态
 // 返回: int64 两个变换值
 func jxrForwardRotate(a, b int64, check *jxrArithmetic) (int64, int64) {
@@ -884,7 +884,7 @@ func jxrForwardRotate(a, b int64, check *jxrArithmetic) (int64, int64) {
 	return a, b
 }
 
-// jxrForwardScale 执行表D.16的两点整数正缩放
+// jxrForwardScale 执行两点整数正缩放
 // 入参: a, b 有界输入值, check 局部变量校验状态
 // 返回: int64 两个变换值
 func jxrForwardScale(a, b int64, check *jxrArithmetic) (int64, int64) {
@@ -897,7 +897,7 @@ func jxrForwardScale(a, b int64, check *jxrArithmetic) (int64, int64) {
 	return a, b
 }
 
-// jxrT2x2Pre 执行表D.14的四点预滤波变换，对应规范性T2x2hPOST的逆运算
+// jxrT2x2Pre 执行四点预滤波变换，为四点后滤波变换的逆运算
 // 入参: a, b, c, d 有界输入值, check 局部变量校验状态
 // 返回: int64 四个变换值
 func jxrT2x2Pre(a, b, c, d int64, check *jxrArithmetic) (int64, int64, int64, int64) {

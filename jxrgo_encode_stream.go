@@ -49,7 +49,7 @@ type jxrStreamOutput struct {
 }
 
 // writeStream 编码完整系数图像并生成实际包索引，不修改输入头部、量化参数或系数
-// 入参: ctx 已规范化取消上下文, source 图像及平面头部, options 分块参数及系数、临时缓冲、输出容量预算
+// 入参: ctx 已规范化Context, source 图像及平面头部, options 分块参数及系数、临时缓冲、输出容量预算
 // 返回: []byte 完整独立码流, error 参数、资源、精度或取消错误
 func (img *jxrCoefficientImage) writeStream(ctx context.Context, source *jxrStream, options jxrStreamOutput) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
@@ -194,7 +194,7 @@ func (img *jxrCoefficientImage) writeStream(ctx context.Context, source *jxrStre
 	return writer.data, nil
 }
 
-// tileWriteScratchWork 计算单个额外并发编码协程所需的残差、预测行及熵状态字节数
+// tileWriteScratchWork 计算单个额外并发编码Goroutine所需的残差、预测行及熵状态字节数
 // 返回: uint64 单并发工作区开销，无效几何或溢出返回最大值
 func (s *jxrStream) tileWriteScratchWork() uint64 {
 	base := s.tileScratchWork()
@@ -215,9 +215,8 @@ func (s *jxrStream) tileWriteScratchWork() uint64 {
 	return work
 }
 
-// writeStreamParallel 在共享预算允许时并行编码多个分块并按原始分块和频带顺序拼接完整码流
-// 所有并发分块共享原子输出预算，避免均匀硬切导致的假回退、杜绝峰值超发并保留真实maxBytes错误
-// 入参: ctx 已规范化取消上下文, s 已校验码流头部, options 写入选项, writer 最终流写入器, budget 共享输出预算, tiles 分块总数, bands 频带数
+// writeStreamParallel 在共享原子输出预算内并行编码多个分块，并按原始分块和频带顺序拼接完整码流
+// 入参: ctx 已规范化Context, s 已校验码流头部, options 写入选项, writer 最终流写入器, budget 共享输出预算, tiles 分块总数, bands 频带数
 // 返回: []byte 完整码流, bool 是否由并行路径完成, error 非并行内存回退类编码或取消错误
 func (img *jxrCoefficientImage) writeStreamParallel(ctx context.Context, s *jxrStream, options jxrStreamOutput, writer *jxrBitWriter, budget *jxrWriteBudget, tiles, bands int) ([]byte, bool, error) {
 	if budget.used >= budget.limit {
@@ -368,7 +367,7 @@ func (img *jxrCoefficientImage) writeStreamParallel(ctx context.Context, s *jxrS
 }
 
 // tileWork 计算公开配置、分块设置及量化和索引数组，包含切片容量范围内未使用的设置
-// 入参: ctx 取消上下文, maximum 工作内存上限
+// 入参: ctx Context, maximum 工作内存上限
 // 返回: uint64 设置存储预算, error 资源或取消错误
 func (o *jxrStreamOutput) tileWork(ctx context.Context, maximum uint64) (uint64, error) {
 	if o.quantWork > maximum || uint64(cap(o.tiles)) > (maximum-o.quantWork)/jxrTileSettingBytes {
@@ -460,7 +459,7 @@ func (img *jxrCoefficientImage) checkOutput(s *jxrStream) error {
 }
 
 // encodeJXRCodestreamTo 共用独立码流和文件内逐包写出，输入布局与选项已由公开入口校验
-// 入参: ctx 已规范化上下文, w 当前位置为码流起点的输出, raster 原生图像, layout 编码布局, options 含原图的资源限制
+// 入参: ctx 已规范化Context, w 当前位置为码流起点的输出, raster 原生图像, layout 编码布局, options 含原图的资源限制
 // 返回: error 精度、资源、取消、定位或写入错误
 func encodeJXRCodestreamTo(ctx context.Context, w io.WriteSeeker, raster *Raster, layout jxrStream, options jxrStreamOutput) error {
 	retained, err := jxrRasterWork(raster, options.maxMemory)
@@ -490,7 +489,7 @@ func encodeJXRCodestreamTo(ctx context.Context, w io.WriteSeeker, raster *Raster
 }
 
 // writeStreamTo 共用实际分块包编码并回填固定宽度索引，完整系数保持只读且包缓冲逐块复用
-// 入参: ctx 已规范化上下文, w 可定位输出, source 图像头部, options 分块参数及除原图外的容量限制
+// 入参: ctx 已规范化Context, w 可定位输出, source 图像头部, options 分块参数及除原图外的容量限制
 // 返回: error 格式、精度、资源、取消、定位或写入错误
 func (state *jxrCoefficientImage) writeStreamTo(ctx context.Context, w io.WriteSeeker, source *jxrStream, options jxrStreamOutput) error {
 	if state == nil || source == nil {
@@ -506,7 +505,7 @@ func (state *jxrCoefficientImage) writeStreamTo(ctx context.Context, w io.WriteS
 }
 
 // writeJXRPacketsTo 共用空间及频率包提交和索引回填，分块提供器负责在给定容量内准备原生系数
-// 入参: ctx 已规范化上下文, w 可定位输出, source 完整头部, options 输出限制, working 不含设置和输出缓冲的活动容量, encode 分块包编码器
+// 入参: ctx 已规范化Context, w 可定位输出, source 完整头部, options 输出限制, working 不含设置和输出缓冲的活动容量, encode 分块包编码器
 // 返回: error 预检、分块提供、取消或I/O错误
 func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream, options jxrStreamOutput, working uint64, encode func(int, *jxrTileOutput) error) error {
 	if source == nil || w == nil || options.budget != nil || encode == nil {
@@ -699,8 +698,8 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 	return ctx.Err()
 }
 
-// encodeJXRFileTilesSequential 从可重放有界块源写出单图附录A文件到普通Writer，不要求Seek或完整原图及压缩结果
-// 入参: ctx 已规范化上下文, w 顺序输出, info 原生描述, read 可重放提供器, opts 文件分块参数
+// encodeJXRFileTilesSequential 从可重放有界块源顺序写出单图JXR容器文件到普通Writer，不要求Seek或完整原图及压缩结果
+// 入参: ctx 已规范化Context, w 顺序输出, info 原生描述, read 可重放提供器, opts 文件分块参数
 // 返回: error 元数据、能力、资源、精度、源、取消或写入错误
 func encodeJXRFileTilesSequential(ctx context.Context, w io.Writer, info Info, read RasterTileReader, opts *EncodeOptions) error {
 	var settings EncodeOptions
@@ -751,7 +750,7 @@ func encodeJXRFileTilesSequential(ctx context.Context, w io.Writer, info Info, r
 }
 
 // writeJXRForwardTileFile 共用交织与双流的先规划后顺序提交，目录和固定宽度索引均在首次外部写入前确定
-// 入参: ctx 当前上下文, w 顺序输出, input 已校验的常驻布局和描述, read 稳定窗口源, separate 是否独立alpha
+// 入参: ctx Context, w 顺序输出, input 已校验的常驻布局和描述, read 稳定窗口源, separate 是否独立alpha
 // 返回: error 目录、容量、源、精度、取消或I/O错误
 func writeJXRForwardTileFile(ctx context.Context, w io.Writer, input *jxrSeparateTileInput, read RasterTileReader, separate bool) error {
 	count := 1
@@ -847,7 +846,7 @@ func writeJXRForwardTileFile(ctx context.Context, w io.Writer, input *jxrSeparat
 }
 
 // writeJXRFileTo 共用已知布局的单图文件前缀和长度回填，具体输入方式由独立编码器处理
-// 入参: ctx 当前上下文, w 起点为零的可定位输出, info 原生元数据, source 完整编码布局, options 含输入的额度, retained 输入常驻额度, encode 主图码流编码器
+// 入参: ctx Context, w 起点为零的可定位输出, info 原生元数据, source 完整编码布局, options 含输入的额度, retained 输入常驻额度, encode 主图码流编码器
 // 返回: error 元数据、资源、取消、定位或写入错误
 func writeJXRFileTo(ctx context.Context, w io.WriteSeeker, info Info, source *jxrStream, options jxrStreamOutput, retained uint64, encode func(jxrStreamOutput) error) error {
 	_, _, err := writeJXRFileAt(ctx, w, info, source, options, retained, 8, encode)
@@ -855,7 +854,7 @@ func writeJXRFileTo(ctx context.Context, w io.WriteSeeker, info Info, source *jx
 }
 
 // writeJXRFileAt 在指定目录位置逐包写当前图像，非首图不重复文件头并将目录地址转换为全文件坐标
-// 入参: ctx 当前上下文, w 当前输出, info 原生信息, source 编码布局, options 含输入的额度, retained 常驻输入额度, start 当前目录起点，首图为八, encode 码流编码器
+// 入参: ctx Context, w 当前输出, info 原生信息, source 编码布局, options 含输入的额度, retained 常驻输入额度, start 当前目录起点，首图为八, encode 码流编码器
 // 返回: uint64 当前图像结束位置, uint64 当前目录链接位置, error 元数据、资源、取消、定位或写入错误
 func writeJXRFileAt(ctx context.Context, w io.WriteSeeker, info Info, source *jxrStream, options jxrStreamOutput, retained, start uint64, encode func(jxrStreamOutput) error) (uint64, uint64, error) {
 	if start < 8 || start&1 != 0 || start > math.MaxUint32 {
@@ -930,7 +929,7 @@ func writeJXRFileAt(ctx context.Context, w io.WriteSeeker, info Info, source *jx
 }
 
 // makeJXRFilePrefix 从同一已校验编码布局产生目录及元数据，不构造占位码流或假样本
-// 入参: ctx 取消上下文, info 原生信息, source 编码布局, maxPixels 像素上限, maxBytes 文件上限, maxMemory 前缀容量
+// 入参: ctx Context, info 原生信息, source 编码布局, maxPixels 像素上限, maxBytes 文件上限, maxMemory 前缀容量
 // 返回: []byte 独占文件前缀, uint64 主图长度字段位置, error 元数据、容量或取消错误
 func makeJXRFilePrefix(ctx context.Context, info Info, source *jxrStream, maxPixels, maxBytes, maxMemory uint64) ([]byte, uint64, error) {
 	data, offsets, err := makeJXRFilePrefixParts(ctx, info, source, nil, maxPixels, maxBytes, maxMemory)
@@ -938,7 +937,7 @@ func makeJXRFilePrefix(ctx context.Context, info Info, source *jxrStream, maxPix
 }
 
 // makeJXRFilePrefixParts 从明确的主流和可选独立透明度头部生成目录，不需要完整压缩结果
-// 入参: ctx 当前上下文, info 原生元数据, source 主图布局, alpha 可选独立透明度布局, maxPixels 像素上限, maxBytes 文件上限, maxMemory 前缀容量
+// 入参: ctx Context, info 原生元数据, source 主图布局, alpha 可选独立透明度布局, maxPixels 像素上限, maxBytes 文件上限, maxMemory 前缀容量
 // 返回: []byte 文件前缀, jxrContainerOffsets 全部待回填字段位置, error 元数据、布局、容量或取消错误
 func makeJXRFilePrefixParts(ctx context.Context, info Info, source, alpha *jxrStream, maxPixels, maxBytes, maxMemory uint64) ([]byte, jxrContainerOffsets, error) {
 	identifier, format, err := jxrRasterIdentifier(info, [16]byte{})
