@@ -138,7 +138,7 @@ type jxrLowTileRows struct {
 }
 
 // DecodeReduced 按二、四、八或十六缩减分母从必要重建阶段生成全采样独立原生粗图，保留原生数值、颜色、ICC及预乘状态
-// 未知色度相位返回错误，四倍及以上仅重建低频带并忽略未选频率包，逐行有界工作内存不含输出粗图，NewDecoderAt按需读取
+// 未知色度相位按ITU-T T.832默认居中相位处理，四倍及以上仅重建低频带并忽略未选频率包，逐行有界工作内存不含输出粗图，NewDecoderAt按需读取
 // 入参: ctx Context，nil采用Background, divisor 缩减分母（二、四、八或十六）
 // 返回: *Raster 独立完整采样原生粗图, error 参数、能力、数据、资源、关闭、读取或取消错误
 func (d *Decoder) DecodeReduced(ctx context.Context, divisor int) (*Raster, error) {
@@ -165,7 +165,7 @@ func jxrReducedInfo(original Info, divisor int, maximum uint64) (Info, uint64, e
 		return Info{}, 0, fmt.Errorf("%w: reduced output geometry", ErrInvalid)
 	}
 	width, height := (original.Bounds.Dx()+divisor-1)/divisor, (original.Bounds.Dy()+divisor-1)/divisor
-	work := uint64(512) + uint64(len(original.Components))*256 + uint64(len(original.ICCProfile))
+	work := uint64(512) + uint64(len(original.Components))*256 + uint64(len(original.ICCProfile)) + uint64(len(original.EXIF)) + uint64(len(original.GPS)) + uint64(len(original.XMP)) + uint64(len(original.IPTC)) + jxrDescriptionWork(original.Description)
 	if original.ColorEncoding != nil {
 		work += 4
 	}
@@ -207,6 +207,9 @@ func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster
 	if len(d.data) == 0 || divisor != 2 && divisor != 4 && divisor != 8 && divisor != 16 {
 		return nil, fmt.Errorf("%w: reduced decoder parameters", ErrInvalid)
 	}
+	if d.source.container.uncompressed {
+		return d.decodeUncompressedReducedLocked(ctx, divisor)
+	}
 	source := &d.source
 	for _, stream := range [2]*jxrStream{&source.primary, source.alpha} {
 		if stream == nil {
@@ -222,7 +225,7 @@ func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster
 		}
 	}
 	remaining := min(d.limits.MaxMemoryBytes, uint64(^uint(0)>>1))
-	metadataExtra := uint64(cap(d.info.ICCProfile)) + uint64(cap(d.info.EXIF)) + uint64(cap(d.info.XMP)) + uint64(cap(d.info.IPTC))
+	metadataExtra := uint64(cap(d.info.ICCProfile)) + uint64(cap(d.info.EXIF)) + uint64(cap(d.info.GPS)) + uint64(cap(d.info.XMP)) + uint64(cap(d.info.IPTC)) + jxrDescriptionWork(d.info.Description)
 	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), metadataExtra, 4096 + uint64(len(d.info.Components))*128} {
 		if amount > remaining {
 			return nil, fmt.Errorf("%w: reduced retained storage", ErrLimit)
@@ -1549,4 +1552,128 @@ func (r *jxrLowTileRows) readRow(ctx context.Context) error {
 	}
 	r.next++
 	return ctx.Err()
+}
+
+// decodeUncompressedReducedLocked 在单行有界工作内存内对无压缩容器图像执行缩减采样重建
+// 入参: ctx 已规范化Context, divisor 二、四、八或十六缩减分母
+// 返回: *Raster 全采样原生粗图, error 参数、读取、资源或取消错误
+func (d *Decoder) decodeUncompressedReducedLocked(ctx context.Context, divisor int) (*Raster, error) {
+	c := &d.source.container
+	layout, err := jxrMakeUncompressedLayout(c.pixelFormat[15], c.format, c.width, c.height, c.separateAlpha())
+	if err != nil {
+		return nil, err
+	}
+	rowWork := layout.rowBufferWork()
+	remaining := min(d.limits.MaxMemoryBytes, uint64(^uint(0)>>1))
+	metadataExtra := uint64(cap(d.info.ICCProfile)) + uint64(cap(d.info.EXIF)) + uint64(cap(d.info.GPS)) + uint64(cap(d.info.XMP)) + uint64(cap(d.info.IPTC)) + jxrDescriptionWork(d.info.Description)
+	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), metadataExtra, rowWork} {
+		if amount > remaining {
+			return nil, fmt.Errorf("%w: reduced uncompressed budget", ErrLimit)
+		}
+		remaining -= amount
+	}
+	info, outputWork, err := jxrReducedInfo(d.info, divisor, remaining)
+	if err != nil {
+		return nil, err
+	}
+	output, err := newRasterContext(ctx, info, Limits{MaxPixels: d.limits.MaxPixels, MaxMemoryBytes: outputWork})
+	if err != nil {
+		return nil, err
+	}
+	d.bindInputContext(ctx)
+	defer d.bindInputContext(nil)
+	rowBuf := make([]byte, int(layout.rowBytes))
+	var alphaBuf []byte
+	if !layout.planar && layout.separateAlpha {
+		alphaBuf = make([]byte, int(layout.alphaRowBytes))
+	}
+	codedW, codedH := int(c.width), int(c.height)
+	outW, outH := (codedW+divisor-1)/divisor, (codedH+divisor-1)/divisor
+	dispW := output.Bounds().Dx()
+	transform := uint8(c.transform)
+	if layout.planar {
+		step := int(layout.sampleBytes)
+		for ci := range len(d.info.Components) {
+			sx, sy, baseOffset, srcRowBytes, inAlpha := layout.planeSpec(ci)
+			planeData, planeInput := c.image, c.imageInput
+			if inAlpha {
+				planeData, planeInput = c.alpha, c.alphaInput
+			}
+			cw, ch := codedW/sx, codedH/sy
+			buf := rowBuf[:int(srcRowBytes)]
+			cachedRow := -1
+			offX, offY := float64(sx-1)*0.5, float64(sy-1)*0.5
+			for y := range outH {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				visY := min(float64(codedH-1), float64(y*divisor)+float64(divisor-1)/2)
+				cy := max(0, min(ch-1, int(math.Floor((visY-offY)/float64(sy)+0.5))))
+				if cy != cachedRow {
+					if err := jxrReadUncompressedSpan(planeData, planeInput, ctx, baseOffset+uint64(cy)*srcRowBytes, buf); err != nil {
+						return nil, err
+					}
+					cachedRow = cy
+				}
+				for x := range outW {
+					if x&1023 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
+					}
+					visX := min(float64(codedW-1), float64(x*divisor)+float64(divisor-1)/2)
+					cx := max(0, min(cw-1, int(math.Floor((visX-offX)/float64(sx)+0.5))))
+					val, err := jxrUnpackUncompressedSample(buf[cx*step:], layout.sampleBytes, layout.tenBit)
+					if err != nil {
+						return nil, err
+					}
+					px, py := jxrRasterPosition(x, y, outW, outH, transform)
+					output.planes[ci].storeBits(py*dispW+px, val)
+				}
+			}
+		}
+		return output, ctx.Err()
+	}
+	totalComp := layout.channels
+	if layout.hasAlpha {
+		totalComp++
+	}
+	var samples [9]uint32
+	cachedRow := -1
+	for y := range outH {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		visY := min(float64(codedH-1), float64(y*divisor)+float64(divisor-1)/2)
+		cy := max(0, min(codedH-1, int(math.Floor(visY+0.5))))
+		if cy != cachedRow {
+			if err := jxrReadUncompressedSpan(c.image, c.imageInput, ctx, uint64(cy)*layout.rowBytes, rowBuf); err != nil {
+				return nil, err
+			}
+			if layout.separateAlpha {
+				if err := jxrReadUncompressedSpan(c.alpha, c.alphaInput, ctx, uint64(cy)*layout.alphaRowBytes, alphaBuf); err != nil {
+					return nil, err
+				}
+			}
+			cachedRow = cy
+		}
+		for x := range outW {
+			if x&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			visX := min(float64(codedW-1), float64(x*divisor)+float64(divisor-1)/2)
+			cx := max(0, min(codedW-1, int(math.Floor(visX+0.5))))
+			if err := jxrUnpackUncompressedPixel(&layout, rowBuf, alphaBuf, cx, samples[:totalComp]); err != nil {
+				return nil, err
+			}
+			px, py := jxrRasterPosition(x, y, outW, outH, transform)
+			at := py*dispW + px
+			for ci := range totalComp {
+				output.planes[ci].storeBits(at, samples[ci])
+			}
+		}
+	}
+	return output, ctx.Err()
 }

@@ -79,28 +79,29 @@ type jxrParser struct {
 
 // jxrHeader 保存输出尺寸、宏块边界、窗口及码流控制标志
 type jxrHeader struct {
-	width       uint64
-	height      uint64
-	columns     []uint32
-	rows        []uint32
-	top         uint32
-	left        uint32
-	bottom      uint32
-	right       uint32
-	color       uint8
-	depth       uint8
-	overlap     uint8
-	transform   uint8
-	hardTiles   bool
-	frequency   bool
-	index       bool
-	short       bool
-	longWord    bool
-	trim        bool
-	alpha       bool
-	redBlue     bool
-	premultiply bool
-	planeStart  int
+	width          uint64
+	height         uint64
+	columns        []uint32
+	rows           []uint32
+	top            uint32
+	left           uint32
+	bottom         uint32
+	right          uint32
+	color          uint8
+	depth          uint8
+	overlap        uint8
+	transform      uint8
+	hardTiles      bool
+	frequency      bool
+	index          bool
+	short          bool
+	longWord       bool
+	trim           bool
+	alpha          bool
+	redBlue        bool
+	premultiply    bool
+	explicitWindow bool
+	planeStart     int
 }
 
 // jxrPlane 保存单个颜色或透明度平面的格式、精度和图像级量化参数
@@ -112,6 +113,8 @@ type jxrPlane struct {
 	scaled                   bool
 	chromaX                  uint8
 	chromaY                  uint8
+	explicitChromaX          bool
+	explicitChromaY          bool
 	itemChroma               [2][2]uint8
 	hasItemChroma            bool
 	shift                    uint8
@@ -258,31 +261,125 @@ func (parser *jxrParser) streamIndex(b jxrBits, s jxrStream) (jxrStream, error) 
 			return s, fmt.Errorf("%w: JPEG XR packet offset", ErrInvalid)
 		}
 	}
-	jxrNormalizeEmptyFlexPackets(&s, b.length())
+	if err := jxrNormalizeEmptyFlexPackets(parser, &s, b.length()); err != nil {
+		return s, err
+	}
 	if err := s.checkProfile(); err != nil {
 		return s, err
 	}
 	return s, nil
 }
 
-// jxrNormalizeEmptyFlexPackets 将频率模式中物理长度不足四字节的精细位包统一标记为逃逸空包
-// 入参: s 已校验包偏移的码流头, length 码流总字节数
-func jxrNormalizeEmptyFlexPackets(s *jxrStream, length uint64) {
+// jxrNormalizeEmptyFlexPackets 将频率模式中物理长度不足四字节的精细位包统一标记为逃逸空包，乱序时临时排序缓冲纳入解析预算
+// 入参: parser 共享解析预算, s 已校验包偏移的码流头, length 码流总字节数
+// 返回: error 内存预算或取消错误
+func jxrNormalizeEmptyFlexPackets(parser *jxrParser, s *jxrStream, length uint64) error {
 	if !s.header.frequency || s.primary.bands != 0 || len(s.packets) < 4 {
-		return
+		return nil
+	}
+	hasFlex, bandOrdered := false, true
+	var bandPrev [4]uint64
+	var bandSeen [4]bool
+	validCount := 0
+	for index, offset := range s.packets {
+		if index&4095 == 0 {
+			if err := parser.check(); err != nil {
+				return err
+			}
+		}
+		if offset == jxrPacketEscape {
+			continue
+		}
+		validCount++
+		band := index & 3
+		if band == 3 {
+			hasFlex = true
+		}
+		if bandSeen[band] && offset < bandPrev[band] {
+			bandOrdered = false
+		}
+		bandPrev[band], bandSeen[band] = offset, true
+	}
+	if !hasFlex {
+		return parser.check()
+	}
+	if bandOrdered {
+		cur := [3]int{0, 1, 2}
+		prevFlex, seenFlex := uint64(0), false
+		nextFlex := 3
+		for index := 3; index < len(s.packets); index += 4 {
+			if index&4095 == 3 {
+				if err := parser.check(); err != nil {
+					return err
+				}
+			}
+			offset := s.packets[index]
+			if offset == jxrPacketEscape {
+				continue
+			}
+			if length-s.dataStart-offset < 4 {
+				s.packets[index] = jxrPacketEscape
+				prevFlex, seenFlex = offset, true
+				continue
+			}
+			empty := seenFlex && offset == prevFlex
+			if !empty {
+				if nextFlex <= index {
+					nextFlex = index + 4
+				}
+				for nextFlex < len(s.packets) && s.packets[nextFlex] == jxrPacketEscape {
+					nextFlex += 4
+				}
+				if nextFlex < len(s.packets) && s.packets[nextFlex]-offset < 4 {
+					empty = true
+				}
+			}
+			for b := range 3 {
+				for cur[b] < len(s.packets) && (s.packets[cur[b]] == jxrPacketEscape || s.packets[cur[b]] < offset) {
+					cur[b] += 4
+				}
+				if cur[b] < len(s.packets) && s.packets[cur[b]]-offset < 4 {
+					empty = true
+				}
+			}
+			if empty {
+				s.packets[index] = jxrPacketEscape
+			}
+			prevFlex, seenFlex = offset, true
+		}
+		return parser.check()
 	}
 	var stack [64]uint64
 	sorted := stack[:0]
-	if len(s.packets) > len(stack) {
-		sorted = make([]uint64, 0, len(s.packets))
+	if validCount > len(stack) {
+		work := uint64(validCount) * 8
+		if err := parser.reserve(work); err != nil {
+			return err
+		}
+		defer func() {
+			if parser != nil {
+				parser.used -= work
+			}
+		}()
+		sorted = make([]uint64, 0, validCount)
 	}
-	for _, offset := range s.packets {
+	for index, offset := range s.packets {
+		if index&1023 == 0 {
+			if err := parser.check(); err != nil {
+				return err
+			}
+		}
 		if offset != jxrPacketEscape {
 			sorted = append(sorted, offset)
 		}
 	}
 	slices.Sort(sorted)
 	for index := 3; index < len(s.packets); index += 4 {
+		if index&4095 == 3 {
+			if err := parser.check(); err != nil {
+				return err
+			}
+		}
 		offset := s.packets[index]
 		if offset == jxrPacketEscape {
 			continue
@@ -291,19 +388,12 @@ func jxrNormalizeEmptyFlexPackets(s *jxrStream, length uint64) {
 			s.packets[index] = jxrPacketEscape
 			continue
 		}
-		lo, hi := 0, len(sorted)
-		for lo < hi {
-			mid := int(uint(lo+hi) >> 1)
-			if sorted[mid] < offset {
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
+		lo, _ := slices.BinarySearch(sorted, offset)
 		if lo+1 < len(sorted) && sorted[lo+1]-offset < 4 {
 			s.packets[index] = jxrPacketEscape
 		}
 	}
+	return parser.check()
 }
 
 // reserve 在新增解析存储分配前检查剩余预算及累计地址容量，失败时不增加已保留容量

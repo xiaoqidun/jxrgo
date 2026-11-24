@@ -455,7 +455,7 @@ func (c *jxrCoefficients) componentViewsStorage(h *jxrHeader, samples bool, stor
 	if cap(views) < c.plane.channels {
 		views = make([]jxrComponentView, c.plane.channels)
 	} else {
-		views = views[:c.plane.channels]
+		views = views[:c.plane.channels:c.plane.channels]
 	}
 	wordBits := uint8(16)
 	if h.longWord {

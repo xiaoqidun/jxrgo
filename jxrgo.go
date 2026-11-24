@@ -140,6 +140,8 @@ const (
 	IntentPerceptual
 	// IntentSaturation 表示ICC饱和度渲染意图
 	IntentSaturation
+	// IntentAbsolute 表示ICC绝对色度渲染意图
+	IntentAbsolute
 )
 
 const (
@@ -209,9 +211,35 @@ type RenderingIntent uint8
 // Subsampling 表示有损编码时可选的内部色度下采样模式
 type Subsampling uint8
 
+// WindowMargins 指定编码端图像头的四个裁剪边距（0至63），对应WINDOWING_FLAG窗口参数
+// 启用时编码网格扩展为可见尺寸加上对应边距，边缘冗余区域以边界像素复制填充
+type WindowMargins struct {
+	Top    uint8
+	Left   uint8
+	Bottom uint8
+	Right  uint8
+}
+
+// ImageDescription 保存ITU-T T.832 Annex A.5图像描述元数据标签
+// 文本字段采用UTF-8字符串，PageNumber为可选的页号与总页数对（非nil时写入0x0129标签）
+type ImageDescription struct {
+	DocumentName        string
+	ImageDescription    string
+	EquipmentMake       string
+	EquipmentModel      string
+	PageName            string
+	PageNumber          *[2]uint16
+	SoftwareNameVersion string
+	DateTime            string
+	ArtistName          string
+	HostComputer        string
+	CopyrightNotice     string
+}
+
 // EncodeOptions 指定编码格式、布局、精度、并发、元数据与资源上限，零值采用无损JXR及全部频带
 // TileSize以编码网格像素计且须为十六倍数，仅Lossy允许精度损失与Subsampling下采样，SeparateAlpha写入独立透明度码流
-// Profiles指定档次与级别声明，EXIF、XMP、IPTC为容器可选元数据字节；Workers零值自动，MaxOutputBytes零值采用64MiB
+// Profiles指定档次与级别声明，EXIF、GPS、XMP、IPTC与Description为容器可选元数据；Uncompressed启用0xBC03无压缩容器模式
+// Window指定编码窗口边距，ChromaCenteringX与ChromaCenteringY指定色度采样相位（0至4或7）；Workers零值自动，MaxOutputBytes零值采用64MiB
 type EncodeOptions struct {
 	Format                   Format
 	Layout                   Layout
@@ -234,8 +262,14 @@ type EncodeOptions struct {
 	MirrorSeparateAlpha      bool
 	Profiles                 []ProfileLevel
 	EXIF                     []byte
+	GPS                      []byte
 	XMP                      []byte
 	IPTC                     []byte
+	Description              *ImageDescription
+	Uncompressed             bool
+	Window                   *WindowMargins
+	ChromaCenteringX         *uint8
+	ChromaCenteringY         *uint8
 	Scratch                  io.ReadWriteSeeker
 	MaxOutputBytes           uint64
 	Limits                   Limits
@@ -325,8 +359,8 @@ type Resolution struct {
 }
 
 // Info 保存图像范围、像素格式、原始方向及颜色与容器元数据
-// Channels不含透明度，Premultiplied保持原样不解除预乘，Linear表示扩展范围数值格式，Orientation为原始声明方向
-// ICCProfile、ColorHint、ColorEncoding、EXIF、XMP及IPTC保留容器元数据，独立码流不携带这些字段
+// Channels不含透明度，Premultiplied保持原样不解除预乘，Linear表示线性光扩展范围数值格式，Orientation为原始声明方向
+// ICCProfile、ColorHint、ColorEncoding、EXIF、GPS、XMP、IPTC及Description保留容器元数据，独立码流不携带这些字段
 type Info struct {
 	Format        Format
 	ImageType     ImageType
@@ -343,8 +377,10 @@ type Info struct {
 	Resolution    Resolution
 	ICCProfile    []byte
 	EXIF          []byte
+	GPS           []byte
 	XMP           []byte
 	IPTC          []byte
+	Description   *ImageDescription
 	Components    []ComponentInfo
 }
 
@@ -407,7 +443,7 @@ func DefaultLimits() Limits {
 	return Limits{MaxInputBytes: 64 << 20, MaxPixels: 1 << 24, MaxMemoryBytes: rasterMaxWork}
 }
 
-// Info 返回图像信息副本，不共享ICC配置字节及分量网格切片
+// Info 返回图像信息副本，不共享容器元数据、描述标签、颜色声明及分量网格切片
 // 返回: Info 图像信息
 func (r *Raster) Info() Info {
 	if r == nil {
@@ -428,17 +464,67 @@ func cloneBytes(src []byte) []byte {
 	return dst
 }
 
-// cloneInfo 独立复制可变元数据，不共享ICC配置、容器元数据、颜色声明或分量描述
+// cloneInfo 独立复制可变元数据，不共享ICC配置、容器元数据、颜色声明、描述标签或分量描述
 // 入参: info 原信息
 // 返回: Info 独立元数据副本
 func cloneInfo(info Info) Info {
 	info.ICCProfile = cloneBytes(info.ICCProfile)
 	info.EXIF = cloneBytes(info.EXIF)
+	info.GPS = cloneBytes(info.GPS)
 	info.XMP = cloneBytes(info.XMP)
 	info.IPTC = cloneBytes(info.IPTC)
+	info.Description = cloneImageDescription(info.Description)
 	info.Components = cloneComponentInfo(info.Components)
 	info.ColorEncoding = cloneColorEncoding(info.ColorEncoding)
 	return info
+}
+
+// cloneImageDescription 深拷贝图像描述标签结构，含PageNumber独立副本
+// 入参: desc 原图像描述，nil返回nil
+// 返回: *ImageDescription 独立图像描述副本
+func cloneImageDescription(desc *ImageDescription) *ImageDescription {
+	if desc == nil {
+		return nil
+	}
+	copied := *desc
+	if desc.PageNumber != nil {
+		page := *desc.PageNumber
+		copied.PageNumber = &page
+	}
+	return &copied
+}
+
+// jxrDescriptionEmpty 判断图像描述标签结构是否全为空，空结构不写入目录字段
+// 入参: desc 图像描述指针
+// 返回: bool 是否无有效描述字段
+func jxrDescriptionEmpty(desc *ImageDescription) bool {
+	if desc == nil {
+		return true
+	}
+	return desc.DocumentName == "" && desc.ImageDescription == "" && desc.EquipmentMake == "" && desc.EquipmentModel == "" &&
+		desc.PageName == "" && desc.PageNumber == nil && desc.SoftwareNameVersion == "" && desc.DateTime == "" &&
+		desc.ArtistName == "" && desc.HostComputer == "" && desc.CopyrightNotice == ""
+}
+
+// jxrDescriptionWork 计算图像描述标签结构在内存中占用的保守字节数
+// 入参: desc 图像描述指针
+// 返回: uint64 保守内存字节数
+func jxrDescriptionWork(desc *ImageDescription) uint64 {
+	if desc == nil {
+		return 0
+	}
+	work := uint64(256)
+	for _, s := range [10]string{desc.DocumentName, desc.ImageDescription, desc.EquipmentMake, desc.EquipmentModel, desc.PageName, desc.SoftwareNameVersion, desc.DateTime, desc.ArtistName, desc.HostComputer, desc.CopyrightNotice} {
+		work += uint64(len(s))
+	}
+	return work
+}
+
+// jxrInfoLinear 判断标准像素格式是否采用线性光编码，定点YCC为扩展色域非线性编码
+// 入参: format 标准像素格式
+// 返回: bool 是否为线性光数值格式
+func jxrInfoLinear(format jxrPixelFormat) bool {
+	return format.number != jxrUnsigned && format.color != 1 && format.color != 2 && format.color != 3
 }
 
 // cloneComponentInfo 按精确容量复制分量描述，保持空切片语义，不引入追加增长的额外容量
@@ -864,7 +950,7 @@ func newRasterContext(ctx context.Context, info Info, limits Limits) (*Raster, e
 	if len(info.Components) == 0 || len(info.Components) > rasterMaxComponents+1 {
 		return nil, fmt.Errorf("%w: raster component count", ErrInvalid)
 	}
-	memory := uint64(512) + uint64(len(info.Components))*256 + uint64(len(info.ICCProfile))
+	memory := uint64(512) + uint64(len(info.Components))*256 + uint64(len(info.ICCProfile)) + uint64(len(info.EXIF)) + uint64(len(info.GPS)) + uint64(len(info.XMP)) + uint64(len(info.IPTC)) + jxrDescriptionWork(info.Description)
 	if info.ColorEncoding != nil {
 		memory += 4
 	}
@@ -895,6 +981,11 @@ func newRasterContext(ctx context.Context, info Info, limits Limits) (*Raster, e
 	}
 	raster := &Raster{info: info, planes: make([]imageComponents, len(info.Components))}
 	raster.info.ColorEncoding = cloneColorEncoding(info.ColorEncoding)
+	raster.info.EXIF = cloneBytes(info.EXIF)
+	raster.info.GPS = cloneBytes(info.GPS)
+	raster.info.XMP = cloneBytes(info.XMP)
+	raster.info.IPTC = cloneBytes(info.IPTC)
+	raster.info.Description = cloneImageDescription(info.Description)
 	if len(info.ICCProfile) != 0 {
 		raster.info.ICCProfile = make([]byte, len(info.ICCProfile))
 		for at := 0; at < len(info.ICCProfile); {
@@ -1129,7 +1220,7 @@ func normalizeRasterInfo(info *Info) error {
 	if err := checkJXRColorMetadata(format, info.ColorHint, info.ColorEncoding); err != nil {
 		return err
 	}
-	linear := format.number != jxrUnsigned
+	linear := jxrInfoLinear(format)
 	if info.Linear && !linear {
 		return fmt.Errorf("%w: raster linear representation", ErrInvalid)
 	}

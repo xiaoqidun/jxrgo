@@ -122,6 +122,180 @@ type jxrCICPConstantLuminance struct {
 	redNegative, redPositive   float64
 }
 
+// jxrYCCDecoder 保存非线性YCC到扩展色域设备RGB的矩阵与量化范围参数
+type jxrYCCDecoder struct {
+	offset     [3]float64
+	scale      [3]float64
+	red        float64
+	blue       float64
+	matrixCode uint16
+	ycgco      jxrCICPYCgCo
+}
+
+// jxrHasSignedSamples 判断图像颜色分量是否采用支持负值与扩展范围的数值编码
+// 入参: info 原生图像描述
+// 返回: bool 是否含扩展范围有符号分量
+func jxrHasSignedSamples(info Info) bool {
+	if info.Linear {
+		return true
+	}
+	if len(info.Components) == 0 {
+		return false
+	}
+	format := info.Components[0].Format
+	return format == SampleFixed || format == SampleFloat
+}
+
+// jxrNewYCCDecoder 为YCC图像构造非线性YCC到RGB的预解码器，可选优先使用合法CICP矩阵与范围，否则回退T.832默认全范围BT.601
+// 入参: info 原生图像描述, encoding 可选PTM CICP编码声明
+// 返回: jxrYCCDecoder YCC到RGB预解码器, bool 样本编码是否有效
+func jxrNewYCCDecoder(info Info, encoding *ColorEncoding) (jxrYCCDecoder, bool) {
+	if info.ColorSpace != ColorYCC || info.Channels != 3 || len(info.Components) < 3 {
+		return jxrYCCDecoder{}, false
+	}
+	if encoding != nil {
+		if dec, ok := jxrBuildYCCDecoder(info, *encoding); ok {
+			return dec, true
+		}
+	}
+	return jxrBuildYCCDecoder(info, ColorEncoding{Primaries: 1, Transfer: 13, Matrix: 5, FullRange: true})
+}
+
+// jxrCICPMatrixLuma 返回标准CICP非恒定或恒定亮度颜色矩阵对应的红蓝亮度权重
+// 入参: matrixCode H.273矩阵编号, allowConstant 是否接受恒定亮度矩阵编号十
+// 返回: float64 红色亮度权重, float64 蓝色亮度权重, bool 矩阵编号是否受支持
+func jxrCICPMatrixLuma(matrixCode uint16, allowConstant bool) (float64, float64, bool) {
+	switch matrixCode {
+	case 1:
+		return 0.2126, 0.0722, true
+	case 4:
+		return 0.30, 0.11, true
+	case 5, 6:
+		return 0.299, 0.114, true
+	case 7:
+		return 0.212, 0.087, true
+	case 9:
+		return jxrBT2100Red, jxrBT2100Blue, true
+	case 10:
+		if allowConstant {
+			return jxrBT2100Red, jxrBT2100Blue, true
+		}
+	}
+	return 0, 0, false
+}
+
+// jxrCICPComponentRanges 按CICP全范围或受限范围规范计算各颜色分量的反量化偏移与缩放系数
+// 入参: components 颜色分量描述切片, fullRange 是否全范围, ycc 是否为YCC空间, ycgco 是否为YCgCo矩阵, matrixCode H.273矩阵编号
+// 返回: [3]float64 各分量偏移, [3]float64 各分量缩放, bool 样本编码与位深组合是否合法
+func jxrCICPComponentRanges(components []ComponentInfo, fullRange, ycc, ycgco bool, matrixCode uint16) ([3]float64, [3]float64, bool) {
+	var offsets, scales [3]float64
+	for index, component := range components {
+		colorDifference := ycc && matrixCode != 0 && index != 0
+		switch component.Format {
+		case SampleFloat, SampleFixed:
+			if ycgco {
+				return offsets, scales, false
+			}
+			if fullRange {
+				scales[index] = 1
+			} else if colorDifference {
+				scales[index] = 256.0 / 224.0
+			} else {
+				offsets[index], scales[index] = 16.0/256.0, 256.0/219.0
+			}
+			continue
+		case SampleRGBE:
+			if !fullRange || ycgco || ycc {
+				return offsets, scales, false
+			}
+			scales[index] = 1
+			continue
+		}
+		bits := int(component.Precision)
+		if component.Format != SampleUnsigned || bits < 1 || ycgco && bits > 32 ||
+			!ycgco && bits < 8 && (!fullRange || ycc && matrixCode != 0) {
+			return offsets, scales, false
+		}
+		if ycgco {
+			continue
+		}
+		maximum := math.Ldexp(1, bits) - 1
+		offset, span := 0.0, maximum
+		if fullRange {
+			if colorDifference {
+				offset = math.Ldexp(1, bits-1)
+			}
+		} else {
+			step := math.Ldexp(1, bits-8)
+			offset, span = 16*step, 219*step
+			if colorDifference {
+				offset, span = 128*step, 224*step
+			}
+		}
+		offsets[index], scales[index] = offset/maximum, maximum/span
+	}
+	return offsets, scales, true
+}
+
+// jxrBuildYCCDecoder 按指定CICP矩阵和范围构造非线性YCC到RGB解码器，保留扩展色域不裁剪
+// 入参: info 原生YCC图像描述, specification CICP矩阵与范围声明
+// 返回: jxrYCCDecoder YCC解码器, bool 矩阵及分量编码组合是否合法
+func jxrBuildYCCDecoder(info Info, specification ColorEncoding) (jxrYCCDecoder, bool) {
+	var dec jxrYCCDecoder
+	matrixCode := uint16(specification.Matrix)
+	if matrixCode == 2 {
+		matrixCode = 5
+	}
+	var red, blue float64
+	switch matrixCode {
+	case 0, 8, 16, 17:
+	case 12:
+		var ok bool
+		_, red, blue, ok = jxrCICPPrimaries(uint16(specification.Primaries))
+		if !ok || red < 0 || blue < 0 || red+blue >= 1 {
+			return dec, false
+		}
+	default:
+		var ok bool
+		red, blue, ok = jxrCICPMatrixLuma(matrixCode, false)
+		if !ok {
+			return dec, false
+		}
+	}
+	ycgco := matrixCode == 8 || matrixCode == 16 || matrixCode == 17
+	offsets, scales, ok := jxrCICPComponentRanges(info.Components[:3], specification.FullRange, true, ycgco, matrixCode)
+	if !ok {
+		return jxrYCCDecoder{}, false
+	}
+	dec.offset, dec.scale = offsets, scales
+	if ycgco {
+		dec.ycgco, ok = jxrNewCICPYCgCo(info, matrixCode, specification.FullRange)
+		if !ok {
+			return jxrYCCDecoder{}, false
+		}
+	}
+	dec.red, dec.blue, dec.matrixCode = red, blue, matrixCode
+	return dec, true
+}
+
+// rgb 将已采样YCC三通道解码为未裁剪的非线性设备RGB
+// 入参: samples 归一化或扩展范围YCC三通道
+// 返回: [3]float64 未裁剪非线性设备RGB
+func (dec *jxrYCCDecoder) rgb(samples []float64) [3]float64 {
+	if dec.matrixCode == 8 || dec.matrixCode == 16 || dec.matrixCode == 17 {
+		return dec.ycgco.rgb(samples)
+	}
+	signal := [3]float64{
+		(samples[0] - dec.offset[0]) * dec.scale[0],
+		(samples[1] - dec.offset[1]) * dec.scale[1],
+		(samples[2] - dec.offset[2]) * dec.scale[2],
+	}
+	if dec.matrixCode == 0 {
+		return [3]float64{signal[2], signal[0], signal[1]}
+	}
+	return jxrCICPYCCToRGB(signal, dec.red, dec.blue)
+}
+
 // jxrCICPDisplay 准备SDR、数字影院XYZ、PQ或HLG到sRGB的转换，PQ和HLG采用BT.2446方法A
 // 入参: info 原生分量描述, specification PTM颜色声明, peakNits 可选HDR峰值亮度，零值对PQ默认10000、对HLG默认1000
 // 返回: jxrDisplayMapping 转换, bool 是否支持声明及样本组合
@@ -132,7 +306,7 @@ func jxrCICPDisplay(info Info, specification ColorEncoding, peakNits float64) (j
 	gray := info.ColorSpace == ColorGray && info.Channels == 1
 	rgb := info.ColorSpace == ColorRGB && info.Channels == 3
 	xyz := specification.Primaries == 10
-	layout := rgb && matrixCode == 0 || ycc && (matrixCode != 0 || xyz) || gray && !xyz
+	layout := rgb && matrixCode == 0 || ycc || gray && !xyz
 	if !layout || len(info.Components) < info.Channels ||
 		info.Premultiplied && (!specification.FullRange || ycc) {
 		return mapping, false
@@ -140,14 +314,6 @@ func jxrCICPDisplay(info Info, specification ColorEncoding, peakNits float64) (j
 	transfer := uint16(specification.Transfer)
 	if xyz && !jxrCICPXYZEncoding(specification) || transfer == 17 && !xyz {
 		return mapping, false
-	}
-	if info.Linear {
-		if !specification.FullRange {
-			return mapping, false
-		}
-		if gray && transfer != 8 || rgb && transfer != 8 && transfer != 13 && transfer != 16 && transfer != 18 {
-			return mapping, false
-		}
 	}
 	hdr := transfer == 16 || transfer == 18
 	hdrMatrix := matrixCode == 14 || matrixCode == 15
@@ -179,52 +345,18 @@ func jxrCICPDisplay(info Info, specification ColorEncoding, peakNits float64) (j
 		if red < 0 || blue < 0 || red+blue >= 1 {
 			return mapping, false
 		}
-	case 1:
-		red, blue = 0.2126, 0.0722
-	case 4:
-		red, blue = 0.30, 0.11
-	case 5, 6:
-		red, blue = 0.299, 0.114
-	case 7:
-		red, blue = 0.212, 0.087
-	case 9, 10:
-		red, blue = jxrBT2100Red, jxrBT2100Blue
 	default:
-		return mapping, false
+		red, blue, ok = jxrCICPMatrixLuma(matrixCode, true)
+		if !ok {
+			return mapping, false
+		}
 	}
 	display := &mapping.cicp
-	for index, component := range info.Components[:info.Channels] {
-		if info.Linear && (component.Format == SampleFloat || component.Format == SampleFixed) {
-			if ycgco {
-				return jxrDisplayMapping{}, false
-			}
-			display.scale[index] = 1
-			continue
-		}
-		bits := int(component.Precision)
-		if component.Format != SampleUnsigned || bits < 1 || ycgco && bits > 32 ||
-			!ycgco && bits < 8 && (!specification.FullRange || ycc && matrixCode != 0) {
-			return jxrDisplayMapping{}, false
-		}
-		if ycgco {
-			continue
-		}
-		maximum := math.Ldexp(1, bits) - 1
-		offset, span := 0.0, maximum
-		colorDifference := ycc && matrixCode != 0 && index != 0
-		if specification.FullRange {
-			if colorDifference {
-				offset = math.Ldexp(1, bits-1)
-			}
-		} else {
-			step := math.Ldexp(1, bits-8)
-			offset, span = 16*step, 219*step
-			if colorDifference {
-				offset, span = 128*step, 224*step
-			}
-		}
-		display.offset[index], display.scale[index] = offset/maximum, maximum/span
+	offsets, scales, ok := jxrCICPComponentRanges(info.Components[:info.Channels], specification.FullRange, ycc, ycgco, matrixCode)
+	if !ok {
+		return jxrDisplayMapping{}, false
 	}
+	display.offset, display.scale = offsets, scales
 	if !ycc && specification.Primaries == 1 && specification.FullRange && (transfer == 8 || transfer == 13) {
 		mapping.linear = transfer == 8
 		return mapping, true
@@ -355,7 +487,7 @@ func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha fl
 	if info.Channels == 1 && !hdr {
 		value := rgb[0]
 		if display.transfer != jxrCICPDirectSRGB {
-			value = displayLinear(jxrCICPInverseTransfer(value, display.transfer, false))
+			value = displayLinear(jxrCICPInverseTransfer(value, display.transfer, jxrHasSignedSamples(info)))
 		}
 		return value, value, value
 	}
@@ -399,7 +531,7 @@ func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha fl
 		}
 		rgb = jxrBT2446MethodA(rgb, display.peakNits)
 	} else if !constant {
-		signed := ycc || info.Linear
+		signed := ycc || jxrHasSignedSamples(info)
 		for index, value := range rgb {
 			rgb[index] = jxrCICPInverseTransfer(value, display.transfer, signed)
 		}
@@ -439,7 +571,7 @@ func (display *jxrCICPColorDisplay) linearColor(info Info, samples []float64, al
 		if transfer == jxrCICPDirectSRGB {
 			transfer = 13
 		}
-		value := jxrCICPInverseTransfer(rgb[0], transfer, info.Linear)
+		value := jxrCICPInverseTransfer(rgb[0], transfer, jxrHasSignedSamples(info))
 		if repremultiply {
 			value *= alpha
 		}
@@ -470,8 +602,8 @@ func (display *jxrCICPColorDisplay) linearColor(info Info, samples []float64, al
 		}
 		scale := 100.0
 		if display.transfer == 18 {
-			rgb = jxrHLGDisplayLight(rgb, display.hlgLuma, 1000)
-			scale = 10.0
+			rgb = jxrHLGDisplayLight(rgb, display.hlgLuma, display.peakNits)
+			scale = display.peakNits / 100.0
 		}
 		for index := range rgb {
 			rgb[index] *= scale
@@ -481,7 +613,7 @@ func (display *jxrCICPColorDisplay) linearColor(info Info, samples []float64, al
 		if transfer == jxrCICPDirectSRGB {
 			transfer = 13
 		}
-		signed := ycc || info.Linear
+		signed := ycc || jxrHasSignedSamples(info)
 		for index, value := range rgb {
 			rgb[index] = jxrCICPInverseTransfer(value, transfer, signed)
 		}
@@ -507,9 +639,9 @@ func jxrCICPYCCToRGB(signal [3]float64, kr, kb float64) [3]float64 {
 }
 
 // jxrCICPInverseTransfer 反解CICP的SDR传递特性
-// 入参: value 非线性信号, transfer 传递特性编号, ycc 是否采用非零矩阵的有符号sRGB分支
+// 入参: value 非线性信号, transfer 传递特性编号, signed 是否对sRGB采用有符号对称扩展分支
 // 返回: float64 线性分量
-func jxrCICPInverseTransfer(value float64, transfer uint16, ycc bool) float64 {
+func jxrCICPInverseTransfer(value float64, transfer uint16, signed bool) float64 {
 	switch transfer {
 	case 4:
 		return math.Pow(max(0, value), 2.2)
@@ -530,7 +662,7 @@ func jxrCICPInverseTransfer(value float64, transfer uint16, ycc bool) float64 {
 		return -math.Pow((alpha-1-4*value)/alpha, power) / 4
 	}
 	magnitude := value
-	if transfer == 11 || transfer == 13 && ycc {
+	if transfer == 11 || transfer == 13 && signed {
 		magnitude = math.Abs(value)
 	}
 	if magnitude <= beta*slope {
@@ -627,7 +759,7 @@ func jxrHLGLuma(color ColorEncoding) ([3]float64, bool) {
 	return [3]float64{red, green, blue}, ok && red >= 0 && green >= 0 && blue >= 0
 }
 
-// jxrBT2100Linear 恢复相对1000 cd/m²的BT.2100 PQ显示光或HLG场景光
+// jxrBT2100Linear 恢复相对10000 cd/m²的BT.2100 PQ显示光或HLG场景光
 // 入参: signal 非线性RGB或归一化ICtCp/IPT, transfer H.273的PQ或HLG编号, matrix H.273矩阵编号
 // 返回: [3]float64 源基色的线性RGB，ICtCp和IPT使用BT.2020基色
 func jxrBT2100Linear(signal [3]float64, transfer, matrix uint16) [3]float64 {
@@ -816,7 +948,7 @@ func jxrNewCICPConstantLuminance(kr, kb float64, transfer uint16) jxrCICPConstan
 }
 
 // linear 从恒定亮度信号恢复线性RGB，绿色由线性亮度方程求得
-// 入参: signal 已撤销量化的亮度及色差, kr,kb 红蓝权重, transfer 已支持的SDR传递代码
+// 入参: signal 已撤销量化的亮度及色差, kr,kb 红蓝权重, transfer 已支持的H.273传递代码
 // 返回: [3]float64 线性RGB，PQ以10000 cd/m²参考显示光为单位，HLG为场景光
 func (constant *jxrCICPConstantLuminance) linear(signal [3]float64, kr, kb float64, transfer uint16) [3]float64 {
 	y, cb, cr := signal[0], signal[1], signal[2]

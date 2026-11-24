@@ -39,15 +39,16 @@ type DisplayOptions struct {
 	HDRPeakNits float64
 }
 
-// LinearOptions 指定线性浮点行读取的采样滤波、色彩管理、渲染意图、解预乘及资源限制
+// LinearOptions 指定线性浮点行读取的采样滤波、色彩管理、渲染意图、HLG峰值亮度、解预乘及资源限制
 // opts为nil时默认采用双线性滤波；ApplyICC启用内建ICC，ApplyCICP启用PTM CICP，ApplyICC优先于ApplyCICP
-// Unpremultiply为真时对预乘图像解除预乘，否则保持线性域预乘；输出为未裁剪的D65线性scRGB
+// HDRPeakNits指定HLG逆传递与BT.2100 OOTF的参考显示峰值亮度（零值默认1000 nit），Unpremultiply为真时解除预乘，输出未裁剪D65线性scRGB
 type LinearOptions struct {
 	Filter        ResampleFilter
 	ApplyCICP     bool
 	ApplyICC      bool
 	Unpremultiply bool
 	Intent        RenderingIntent
+	HDRPeakNits   float64
 	Limits        Limits
 }
 
@@ -61,7 +62,29 @@ type LinearReader struct {
 	filter        ResampleFilter
 	unpremultiply bool
 	defaultLinear bool
-	yccFallback   bool
+	useNearest    bool
+}
+
+// RGBOptions 指定设备域非线性RGB行读取的采样滤波、CICP矩阵解码、解预乘及资源限制
+// opts为nil时默认采用双线性滤波；ApplyCICPMatrix为真时对YCC优先按PTM CICP矩阵与范围解码而不执行逆传递线性化或基色转换
+// 忽略内嵌ICC与ColorHintUnspecified，保留负色域与大于一扩展范围供外部色彩管理管线使用
+type RGBOptions struct {
+	Filter          ResampleFilter
+	ApplyCICPMatrix bool
+	Unpremultiply   bool
+	Limits          Limits
+}
+
+// RGBReader 提供面向外部色彩管理管线的按行设备域RGB浮点读取视图
+// 每像素按顺序写入红、绿、蓝与透明度四个未裁剪float64值，对YCC完成相位上采样与矩阵解码而不执行逆传递线性化
+type RGBReader struct {
+	raster        *Raster
+	info          Info
+	components    []Component
+	ycc           jxrYCCDecoder
+	hasYCC        bool
+	filter        ResampleFilter
+	unpremultiply bool
 	useNearest    bool
 }
 
@@ -98,7 +121,7 @@ func (r *Raster) display(ctx context.Context, opts *DisplayOptions) (*image.NRGB
 	if filter > ResampleBilinear {
 		return nil, fmt.Errorf("%w: display filter", ErrInvalid)
 	}
-	if intent > IntentSaturation {
+	if intent > IntentAbsolute {
 		return nil, fmt.Errorf("%w: display rendering intent", ErrInvalid)
 	}
 	if peakNits != 0 && (!geometryFinite(peakNits) || peakNits < 100) {
@@ -172,17 +195,20 @@ func (r *Raster) newLinearReader(ctx context.Context, opts *LinearOptions) (*Lin
 	if r == nil || r.Bounds().Empty() || r.info.Channels < 1 || r.info.Channels > rasterMaxComponents {
 		return nil, fmt.Errorf("%w: linear reader raster", ErrInvalid)
 	}
-	filter, limits, intent := ResampleBilinear, DefaultLimits(), IntentRelative
+	filter, limits, intent, peakNits := ResampleBilinear, DefaultLimits(), IntentRelative, 0.0
 	applyCICP, applyICC, unpremultiply := false, false, false
 	if opts != nil {
-		filter, limits, intent = opts.Filter, opts.Limits.normalized(), opts.Intent
+		filter, limits, intent, peakNits = opts.Filter, opts.Limits.normalized(), opts.Intent, opts.HDRPeakNits
 		applyCICP, applyICC, unpremultiply = opts.ApplyCICP, opts.ApplyICC, opts.Unpremultiply
 	}
 	if filter > ResampleBilinear {
 		return nil, fmt.Errorf("%w: linear reader filter", ErrInvalid)
 	}
-	if intent > IntentSaturation {
+	if intent > IntentAbsolute {
 		return nil, fmt.Errorf("%w: linear reader rendering intent", ErrInvalid)
+	}
+	if peakNits != 0 && (!geometryFinite(peakNits) || peakNits < 100) {
+		return nil, fmt.Errorf("%w: linear reader HDR peak luminance", ErrInvalid)
 	}
 	info := r.info
 	count := info.Channels
@@ -197,7 +223,7 @@ func (r *Raster) newLinearReader(ctx context.Context, opts *LinearOptions) (*Lin
 		return nil, &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: scratch, Detail: "linear reader working memory"}
 	}
 	var mapping jxrDisplayMapping
-	defaultLinear, yccFallback := false, false
+	defaultLinear := false
 	switch {
 	case applyICC && len(info.ICCProfile) != 0:
 		icc, err := jxrReadICCTransform(ctx, info.ICCProfile, info, limits.MaxMemoryBytes-scratch, intent)
@@ -207,33 +233,39 @@ func (r *Raster) newLinearReader(ctx context.Context, opts *LinearOptions) (*Lin
 		mapping.icc = icc
 	case applyCICP && info.ColorEncoding != nil:
 		var supported bool
-		mapping, supported = jxrCICPDisplay(info, *info.ColorEncoding, 0)
+		mapping, supported = jxrCICPDisplay(info, *info.ColorEncoding, peakNits)
 		if !supported {
 			return nil, fmt.Errorf("%w: linear CICP color interpretation", ErrUnsupported)
 		}
 	default:
+		if info.ColorHint == ColorHintUnspecified {
+			return nil, fmt.Errorf("%w: unspecified linear color space", ErrUnsupported)
+		}
 		switch info.ColorSpace {
 		case ColorGray:
 			if info.Channels != 1 {
 				return nil, fmt.Errorf("%w: linear gray channels", ErrUnsupported)
 			}
+			defaultLinear = true
 		case ColorRGB:
 			if info.Channels != 3 {
 				return nil, fmt.Errorf("%w: linear RGB channels", ErrUnsupported)
 			}
+			defaultLinear = true
 		case ColorYCC:
-			if info.Channels != 3 {
+			var supported bool
+			mapping, supported = jxrCICPDisplay(info, ColorEncoding{Primaries: 1, Transfer: 13, Matrix: 5, FullRange: true}, 0)
+			if !supported {
 				return nil, fmt.Errorf("%w: linear YCC channels", ErrUnsupported)
 			}
-			yccFallback = true
 		case ColorCMYK, ColorCMYKDirect:
 			if info.Channels != 4 {
 				return nil, fmt.Errorf("%w: linear CMYK channels", ErrUnsupported)
 			}
+			defaultLinear = true
 		default:
 			return nil, fmt.Errorf("%w: linear color interpretation", ErrUnsupported)
 		}
-		defaultLinear = true
 	}
 	components := make([]Component, count)
 	for index := range count {
@@ -256,7 +288,6 @@ func (r *Raster) newLinearReader(ctx context.Context, opts *LinearOptions) (*Lin
 		filter:        filter,
 		unpremultiply: unpremultiply,
 		defaultLinear: defaultLinear,
-		yccFallback:   yccFallback,
 		useNearest:    filter == ResampleNearest && info.Bounds.Min == (image.Point{}),
 	}, ctx.Err()
 }
@@ -367,38 +398,6 @@ func (lr *LinearReader) linearPixel(ctx context.Context, values []float64, alpha
 	if lr.defaultLinear {
 		srcLinear = info.Linear
 	}
-	if lr.yccFallback {
-		repremultiply := false
-		if info.Premultiplied {
-			if !(alpha > 0) || !geometryFinite(alpha) {
-				return 0, 0, 0, nil
-			}
-			for index := range 3 {
-				values[index] /= alpha
-			}
-			repremultiply = !lr.unpremultiply
-		}
-		signal := [3]float64{values[0], values[1], values[2]}
-		for index := 1; index < 3; index++ {
-			component := info.Components[index]
-			if component.Format == SampleUnsigned {
-				bits := int(component.Precision)
-				signal[index] -= math.Ldexp(1, bits-1) / (math.Ldexp(1, bits) - 1)
-			}
-		}
-		rgb := jxrCICPYCCToRGB(signal, 0.299, 0.114)
-		if !srcLinear {
-			for index := range rgb {
-				rgb[index] = jxrCICPInverseTransfer(rgb[index], 13, true)
-			}
-		}
-		if repremultiply {
-			for index := range rgb {
-				rgb[index] *= alpha
-			}
-		}
-		return rgb[0], rgb[1], rgb[2], nil
-	}
 	if srcLinear && (info.ColorSpace == ColorGray || info.ColorSpace == ColorRGB) {
 		var red, green, blue float64
 		if info.ColorSpace == ColorGray {
@@ -446,6 +445,203 @@ func (lr *LinearReader) linearPixel(ctx context.Context, values []float64, alpha
 		blue *= alpha
 	}
 	return red, green, blue, nil
+}
+
+// NewRGBReader 为原生图像创建按行读取未裁剪设备域RGB浮点像素的读取器，不执行逆传递线性化或内嵌ICC转换
+// 支持灰度、RGB、全十六种YCC子采样及CMYK，对YCC完成相位上采样与矩阵解码，供外部色彩管理管线套用外部ICC
+// 入参: ctx Context，nil采用Background, opts 设备RGB读取配置，nil默认双线性滤波与T.832默认BT.601矩阵
+// 返回: *RGBReader 设备RGB行读取器, error 参数、颜色、资源或取消错误
+func (r *Raster) NewRGBReader(ctx context.Context, opts *RGBOptions) (*RGBReader, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reader, err := r.newRGBReader(ctx, opts)
+	if err != nil {
+		return nil, wrapJXRError("Raster.NewRGBReader", err)
+	}
+	return reader, nil
+}
+
+// newRGBReader 执行RGBReader的参数预算校验、YCC矩阵解码器准备与分量绑定，由公开入口归一化错误
+// 入参: ctx 已规范化Context, opts 设备RGB读取配置
+// 返回: *RGBReader 设备RGB行读取器, error 参数、颜色、资源或取消错误
+func (r *Raster) newRGBReader(ctx context.Context, opts *RGBOptions) (*RGBReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r == nil || r.Bounds().Empty() || r.info.Channels < 1 || r.info.Channels > rasterMaxComponents {
+		return nil, fmt.Errorf("%w: RGB reader raster", ErrInvalid)
+	}
+	filter, limits := ResampleBilinear, DefaultLimits()
+	applyCICPMatrix, unpremultiply := false, false
+	if opts != nil {
+		filter, limits = opts.Filter, opts.Limits.normalized()
+		applyCICPMatrix, unpremultiply = opts.ApplyCICPMatrix, opts.Unpremultiply
+	}
+	if filter > ResampleBilinear {
+		return nil, fmt.Errorf("%w: RGB reader filter", ErrInvalid)
+	}
+	info := r.info
+	count := info.Channels
+	if info.Alpha {
+		count++
+	}
+	if count != len(info.Components) {
+		return nil, fmt.Errorf("%w: RGB reader components", ErrInvalid)
+	}
+	scratch := uint64(512) + uint64(count)*136
+	if scratch > limits.MaxMemoryBytes {
+		return nil, &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: scratch, Detail: "RGB reader working memory"}
+	}
+	var ycc jxrYCCDecoder
+	hasYCC := false
+	switch info.ColorSpace {
+	case ColorGray:
+		if info.Channels != 1 {
+			return nil, fmt.Errorf("%w: RGB reader gray channels", ErrUnsupported)
+		}
+	case ColorRGB:
+		if info.Channels != 3 {
+			return nil, fmt.Errorf("%w: RGB reader RGB channels", ErrUnsupported)
+		}
+	case ColorYCC:
+		var encoding *ColorEncoding
+		if applyCICPMatrix {
+			encoding = info.ColorEncoding
+		}
+		var ok bool
+		ycc, ok = jxrNewYCCDecoder(info, encoding)
+		if !ok {
+			return nil, fmt.Errorf("%w: RGB reader YCC layout", ErrUnsupported)
+		}
+		hasYCC = true
+	case ColorCMYK, ColorCMYKDirect:
+		if info.Channels != 4 {
+			return nil, fmt.Errorf("%w: RGB reader CMYK channels", ErrUnsupported)
+		}
+	default:
+		return nil, fmt.Errorf("%w: RGB reader color interpretation", ErrUnsupported)
+	}
+	components := make([]Component, count)
+	for index := range count {
+		var err error
+		components[index], err = r.component(index)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &RGBReader{
+		raster:        r,
+		info:          info,
+		components:    components,
+		ycc:           ycc,
+		hasYCC:        hasYCC,
+		filter:        filter,
+		unpremultiply: unpremultiply,
+		useNearest:    filter == ResampleNearest && info.Bounds.Min == (image.Point{}),
+	}, ctx.Err()
+}
+
+// ReadRow 读取指定显示行并按每像素红、绿、蓝、透明度四个float64写入dst，保持设备非线性编码且不裁剪
+// dst长度须不少于图像宽度乘以四，并发读取须由调用方保证源Raster保持只读
+// 入参: ctx Context，nil采用Background, y 目标行坐标, dst 输出浮点切片
+// 返回: error 参数、坐标、数值或取消错误
+func (rr *RGBReader) ReadRow(ctx context.Context, y int, dst []float64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := rr.readRow(ctx, y, dst); err != nil {
+		return wrapJXRError("RGBReader.ReadRow", err)
+	}
+	return nil
+}
+
+// readRow 执行单行原生采样、YCC矩阵解码及可选解预乘，由公开入口归一化错误
+// 入参: ctx 已规范化Context, y 目标行坐标, dst 输出浮点切片
+// 返回: error 参数、坐标、数值或取消错误
+func (rr *RGBReader) readRow(ctx context.Context, y int, dst []float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if rr == nil || rr.raster == nil {
+		return fmt.Errorf("%w: nil RGB reader", ErrInvalid)
+	}
+	bounds := rr.info.Bounds
+	width, height := bounds.Dx(), bounds.Dy()
+	row := y - bounds.Min.Y
+	if row < 0 || row >= height || len(dst) < width*4 {
+		return fmt.Errorf("%w: RGB reader row or destination", ErrInvalid)
+	}
+	count := len(rr.components)
+	var valueStorage [5]float64
+	values := valueStorage[:count]
+	for x := range width {
+		if x&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if rr.useNearest {
+			if err := jxrDisplayNearestPixel(rr.raster, x, row, values); err != nil {
+				return err
+			}
+		} else {
+			for index, component := range rr.components {
+				var err error
+				values[index], err = displayJXRSample(component, x, row, width, height, rr.filter)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		alpha := 1.0
+		if rr.info.Alpha {
+			alpha = values[rr.info.Channels]
+		}
+		red, green, blue := rr.rgbPixel(values, alpha)
+		base := x * 4
+		dst[base], dst[base+1], dst[base+2], dst[base+3] = red, green, blue, alpha
+	}
+	return ctx.Err()
+}
+
+// rgbPixel 将单个已采样原生像素转换为未裁剪的设备域RGB三通道
+// 入参: values 可复用原生样本工作区, alpha 当前像素透明度
+// 返回: float64 设备域红、绿、蓝值
+func (rr *RGBReader) rgbPixel(values []float64, alpha float64) (float64, float64, float64) {
+	info := rr.info
+	repremultiply := false
+	if info.Premultiplied && (rr.unpremultiply || rr.hasYCC || info.ColorSpace == ColorCMYK || info.ColorSpace == ColorCMYKDirect) {
+		if !(alpha > 0) || !geometryFinite(alpha) {
+			return 0, 0, 0
+		}
+		for index := range info.Channels {
+			values[index] /= alpha
+		}
+		repremultiply = !rr.unpremultiply
+	}
+	var red, green, blue float64
+	if rr.hasYCC {
+		rgb := rr.ycc.rgb(values)
+		red, green, blue = rgb[0], rgb[1], rgb[2]
+	} else {
+		switch info.ColorSpace {
+		case ColorGray:
+			red, green, blue = values[0], values[0], values[0]
+		case ColorRGB:
+			red, green, blue = values[0], values[1], values[2]
+		case ColorCMYK, ColorCMYKDirect:
+			red = (1 - values[0]) * (1 - values[3])
+			green = (1 - values[1]) * (1 - values[3])
+			blue = (1 - values[2]) * (1 - values[3])
+		}
+	}
+	if repremultiply {
+		red *= alpha
+		green *= alpha
+		blue *= alpha
+	}
+	return red, green, blue
 }
 
 // renderJXRDisplay 共用标准解码与原生显示转换的直通整数快路径与通用采样渲染循环

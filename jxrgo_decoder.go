@@ -150,7 +150,7 @@ func (d *Decoder) Info() Info {
 // 返回: error 容量不足时返回资源错误
 func (d *Decoder) checkInfoCopy() error {
 	retained := d.inputWork() + d.retainedHeaderWork()
-	work := uint64(len(d.info.Components))*128 + uint64(len(d.info.ICCProfile)) + uint64(len(d.info.EXIF)) + uint64(len(d.info.XMP)) + uint64(len(d.info.IPTC))
+	work := uint64(len(d.info.Components))*128 + uint64(len(d.info.ICCProfile)) + uint64(len(d.info.EXIF)) + uint64(len(d.info.GPS)) + uint64(len(d.info.XMP)) + uint64(len(d.info.IPTC)) + jxrDescriptionWork(d.info.Description)
 	if d.info.ColorEncoding != nil {
 		work += 4
 	}
@@ -203,6 +203,9 @@ func (d *Decoder) decodeLocked(ctx context.Context, extra uint64) (*Raster, erro
 	defer d.bindInputContext(nil)
 	if len(d.data) == 0 {
 		return nil, fmt.Errorf("%w: uninitialized decoder", ErrInvalid)
+	}
+	if d.source.container.uncompressed {
+		return d.decodeUncompressedLocked(ctx, d.info.Bounds, extra)
 	}
 	if extra >= d.limits.MaxMemoryBytes {
 		return nil, &LimitError{Resource: "max memory bytes", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(extra, 1), Detail: "decoding memory budget"}
@@ -363,11 +366,47 @@ func (parser *jxrParser) containerSource(container *jxrContainer, maxPixels uint
 	source := jxrRasterSource{container: *container, format: FormatJXR}
 	var err error
 	c := &source.container
+	if c.uncompressed {
+		return parser.bindUncompressedSource(source)
+	}
 	source.primary, err = parser.streamView(c.image, c.imageInput, maxPixels)
 	if err != nil {
 		return source, err
 	}
 	return parser.bindContainerSource(source, maxPixels)
+}
+
+// bindUncompressedSource 校验无压缩容器的像素格式、尺寸对齐、主区与独立透明度字节长度
+// 入参: source 含已解析无压缩容器目录的图像源
+// 返回: jxrRasterSource 已校验无压缩图像源, error 格式、尺寸、长度或能力错误
+func (parser *jxrParser) bindUncompressedSource(source jxrRasterSource) (jxrRasterSource, error) {
+	c := &source.container
+	if c.format.channels > 8 {
+		return source, fmt.Errorf("%w: JPEG XR raster color format", ErrUnsupported)
+	}
+	layout, err := jxrMakeUncompressedLayout(c.pixelFormat[15], c.format, c.width, c.height, c.separateAlpha())
+	if err != nil {
+		return source, err
+	}
+	actualMain := uint64(len(c.image))
+	if c.imageInput != nil {
+		actualMain = c.imageInput.size
+	}
+	if c.imageRemainder && actualMain < layout.mainBytes || !c.imageRemainder && actualMain != layout.mainBytes {
+		return source, fmt.Errorf("%w: JPEG XR uncompressed image byte count", ErrInvalid)
+	}
+	if c.separateAlpha() {
+		actualAlpha := uint64(len(c.alpha))
+		if c.alphaInput != nil {
+			actualAlpha = c.alphaInput.size
+		}
+		if actualAlpha != layout.alphaBytes {
+			return source, fmt.Errorf("%w: JPEG XR uncompressed alpha byte count", ErrInvalid)
+		}
+	}
+	source.primary.header = jxrHeader{width: c.width, height: c.height, color: c.format.color, depth: c.format.depth, alpha: c.format.alpha && !c.separateAlpha(), premultiply: c.format.premultiply, transform: uint8(c.transform)}
+	source.primary.primary = jxrPlane{color: c.format.color, channels: c.format.channels, chromaX: 7, chromaY: 7}
+	return source, nil
 }
 
 // bindContainerSource 校验已经定位的主码流与容器的对应关系，独立透明度仍按原语法读取
@@ -1061,4 +1100,132 @@ func displayWord(value float64) uint16 {
 		return 0
 	}
 	return uint16(math.Floor(colorClamp(value)*65535 + 0.5))
+}
+
+// decodeUncompressedLocked 在持有锁时按指定显示区域解码无压缩容器图像，并严格计入常驻、输出及行缓冲预算
+// 入参: ctx 已规范化Context, region 显示方向的目标区域, extra 调用方额外预留字节数
+// 返回: *Raster 原生区域或整图, error 几何、数据、读取、资源或取消错误
+func (d *Decoder) decodeUncompressedLocked(ctx context.Context, region image.Rectangle, extra uint64) (*Raster, error) {
+	if extra >= d.limits.MaxMemoryBytes {
+		return nil, &LimitError{Resource: "max memory bytes", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(extra, 1), Detail: "uncompressed decoding memory budget"}
+	}
+	info, outputWork, err := jxrRegionInfo(d.info, region)
+	if err != nil {
+		return nil, err
+	}
+	c := &d.source.container
+	layout, err := jxrMakeUncompressedLayout(c.pixelFormat[15], c.format, c.width, c.height, c.separateAlpha())
+	if err != nil {
+		return nil, err
+	}
+	rowWork := layout.rowBufferWork()
+	retained := d.inputWork() + d.retainedHeaderWork()
+	if _, ok := jxrWorkTotal(d.limits.MaxMemoryBytes, extra, retained, outputWork, rowWork); !ok {
+		return nil, &LimitError{Resource: "max memory bytes", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(jxrSaturatedAdd(extra, retained), jxrSaturatedAdd(outputWork, rowWork)), Detail: "uncompressed decoding memory budget"}
+	}
+	if rowWork > uint64(^uint(0)>>1) {
+		return nil, &LimitError{Resource: "max memory bytes", Limit: uint64(^uint(0) >> 1), Required: rowWork, Detail: "uncompressed row buffer capacity"}
+	}
+	target, err := newRasterContext(ctx, info, Limits{MaxPixels: d.limits.MaxPixels, MaxMemoryBytes: outputWork})
+	if err != nil {
+		return nil, err
+	}
+	rowBuf := make([]byte, int(layout.rowBytes))
+	var alphaBuf []byte
+	if !layout.planar && layout.separateAlpha {
+		alphaBuf = make([]byte, int(layout.alphaRowBytes))
+	}
+	if err := d.decodeUncompressedInto(ctx, target, region, &layout, rowBuf, alphaBuf); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return target, nil
+}
+
+// decodeUncompressedInto 逐行读取无压缩容器数据并解包至目标原生图像，支持随机输入与全部方向变换
+// 入参: ctx Context, target 已按region初始化的目标原生图像, region 显示方向区域, layout 无压缩布局, rowBuf 主行缓冲, alphaBuf 可选独立透明度行缓冲
+// 返回: error 范围、样本、读取或取消错误
+func (d *Decoder) decodeUncompressedInto(ctx context.Context, target *Raster, region image.Rectangle, layout *jxrUncompressedLayout, rowBuf, alphaBuf []byte) error {
+	c := &d.source.container
+	codedW, codedH := int(c.width), int(c.height)
+	dispW, dispH := d.info.Bounds.Dx(), d.info.Bounds.Dy()
+	transform := uint8(c.transform)
+	inverse := [8]uint8{0, 1, 2, 3, 7, 5, 6, 4}
+	codedRect := jxrRegionPosition(region, dispW, dispH, inverse[transform])
+	if layout.planar {
+		step := int(layout.sampleBytes)
+		for ci := range len(d.info.Components) {
+			sx, sy, baseOffset, srcRowBytes, inAlpha := layout.planeSpec(ci)
+			planeData, planeInput := c.image, c.imageInput
+			if inAlpha {
+				planeData, planeInput = c.alpha, c.alphaInput
+			}
+			cw, ch := codedW/sx, codedH/sy
+			x0, x1 := codedRect.Min.X/sx, codedRect.Max.X/sx
+			y0, y1 := codedRect.Min.Y/sy, codedRect.Max.Y/sy
+			dComp := d.info.Components[ci]
+			dx0, dy0 := region.Min.X/int(dComp.XStep), region.Min.Y/int(dComp.YStep)
+			dstStride := target.planes[ci].bounds.Dx()
+			buf := rowBuf[:int(srcRowBytes)]
+			for cy := y0; cy < y1; cy++ {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if err := jxrReadUncompressedSpan(planeData, planeInput, ctx, baseOffset+uint64(cy)*srcRowBytes, buf); err != nil {
+					return err
+				}
+				for cx := x0; cx < x1; cx++ {
+					if cx&1023 == 0 {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+					}
+					val, err := jxrUnpackUncompressedSample(buf[cx*step:], layout.sampleBytes, layout.tenBit)
+					if err != nil {
+						return err
+					}
+					px, py := jxrRasterPosition(cx, cy, cw, ch, transform)
+					target.planes[ci].storeBits((py-dy0)*dstStride+(px-dx0), val)
+				}
+			}
+		}
+		return ctx.Err()
+	}
+	totalComp := layout.channels
+	if layout.hasAlpha {
+		totalComp++
+	}
+	var samples [9]uint32
+	dstStride := region.Dx()
+	for cy := codedRect.Min.Y; cy < codedRect.Max.Y; cy++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := jxrReadUncompressedSpan(c.image, c.imageInput, ctx, uint64(cy)*layout.rowBytes, rowBuf); err != nil {
+			return err
+		}
+		if layout.separateAlpha {
+			if err := jxrReadUncompressedSpan(c.alpha, c.alphaInput, ctx, uint64(cy)*layout.alphaRowBytes, alphaBuf); err != nil {
+				return err
+			}
+		}
+		for cx := codedRect.Min.X; cx < codedRect.Max.X; cx++ {
+			if cx&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			if err := jxrUnpackUncompressedPixel(layout, rowBuf, alphaBuf, cx, samples[:totalComp]); err != nil {
+				return err
+			}
+			px, py := jxrRasterPosition(cx, cy, codedW, codedH, transform)
+			at := (py-region.Min.Y)*dstStride + (px - region.Min.X)
+			for ci := range totalComp {
+				target.planes[ci].storeBits(at, samples[ci])
+			}
+		}
+	}
+	return ctx.Err()
 }

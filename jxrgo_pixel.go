@@ -16,6 +16,7 @@ package jxrgo
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"math"
@@ -42,6 +43,31 @@ type ResampleFilter uint8
 type ResampleOptions struct {
 	Filter ResampleFilter
 	Limits Limits
+}
+
+// jxrUncompressedLayout 描述容器无压缩模式的原始字节布局与单行容量
+type jxrUncompressedLayout struct {
+	width         uint64
+	height        uint64
+	channels      int
+	hasAlpha      bool
+	separateAlpha bool
+	planar        bool
+	bitPacked     bool
+	bgrOrder      bool
+	rgbe          bool
+	packedBits    uint8
+	tenBit        bool
+	sampleBytes   uint64
+	slots         int
+	rowBytes      uint64
+	uvHeight      uint64
+	uvRowBytes    uint64
+	ySize         uint64
+	uvSize        uint64
+	alphaRowBytes uint64
+	mainBytes     uint64
+	alphaBytes    uint64
 }
 
 // jxrIntegerOutputComponents 执行整数样本的颜色转换、偏置、缩放及范围裁剪，输入已完成采样转换
@@ -404,8 +430,8 @@ func jxrFloatOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha b
 // 入参: value 输出缩放后的整数值, depth 浮点位深, mantissa 有效尾数位数, bias 码流指数偏置
 // 返回: uint32 浮点位模式, error 参数或数值范围错误
 func jxrFloatBits(value int64, depth, mantissa uint8, bias int8) (uint32, error) {
-	if err := checkJXRWords([]int64{value}, true); err != nil {
-		return 0, err
+	if value < -1<<31 || value > 1<<31-1 {
+		return 0, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 	}
 	sign := uint32(0)
 	if value < 0 {
@@ -417,8 +443,8 @@ func jxrFloatBits(value int64, depth, mantissa uint8, bias int8) (uint32, error)
 	if depth != 7 || mantissa > 23 {
 		return 0, fmt.Errorf("%w: JPEG XR floating-point mantissa", ErrUnsupported)
 	}
-	if err := checkJXRWords([]int64{value}, true); err != nil {
-		return 0, err
+	if value > 1<<31-1 {
+		return 0, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 	}
 	unit := int64(1) << mantissa
 	exponent, fraction := value>>mantissa, value&(unit-1)|unit
@@ -999,7 +1025,7 @@ func (r *Raster) Resample(ctx context.Context, size image.Point, opts *ResampleO
 
 // resample 执行原生分量的几何重采样，由公开入口统一归一化错误
 // 入参: ctx 已规范化Context, size 输出可见尺寸, opts 滤波及输出限制
-// 返回: *Raster 独立完整采样原生图像, error 参数、相位、能力、数值、资源或取消错误
+// 返回: *Raster 独立完整采样原生图像, error 参数、能力、数值、资源或取消错误
 func (r *Raster) resample(ctx context.Context, size image.Point, opts *ResampleOptions) (*Raster, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1348,4 +1374,351 @@ func makeJXRPixelFormats() [0x57]jxrPixelFormat {
 		table[id] = f
 	}
 	return table
+}
+
+// jxrMakeUncompressedLayout 根据像素格式GUID末字节、尺寸与独立透明度标志计算无压缩容器字节布局
+// 入参: id 标准GUID末字节, format 已解析像素格式, width 编码宽度, height 编码高度, separateAlpha 是否独立存储透明度
+// 返回: jxrUncompressedLayout 无压缩字节布局, error 格式、尺寸对齐或容量溢出错误
+func jxrMakeUncompressedLayout(id byte, format jxrPixelFormat, width, height uint64, separateAlpha bool) (jxrUncompressedLayout, error) {
+	l := jxrUncompressedLayout{width: width, height: height, channels: format.channels, hasAlpha: format.alpha, separateAlpha: separateAlpha}
+	var uvWidth uint64
+	var padChannel bool
+	switch format.color {
+	case 1:
+		if width%2 != 0 || height%2 != 0 {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed YCC420 dimensions", ErrInvalid)
+		}
+		l.planar, uvWidth, l.uvHeight = true, width/2, height/2
+	case 2:
+		if width%2 != 0 {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed YCC422 dimensions", ErrInvalid)
+		}
+		l.planar, uvWidth, l.uvHeight = true, width/2, height
+	}
+	switch id {
+	case 0x05:
+		l.bitPacked = true
+		l.rowBytes = (width + 7) / 8
+	case 0x09:
+		l.packedBits = 15
+		if width > math.MaxUint32/2 {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed row bytes", ErrLimit)
+		}
+		l.rowBytes = width * 2
+	case 0x0a:
+		l.packedBits = 16
+		if width > math.MaxUint32/2 {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed row bytes", ErrLimit)
+		}
+		l.rowBytes = width * 2
+	case 0x14:
+		l.packedBits = 30
+		if width > math.MaxUint32/4 {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed row bytes", ErrLimit)
+		}
+		l.rowBytes = width * 4
+	case 0x3d:
+		l.rgbe = true
+		if width > math.MaxUint32/4 {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed row bytes", ErrLimit)
+		}
+		l.rowBytes = width * 4
+	default:
+		switch format.depth {
+		case 1:
+			l.sampleBytes = 1
+		case 2, 3, 4:
+			l.sampleBytes = 2
+		case 9:
+			l.sampleBytes, l.tenBit = 2, true
+		case 6, 7:
+			l.sampleBytes = 4
+		default:
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed pixel depth", ErrUnsupported)
+		}
+		switch id {
+		case 0x0c, 0x0f, 0x10:
+			l.bgrOrder = true
+		case 0x0e:
+			l.bgrOrder, padChannel = true, true
+		case 0x1b, 0x40, 0x41, 0x42:
+			padChannel = true
+		}
+	}
+	if l.planar {
+		if width > math.MaxUint32/l.sampleBytes {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed planar row", ErrLimit)
+		}
+		l.rowBytes = width * l.sampleBytes
+		l.uvRowBytes = uvWidth * l.sampleBytes
+		if height > math.MaxUint32/l.rowBytes || l.uvHeight > math.MaxUint32/l.uvRowBytes {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed planar size", ErrLimit)
+		}
+		l.ySize = l.rowBytes * height
+		l.uvSize = l.uvRowBytes * l.uvHeight
+		if l.uvSize > math.MaxUint32/2 || l.ySize > math.MaxUint32-l.uvSize*2 {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed planar total", ErrLimit)
+		}
+		l.mainBytes = l.ySize + l.uvSize*2
+		if l.hasAlpha {
+			if l.separateAlpha {
+				l.alphaRowBytes, l.alphaBytes = l.rowBytes, l.ySize
+			} else {
+				if l.ySize > math.MaxUint32-l.mainBytes {
+					return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed planar alpha total", ErrLimit)
+				}
+				l.mainBytes += l.ySize
+			}
+		}
+		return l, nil
+	}
+	if l.bitPacked || l.packedBits != 0 || l.rgbe {
+		if height > math.MaxUint32/l.rowBytes {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed image bytes", ErrLimit)
+		}
+		l.mainBytes = l.rowBytes * height
+		return l, nil
+	}
+	l.slots = l.channels
+	if padChannel || l.hasAlpha && !l.separateAlpha {
+		l.slots++
+	}
+	pixelBytes := uint64(l.slots) * l.sampleBytes
+	if width > math.MaxUint32/pixelBytes {
+		return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed row bytes", ErrLimit)
+	}
+	l.rowBytes = width * pixelBytes
+	if height > math.MaxUint32/l.rowBytes {
+		return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed image bytes", ErrLimit)
+	}
+	l.mainBytes = l.rowBytes * height
+	if l.hasAlpha && l.separateAlpha {
+		if width > math.MaxUint32/l.sampleBytes {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed alpha row", ErrLimit)
+		}
+		l.alphaRowBytes = width * l.sampleBytes
+		if height > math.MaxUint32/l.alphaRowBytes {
+			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed alpha bytes", ErrLimit)
+		}
+		l.alphaBytes = l.alphaRowBytes * height
+	}
+	return l, nil
+}
+
+// rowBufferWork 返回无压缩逐行解码所需行缓冲总字节数
+// 返回: uint64 主行缓冲及可选独立透明度行缓冲字节总和
+func (l *jxrUncompressedLayout) rowBufferWork() uint64 {
+	work := l.rowBytes
+	if !l.planar && l.separateAlpha {
+		work += l.alphaRowBytes
+	}
+	return work
+}
+
+// planeSpec 返回平面无压缩布局中指定分量的子采样步长、字节起点、行宽及独立透明度标志
+// 入参: ci 分量序号
+// 返回: int 水平步长, int 垂直步长, uint64 平面起始偏移, uint64 平面行字节数, bool 是否位于独立透明度流
+func (l *jxrUncompressedLayout) planeSpec(ci int) (int, int, uint64, uint64, bool) {
+	switch ci {
+	case 0:
+		return 1, 1, 0, l.rowBytes, false
+	case 1:
+		sy := 1
+		if l.uvHeight != l.height {
+			sy = 2
+		}
+		return 2, sy, l.ySize, l.uvRowBytes, false
+	case 2:
+		sy := 1
+		if l.uvHeight != l.height {
+			sy = 2
+		}
+		return 2, sy, l.ySize + l.uvSize, l.uvRowBytes, false
+	default:
+		if l.separateAlpha {
+			return 1, 1, 0, l.alphaRowBytes, true
+		}
+		return 1, 1, l.ySize + l.uvSize*2, l.rowBytes, false
+	}
+}
+
+// jxrReadUncompressedSpan 从内存切片或随机输入视图读取指定偏移与长度的无压缩字节片段
+// 入参: data 可选内存切片, input 可选随机视图, ctx Context, offset 视图内字节偏移, dst 目标缓冲区
+// 返回: error 范围、读取或取消错误
+func jxrReadUncompressedSpan(data []byte, input *jxrReaderAt, ctx context.Context, offset uint64, dst []byte) error {
+	if input != nil {
+		input.ctx = ctx
+		return input.copy(offset, dst)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if offset > uint64(len(data)) || uint64(len(dst)) > uint64(len(data))-offset {
+		return fmt.Errorf("%w: JPEG XR uncompressed byte range", ErrInvalid)
+	}
+	copy(dst, data[offset:offset+uint64(len(dst))])
+	return nil
+}
+
+// jxrUnpackUncompressedSample 按字节宽度和十位约束从缓冲读取单个无压缩样本位模式
+// 入参: src 至少含sampleBytes字节的源切片, sampleBytes 样本字节宽度, tenBit 是否约束在十位无符号范围内
+// 返回: uint32 原生样本位模式, error 越界或格式错误
+func jxrUnpackUncompressedSample(src []byte, sampleBytes uint64, tenBit bool) (uint32, error) {
+	switch sampleBytes {
+	case 1:
+		return uint32(src[0]), nil
+	case 2:
+		v := uint32(binary.LittleEndian.Uint16(src))
+		if tenBit && v > 1023 {
+			return 0, fmt.Errorf("%w: JPEG XR uncompressed 10-bit sample range", ErrInvalid)
+		}
+		return v, nil
+	case 4:
+		return binary.LittleEndian.Uint32(src), nil
+	default:
+		return 0, fmt.Errorf("%w: JPEG XR uncompressed sample width", ErrUnsupported)
+	}
+}
+
+// jxrPackUncompressedSample 按字节宽度和十位约束将原生样本位模式写入无压缩字节缓冲
+// 入参: dst 至少含sampleBytes字节的目标切片, value 原生样本位模式, sampleBytes 样本字节宽度, tenBit 是否约束在十位无符号范围内
+// 返回: error 样本范围或格式错误
+func jxrPackUncompressedSample(dst []byte, value uint32, sampleBytes uint64, tenBit bool) error {
+	switch sampleBytes {
+	case 1:
+		if value > 255 {
+			return fmt.Errorf("%w: JPEG XR uncompressed 8-bit sample range", ErrInvalid)
+		}
+		dst[0] = byte(value)
+		return nil
+	case 2:
+		if tenBit && value > 1023 || value > 65535 {
+			return fmt.Errorf("%w: JPEG XR uncompressed 16-bit sample range", ErrInvalid)
+		}
+		binary.LittleEndian.PutUint16(dst, uint16(value))
+		return nil
+	case 4:
+		binary.LittleEndian.PutUint32(dst, value)
+		return nil
+	default:
+		return fmt.Errorf("%w: JPEG XR uncompressed sample width", ErrUnsupported)
+	}
+}
+
+// jxrUnpackUncompressedPixel 从非平面无压缩行缓冲解包单个像素的全部颜色及可选透明度样本
+// 入参: l 无压缩字节布局, rowBuf 主行缓冲, alphaBuf 独立透明度行缓冲，无独立透明度时可为nil, x 编码列坐标, out 输出样本缓冲
+// 返回: error 样本范围或格式错误
+func jxrUnpackUncompressedPixel(l *jxrUncompressedLayout, rowBuf, alphaBuf []byte, x int, out []uint32) error {
+	if l.bitPacked {
+		out[0] = uint32((rowBuf[x>>3] >> uint(7-(x&7))) & 1)
+		return nil
+	}
+	switch l.packedBits {
+	case 15:
+		v := uint32(binary.LittleEndian.Uint16(rowBuf[x*2:]))
+		out[0], out[1], out[2] = (v>>10)&31, (v>>5)&31, v&31
+		return nil
+	case 16:
+		v := uint32(binary.LittleEndian.Uint16(rowBuf[x*2:]))
+		out[0], out[1], out[2] = (v>>11)&31, (v>>5)&63, v&31
+		return nil
+	case 30:
+		v := binary.LittleEndian.Uint32(rowBuf[x*4:])
+		out[0], out[1], out[2] = (v>>20)&1023, (v>>10)&1023, v&1023
+		return nil
+	}
+	if l.rgbe {
+		p := rowBuf[x*4 : x*4+4]
+		e := uint32(p[3]) << 8
+		out[0], out[1], out[2] = uint32(p[0])|e, uint32(p[1])|e, uint32(p[2])|e
+		return nil
+	}
+	step := int(l.sampleBytes)
+	base := x * l.slots * step
+	for i := range l.channels {
+		v, err := jxrUnpackUncompressedSample(rowBuf[base+i*step:], l.sampleBytes, l.tenBit)
+		if err != nil {
+			return err
+		}
+		out[i] = v
+	}
+	if l.bgrOrder {
+		out[0], out[2] = out[2], out[0]
+	}
+	if l.hasAlpha {
+		var a uint32
+		var err error
+		if l.separateAlpha {
+			a, err = jxrUnpackUncompressedSample(alphaBuf[x*step:], l.sampleBytes, l.tenBit)
+		} else {
+			a, err = jxrUnpackUncompressedSample(rowBuf[base+l.channels*step:], l.sampleBytes, l.tenBit)
+		}
+		if err != nil {
+			return err
+		}
+		out[l.channels] = a
+	}
+	return nil
+}
+
+// jxrPackUncompressedPixel 将单个像素的原生样本打包写入非平面无压缩行缓冲及可选独立透明度行缓冲
+// 入参: l 无压缩字节布局, rowBuf 主行缓冲, alphaBuf 独立透明度行缓冲, x 编码列坐标, samples 像素原生分量值
+// 返回: error 样本值越界或共享指数不一致错误
+func jxrPackUncompressedPixel(l *jxrUncompressedLayout, rowBuf, alphaBuf []byte, x int, samples []uint32) error {
+	if l.bitPacked {
+		if samples[0] > 1 {
+			return fmt.Errorf("%w: JPEG XR uncompressed 1-bit sample range", ErrInvalid)
+		}
+		if samples[0] != 0 {
+			rowBuf[x>>3] |= 1 << uint(7-(x&7))
+		}
+		return nil
+	}
+	switch l.packedBits {
+	case 15:
+		if samples[0] > 31 || samples[1] > 31 || samples[2] > 31 {
+			return fmt.Errorf("%w: JPEG XR uncompressed BGR555 sample range", ErrInvalid)
+		}
+		binary.LittleEndian.PutUint16(rowBuf[x*2:], uint16(samples[2]|samples[1]<<5|samples[0]<<10))
+		return nil
+	case 16:
+		if samples[0] > 31 || samples[1] > 63 || samples[2] > 31 {
+			return fmt.Errorf("%w: JPEG XR uncompressed BGR565 sample range", ErrInvalid)
+		}
+		binary.LittleEndian.PutUint16(rowBuf[x*2:], uint16(samples[2]|samples[1]<<5|samples[0]<<11))
+		return nil
+	case 30:
+		if samples[0] > 1023 || samples[1] > 1023 || samples[2] > 1023 {
+			return fmt.Errorf("%w: JPEG XR uncompressed BGR101010 sample range", ErrInvalid)
+		}
+		binary.LittleEndian.PutUint32(rowBuf[x*4:], samples[2]|samples[1]<<10|samples[0]<<20)
+		return nil
+	}
+	if l.rgbe {
+		e := samples[0] >> 8
+		if samples[0] > 65535 || samples[1] > 65535 || samples[2] > 65535 || samples[1]>>8 != e || samples[2]>>8 != e {
+			return fmt.Errorf("%w: JPEG XR uncompressed RGBE shared exponent", ErrInvalid)
+		}
+		p := rowBuf[x*4 : x*4+4]
+		p[0], p[1], p[2], p[3] = byte(samples[0]), byte(samples[1]), byte(samples[2]), byte(e)
+		return nil
+	}
+	step := int(l.sampleBytes)
+	base := x * l.slots * step
+	for i := range l.channels {
+		srcIndex := i
+		if l.bgrOrder && (i == 0 || i == 2) {
+			srcIndex = 2 - i
+		}
+		if err := jxrPackUncompressedSample(rowBuf[base+i*step:], samples[srcIndex], l.sampleBytes, l.tenBit); err != nil {
+			return err
+		}
+	}
+	if l.hasAlpha {
+		if l.separateAlpha {
+			return jxrPackUncompressedSample(alphaBuf[x*step:], samples[l.channels], l.sampleBytes, l.tenBit)
+		}
+		return jxrPackUncompressedSample(rowBuf[base+l.channels*step:], samples[l.channels], l.sampleBytes, l.tenBit)
+	}
+	return nil
 }

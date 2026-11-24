@@ -944,29 +944,16 @@ func makeJXRFilePrefixParts(ctx context.Context, info Info, source, alpha *jxrSt
 	if err != nil {
 		return nil, jxrContainerOffsets{}, err
 	}
-	c := jxrContainer{width: source.header.width, height: source.header.height, transform: uint32(source.header.transform), format: format, pixelFormat: identifier, imageBands: uint32(source.primary.bands), profiles: source.profiles, dpi: info.Resolution, colorHint: info.ColorHint, encoding: info.ColorEncoding, imageType: info.ImageType}
-	if source.header.transform&4 != 0 {
-		c.dpi.X, c.dpi.Y = c.dpi.Y, c.dpi.X
-	}
-	if len(info.ICCProfile) != 0 {
-		c.profile = info.ICCProfile
-	}
-	if len(info.EXIF) != 0 {
-		c.exif = info.EXIF
-	}
-	if len(info.XMP) != 0 {
-		c.xmp = info.XMP
-	}
-	if len(info.IPTC) != 0 {
-		c.iptc = info.IPTC
-	}
+	c := jxrContainer{width: source.header.width, height: source.header.height, transform: uint32(source.header.transform), format: format, pixelFormat: identifier, imageBands: uint32(source.primary.bands), profiles: source.profiles}
+	c.setInfoMetadata(info)
 	if alpha != nil {
 		if !info.Alpha || source.header.alpha || !alpha.header.alpha || alpha.alpha == nil || source.header.width != alpha.header.width || source.header.height != alpha.header.height || source.header.depth != alpha.header.depth || alpha.primary.channels != 1 {
 			return nil, jxrContainerOffsets{}, fmt.Errorf("%w: incremental separate alpha stream layout", ErrInvalid)
 		}
 		c.alphaBands = uint32(alpha.alpha.bands)
 	}
-	if err := checkJXRContainerMetadataLayout(&c, maxPixels, alpha != nil); err != nil {
+	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(&c, maxPixels, alpha != nil)
+	if err != nil {
 		return nil, jxrContainerOffsets{}, err
 	}
 	channels := format.channels
@@ -981,7 +968,7 @@ func makeJXRFilePrefixParts(ctx context.Context, info Info, source, alpha *jxrSt
 		return nil, jxrContainerOffsets{}, b.err
 	}
 	var offsets jxrContainerOffsets
-	writeJXRContainerBytes(&b, &c, true, alpha != nil, &offsets)
+	writeJXRContainerBytes(&b, &c, true, alpha != nil, &offsets, exifNode, gpsNode)
 	if b.err != nil {
 		return nil, jxrContainerOffsets{}, b.err
 	}

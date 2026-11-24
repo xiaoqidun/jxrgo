@@ -76,6 +76,9 @@ func (d *Decoder) decodeRegionLocked(ctx context.Context, region image.Rectangle
 	if len(d.data) == 0 {
 		return nil, fmt.Errorf("%w: uninitialized decoder", ErrInvalid)
 	}
+	if d.source.container.uncompressed {
+		return d.decodeUncompressedLocked(ctx, region, 0)
+	}
 	info, outputWork, err := jxrRegionInfo(d.info, region)
 	if err != nil {
 		return nil, err
@@ -166,7 +169,7 @@ func jxrRegionInfo(original Info, region image.Rectangle) (Info, uint64, error) 
 	if region.Empty() || !region.In(original.Bounds) || len(original.Components) == 0 {
 		return Info{}, 0, fmt.Errorf("%w: JPEG XR region bounds", ErrInvalid)
 	}
-	work := uint64(512) + uint64(len(original.Components))*256 + uint64(len(original.ICCProfile))
+	work := uint64(512) + uint64(len(original.Components))*256 + uint64(len(original.ICCProfile)) + uint64(len(original.EXIF)) + uint64(len(original.GPS)) + uint64(len(original.XMP)) + uint64(len(original.IPTC)) + jxrDescriptionWork(original.Description)
 	if original.ColorEncoding != nil {
 		work += 4
 	}

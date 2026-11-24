@@ -39,8 +39,10 @@ type jxrNativeOutput struct {
 	format      Format
 	pixelFormat [16]byte
 	exif        []byte
+	gps         []byte
 	xmp         []byte
 	iptc        []byte
+	description *ImageDescription
 	stream      jxrStreamOutput
 }
 
@@ -608,7 +610,33 @@ func copyStandardPaletted(ctx context.Context, pix []byte, stride, offset0, widt
 	return ctx.Err()
 }
 
-// jxrWithContainerMetadata 合并编码选项覆盖的EXIF、XMP及IPTC容器元数据，不修改原Info
+// jxrContainerMetadataRetained 累加编码选项覆盖容器元数据及描述标签引入的常驻内存增量
+// 入参: retained 当前已计入的常驻内存, limit 总内存上限, base 原始图像信息, opts 编码选项
+// 返回: uint64 累加后的常驻内存, uint64 超限时的需求总量, bool 是否处于上限内
+func jxrContainerMetadataRetained(retained, limit uint64, base Info, opts *EncodeOptions) (uint64, uint64, bool) {
+	for _, pair := range [4][2][]byte{{opts.EXIF, base.EXIF}, {opts.GPS, base.GPS}, {opts.XMP, base.XMP}, {opts.IPTC, base.IPTC}} {
+		if len(pair[0]) != 0 && uint64(cap(pair[0])) > uint64(cap(pair[1])) {
+			delta := uint64(cap(pair[0])) - uint64(cap(pair[1]))
+			if retained > limit || delta > limit-retained {
+				return retained, jxrSaturatedAdd(retained, delta), false
+			}
+			retained += delta
+		}
+	}
+	if !jxrDescriptionEmpty(opts.Description) {
+		nextWork, prevWork := jxrDescriptionWork(opts.Description), jxrDescriptionWork(base.Description)
+		if nextWork > prevWork {
+			delta := nextWork - prevWork
+			if retained > limit || delta > limit-retained {
+				return retained, jxrSaturatedAdd(retained, delta), false
+			}
+			retained += delta
+		}
+	}
+	return retained, retained, true
+}
+
+// jxrWithContainerMetadata 合并编码选项覆盖的EXIF、GPS、XMP、IPTC及描述标签，不修改原Info
 // 入参: info 原生图像元数据, opts 可选编码选项
 // 返回: Info 合并后的图像元数据
 func jxrWithContainerMetadata(info Info, opts *EncodeOptions) Info {
@@ -618,11 +646,17 @@ func jxrWithContainerMetadata(info Info, opts *EncodeOptions) Info {
 	if len(opts.EXIF) != 0 {
 		info.EXIF = opts.EXIF
 	}
+	if len(opts.GPS) != 0 {
+		info.GPS = opts.GPS
+	}
 	if len(opts.XMP) != 0 {
 		info.XMP = opts.XMP
 	}
 	if len(opts.IPTC) != 0 {
 		info.IPTC = opts.IPTC
+	}
+	if !jxrDescriptionEmpty(opts.Description) {
+		info.Description = opts.Description
 	}
 	return info
 }
@@ -706,8 +740,20 @@ func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixe
 	h.color, h.depth, h.alpha, h.premultiply = f.color, f.depth, f.alpha, f.premultiply
 	h.longWord = h.longWord || f.color == 8 || f.depth != 0 && f.depth != 1 && f.depth != 15
 	h.planeStart = 0
-	if h.top == 0 && h.left == 0 && h.bottom == 0 && h.right == 0 {
+	internalColor := s.primary.color
+	if s.primary.channels == 0 {
+		internalColor = f.color
+		if f.color == 7 || f.color == 8 {
+			internalColor = 3
+		} else if f.color == 5 {
+			internalColor = 4
+		}
+	}
+	if !h.explicitWindow && h.top == 0 && h.left == 0 && h.bottom == 0 && h.right == 0 {
 		h.right, h.bottom = uint32((16-h.width%16)%16), uint32((16-h.height%16)%16)
+		if (internalColor == 1 || internalColor == 2) && h.overlap == 2 && h.width+uint64(h.left)+uint64(h.right) < 32 {
+			h.right += 16
+		}
 	}
 	if h.columns == nil {
 		extent := (h.width + uint64(h.left) + uint64(h.right)) / 16
@@ -737,12 +783,7 @@ func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixe
 		return jxrStream{}, err
 	}
 	if s.primary.channels == 0 {
-		s.primary.color, s.primary.channels = f.color, f.channels
-		if f.color == 7 || f.color == 8 {
-			s.primary.color = 3
-		} else if f.color == 5 {
-			s.primary.color = 4
-		}
+		s.primary.color, s.primary.channels = internalColor, f.channels
 	}
 	if s.alpha != nil {
 		alpha := *s.alpha
@@ -787,9 +828,9 @@ func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixe
 	}
 	if f.color == 1 || f.color == 2 {
 		component := info.Components[1]
-		s.primary.chromaX, s.primary.chromaY = 7, 0
+		derivedX, derivedY := uint8(7), uint8(0)
 		if f.color == 1 {
-			s.primary.chromaY = 7
+			derivedY = 7
 		}
 		x, y := component.XOffset, component.YOffset
 		knownX, knownY := component.XPositionKnown, component.YPositionKnown
@@ -806,10 +847,16 @@ func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixe
 			}
 		}
 		if knownX {
-			s.primary.chromaX = uint8(x * 4)
+			derivedX = uint8(x * 4)
 		}
 		if f.color == 1 && knownY {
-			s.primary.chromaY = uint8(y * 4)
+			derivedY = uint8(y * 4)
+		}
+		if !s.primary.explicitChromaX {
+			s.primary.chromaX = derivedX
+		}
+		if !s.primary.explicitChromaY {
+			s.primary.chromaY = derivedY
 		}
 	}
 	if err := checkJXRPlaneHeader(h, &s.primary, false); err != nil {
@@ -901,16 +948,12 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 	output := jxrNativeOutput{format: o.Format, stream: jxrStreamOutput{exact: !o.Lossy, workers: normalizeJXRWorkers(o.Workers), maxPixels: limits.MaxPixels, maxBytes: o.MaxOutputBytes, maxMemory: limits.MaxMemoryBytes}}
 	if o.Format == FormatJXR {
 		merged := jxrWithContainerMetadata(raster.info, &o)
-		output.exif, output.xmp, output.iptc = merged.EXIF, merged.XMP, merged.IPTC
-		for _, pair := range [3][2][]byte{{o.EXIF, raster.info.EXIF}, {o.XMP, raster.info.XMP}, {o.IPTC, raster.info.IPTC}} {
-			if len(pair[0]) != 0 && uint64(cap(pair[0])) > uint64(cap(pair[1])) {
-				delta := uint64(cap(pair[0])) - uint64(cap(pair[1]))
-				if retained > limits.MaxMemoryBytes || delta > limits.MaxMemoryBytes-retained {
-					return jxrStream{}, output, errJXREncodingPlanMemory
-				}
-				retained += delta
-			}
+		output.exif, output.gps, output.xmp, output.iptc, output.description = merged.EXIF, merged.GPS, merged.XMP, merged.IPTC, merged.Description
+		nextRetained, _, ok := jxrContainerMetadataRetained(retained, limits.MaxMemoryBytes, raster.info, &o)
+		if !ok {
+			return jxrStream{}, output, errJXREncodingPlanMemory
 		}
+		retained = nextRetained
 	}
 	if output.stream.maxBytes == 0 {
 		output.stream.maxBytes = 64 << 20
@@ -923,6 +966,10 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 		return jxrStream{}, output, errJXREncodingPlanMemory
 	}
 	layout := jxrStream{header: jxrHeader{frequency: o.Layout == LayoutFrequency, overlap: uint8(o.Overlap), transform: uint8(o.Orientation), hardTiles: o.HardTiles, trim: o.Trim != 0}}
+	if o.Window != nil {
+		layout.header.explicitWindow = true
+		layout.header.top, layout.header.left, layout.header.bottom, layout.header.right = uint32(o.Window.Top), uint32(o.Window.Left), uint32(o.Window.Bottom), uint32(o.Window.Right)
+	}
 	if len(o.Profiles) != 0 {
 		layout.profiles = make([]jxrProfileLevel, len(o.Profiles))
 		for index, item := range o.Profiles {
@@ -945,9 +992,26 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 		p.channels, p.chromaX = 3, 2
 		if o.Subsampling == Subsampling422 {
 			p.color, p.chromaY = 2, 0
+			if o.ChromaCenteringY != nil {
+				return layout, output, fmt.Errorf("%w: encode YCC422 does not allow chroma centering Y", ErrInvalid)
+			}
 		} else {
 			p.color, p.chromaY = 1, 2
 		}
+	} else if o.ChromaCenteringX != nil || o.ChromaCenteringY != nil {
+		f, err := rasterPixelFormat(raster.info)
+		if err != nil {
+			return layout, output, err
+		}
+		if f.color != 1 && f.color != 2 || f.color == 2 && o.ChromaCenteringY != nil {
+			return layout, output, fmt.Errorf("%w: encode chroma centering requires YCC420 or YCC422", ErrInvalid)
+		}
+	}
+	if o.ChromaCenteringX != nil {
+		p.chromaX, p.explicitChromaX = *o.ChromaCenteringX, true
+	}
+	if o.ChromaCenteringY != nil {
+		p.chromaY, p.explicitChromaY = *o.ChromaCenteringY, true
 	}
 	p.legacyHighpassPrediction = o.LegacyHighpassPrediction
 	layout.primary = p
@@ -1016,6 +1080,20 @@ func checkJXREncodeOptions(o EncodeOptions) error {
 	}
 	if o.Format > FormatCodestream || o.Band > BandDC || o.Layout > LayoutFrequency || o.Overlap > OverlapTwo || o.Orientation > OrientationRotate90FlipXY || o.Subsampling > Subsampling420 || o.Subsampling != SubsamplingNone && !o.Lossy || o.Trim > 15 || o.Alpha != nil && o.Alpha.Band > BandDC {
 		return fmt.Errorf("%w: encode options", ErrInvalid)
+	}
+	if o.Uncompressed {
+		if o.Format == FormatCodestream || o.Layout != LayoutSpatial || o.Overlap != OverlapNone || o.Subsampling != SubsamplingNone || o.TileSize != (image.Point{}) || o.HardTiles || o.Lossy || o.LegacyHighpassPrediction || o.Band != BandAll || o.Trim != 0 || o.Scaled || o.Shift != 0 || o.Float != nil || o.Quantization != nil || o.Alpha != nil || o.MirrorSeparateAlpha || len(o.Profiles) != 0 || o.Window != nil || o.ChromaCenteringX != nil || o.ChromaCenteringY != nil {
+			return fmt.Errorf("%w: uncompressed mode conflicts with compression options", ErrInvalid)
+		}
+	}
+	if o.Window != nil && (o.Window.Top > 63 || o.Window.Left > 63 || o.Window.Bottom > 63 || o.Window.Right > 63) {
+		return fmt.Errorf("%w: encode window margins", ErrInvalid)
+	}
+	if o.ChromaCenteringX != nil && (*o.ChromaCenteringX > 4 && *o.ChromaCenteringX != 7) {
+		return fmt.Errorf("%w: encode chroma centering X", ErrInvalid)
+	}
+	if o.ChromaCenteringY != nil && (*o.ChromaCenteringY > 4 && *o.ChromaCenteringY != 7) {
+		return fmt.Errorf("%w: encode chroma centering Y", ErrInvalid)
 	}
 	if len(o.Profiles) != 0 {
 		if len(o.Profiles) > 4096 {
@@ -1556,7 +1634,25 @@ func checkJXRQuantizationGeometry(ctx context.Context, info Info, options Encode
 	if jxrInputTransform(info, format.color, uint8(options.Orientation))&4 != 0 {
 		width, height = height, width
 	}
-	width, height = (width+15)/16, (height+15)/16
+	if options.Window != nil {
+		width += uint64(options.Window.Left) + uint64(options.Window.Right)
+		height += uint64(options.Window.Top) + uint64(options.Window.Bottom)
+		if width%16 != 0 || height%16 != 0 {
+			return fmt.Errorf("%w: adaptive window macroblock alignment", ErrInvalid)
+		}
+		width, height = width/16, height/16
+	} else {
+		width, height = (width+15)/16, (height+15)/16
+		internalColor := format.color
+		if options.Subsampling == Subsampling420 {
+			internalColor = 1
+		} else if options.Subsampling == Subsampling422 {
+			internalColor = 2
+		}
+		if (internalColor == 1 || internalColor == 2) && options.Overlap == OverlapTwo && width < 2 {
+			width = 2
+		}
+	}
 	sx, sy := uint64(options.TileSize.X/16), uint64(options.TileSize.Y/16)
 	if sx == 0 || sy == 0 {
 		return fmt.Errorf("%w: adaptive tile macroblock geometry", ErrInvalid)
@@ -1659,22 +1755,10 @@ func encodeJXRNative(ctx context.Context, raster *Raster, layout jxrStream, opti
 	if options.format == FormatCodestream {
 		return data, nil
 	}
-	c := jxrContainer{width: s.header.width, height: s.header.height, transform: uint32(s.header.transform), format: pixelFormat, pixelFormat: identifier, image: data, imageBands: uint32(s.primary.bands), profiles: s.profiles, dpi: raster.info.Resolution, colorHint: raster.info.ColorHint, encoding: raster.info.ColorEncoding, imageType: raster.info.ImageType}
-	if s.header.transform&4 != 0 {
-		c.dpi.X, c.dpi.Y = c.dpi.Y, c.dpi.X
-	}
-	if len(raster.info.ICCProfile) != 0 {
-		c.profile = raster.info.ICCProfile
-	}
-	if len(options.exif) != 0 {
-		c.exif = options.exif
-	}
-	if len(options.xmp) != 0 {
-		c.xmp = options.xmp
-	}
-	if len(options.iptc) != 0 {
-		c.iptc = options.iptc
-	}
+	meta := raster.info
+	meta.EXIF, meta.GPS, meta.XMP, meta.IPTC, meta.Description = options.exif, options.gps, options.xmp, options.iptc, options.description
+	c := jxrContainer{width: s.header.width, height: s.header.height, transform: uint32(s.header.transform), format: pixelFormat, pixelFormat: identifier, image: data, imageBands: uint32(s.primary.bands), profiles: s.profiles}
+	c.setInfoMetadata(meta)
 	w := newJXRBitWriter(ctx, options.stream.maxBytes, budget.limit)
 	w.budget = &budget
 	writeJXRContainer(&w, &c, options.stream.maxPixels)
@@ -1702,6 +1786,7 @@ func forwardJXRNativeWindowStorage(ctx context.Context, raster *Raster, s *jxrSt
 	if s == nil || options == nil || planes == nil || s.alpha == nil && planes[1] != nil {
 		return jxrCoefficientImage{}, fmt.Errorf("%w: JPEG XR forward storage layout", ErrInvalid)
 	}
+	raster = jxrSyncRasterChroma(raster, s)
 	if options.tiles == nil {
 		q := [2]jxrTileQuant{newJXRTileQuant(&s.primary)}
 		if s.alpha != nil {
@@ -1819,7 +1904,7 @@ func jxrRasterWork(raster *Raster, maximum uint64) (uint64, error) {
 	if raster.info.ColorEncoding != nil {
 		work += 4
 	}
-	for _, size := range []uint64{uint64(cap(raster.info.Components)) * 128, uint64(cap(raster.planes)) * 128, uint64(cap(raster.info.ICCProfile)), uint64(cap(raster.info.EXIF)), uint64(cap(raster.info.XMP)), uint64(cap(raster.info.IPTC))} {
+	for _, size := range []uint64{uint64(cap(raster.info.Components)) * 128, uint64(cap(raster.planes)) * 128, uint64(cap(raster.info.ICCProfile)), uint64(cap(raster.info.EXIF)), uint64(cap(raster.info.GPS)), uint64(cap(raster.info.XMP)), uint64(cap(raster.info.IPTC)), jxrDescriptionWork(raster.info.Description)} {
 		if work > maximum || size > maximum-work {
 			return 0, &LimitError{Resource: "JPEG XR retained raster metadata", Limit: maximum, Required: jxrSaturatedAdd(work, size)}
 		}
@@ -1932,6 +2017,9 @@ func encodeRasterCore(ctx context.Context, w io.Writer, raster *Raster, opts *En
 // 入参: ctx 已规范化Context, raster 原生图像, opts 编码选项
 // 返回: []byte 独占编码缓冲, error 格式、精度、资源或取消错误
 func encodeRasterData(ctx context.Context, raster *Raster, opts *EncodeOptions) ([]byte, error) {
+	if opts != nil && opts.Uncompressed {
+		return encodeUncompressedJXR(ctx, raster, *opts)
+	}
 	if opts != nil && opts.SeparateAlpha {
 		return encodeJXRSeparateAlpha(ctx, raster, *opts)
 	}
@@ -2119,4 +2207,180 @@ func (w *jxrForwardWriter) Seek(offset int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("%w: sequential output cannot seek", ErrUnsupported)
 	}
 	return w.position, nil
+}
+
+// jxrSyncRasterChroma 当原生子采样图像显式指定色度相位时构造浅拷贝视图以匹配编码平面声明，不修改调用方元数据
+// 入参: raster 原始图像, s 已规划的编码码流头部
+// 返回: *Raster 原始图像或同步相位后的浅拷贝视图
+func jxrSyncRasterChroma(raster *Raster, s *jxrStream) *Raster {
+	if raster == nil || s.header.color != 1 && s.header.color != 2 || !s.primary.explicitChromaX && !s.primary.explicitChromaY {
+		return raster
+	}
+	format, err := rasterPixelFormat(raster.info)
+	if err != nil {
+		return raster
+	}
+	view := *raster
+	view.info.Components = cloneComponentInfo(raster.info.Components)
+	src := jxrRasterSource{container: jxrContainer{width: s.header.width, height: s.header.height, transform: uint32(s.header.transform), format: format}, primary: *s}
+	for i := 1; i < 3; i++ {
+		expected := src.componentInfo(i)
+		view.info.Components[i].XOffset = expected.XOffset
+		view.info.Components[i].YOffset = expected.YOffset
+		view.info.Components[i].XPositionKnown = expected.XPositionKnown
+		view.info.Components[i].YPositionKnown = expected.YPositionKnown
+	}
+	return &view
+}
+
+// encodeUncompressedJXR 按ITU-T T.832 Annex A.7.15将原生图像打包写入0xBC03=1无压缩JXR容器
+// 入参: ctx 已规范化Context, raster 原生图像, options 已请求无压缩模式的编码选项
+// 返回: []byte 完整无压缩JXR容器字节, error 选项、格式、样本、资源或取消错误
+func encodeUncompressedJXR(ctx context.Context, raster *Raster, options EncodeOptions) ([]byte, error) {
+	if err := checkJXREncodeOptions(options); err != nil {
+		return nil, err
+	}
+	limits := options.Limits.normalized()
+	maxBytes := options.MaxOutputBytes
+	if maxBytes == 0 {
+		maxBytes = 64 << 20
+	}
+	rasterWork, err := jxrRasterWork(raster, limits.MaxMemoryBytes)
+	if err != nil {
+		return nil, err
+	}
+	if options.SeparateAlpha && !raster.info.Alpha {
+		return nil, fmt.Errorf("%w: separate alpha without source alpha", ErrInvalid)
+	}
+	meta := jxrWithContainerMetadata(raster.info, &options)
+	retained, required, ok := jxrContainerMetadataRetained(rasterWork, limits.MaxMemoryBytes, raster.info, &options)
+	if !ok {
+		return nil, &LimitError{Resource: "uncompressed container metadata memory", Limit: limits.MaxMemoryBytes, Required: required}
+	}
+	identifier, format, err := jxrRasterIdentifier(raster.info, [16]byte{})
+	if err != nil {
+		return nil, err
+	}
+	transform := jxrInputTransform(raster.info, format.color, uint8(options.Orientation))
+	codedW, codedH := uint64(raster.Bounds().Dx()), uint64(raster.Bounds().Dy())
+	if transform&4 != 0 {
+		codedW, codedH = codedH, codedW
+	}
+	if err := checkJXRDimensions(codedW, codedH, limits.MaxPixels); err != nil {
+		return nil, err
+	}
+	layout, err := jxrMakeUncompressedLayout(identifier[15], format, codedW, codedH, options.SeparateAlpha)
+	if err != nil {
+		return nil, err
+	}
+	rawTotal := layout.mainBytes + layout.alphaBytes
+	if rawTotal > maxBytes {
+		return nil, &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: rawTotal, Detail: "uncompressed image payload"}
+	}
+	if retained > limits.MaxMemoryBytes || rawTotal > limits.MaxMemoryBytes-retained || rawTotal > uint64(^uint(0)>>1) {
+		return nil, &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, rawTotal), Detail: "uncompressed image payload memory"}
+	}
+	imageBytes, alphaBytes, err := jxrPackUncompressedImage(ctx, raster, &layout, transform)
+	if err != nil {
+		return nil, err
+	}
+	c := jxrContainer{width: codedW, height: codedH, format: format, pixelFormat: identifier, transform: uint32(transform), image: imageBytes, alpha: alphaBytes, uncompressed: true}
+	c.setInfoMetadata(meta)
+	w := newJXRBitWriter(ctx, maxBytes, limits.MaxMemoryBytes-retained-rawTotal)
+	writeJXRContainer(&w, &c, limits.MaxPixels)
+	if w.err != nil {
+		return nil, w.err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return w.data, nil
+}
+
+// jxrPackUncompressedImage 按给定无压缩布局与方向变换打包原生图像的主区及可选独立透明度字节
+// 入参: ctx Context, raster 原生图像, layout 已校验无压缩布局, transform 编码到显示方向变换
+// 返回: []byte 主图像无压缩字节, []byte 可选独立透明度无压缩字节, error 样本范围或取消错误
+func jxrPackUncompressedImage(ctx context.Context, raster *Raster, layout *jxrUncompressedLayout, transform uint8) ([]byte, []byte, error) {
+	mainData := make([]byte, int(layout.mainBytes))
+	var alphaData []byte
+	if layout.separateAlpha {
+		alphaData = make([]byte, int(layout.alphaBytes))
+	}
+	codedW, codedH := int(layout.width), int(layout.height)
+	totalComp := layout.channels
+	if layout.hasAlpha {
+		totalComp++
+	}
+	components := make([]Component, totalComp)
+	for ci := range totalComp {
+		comp, err := raster.component(ci)
+		if err != nil {
+			return nil, nil, err
+		}
+		components[ci] = comp
+	}
+	if layout.planar {
+		step := int(layout.sampleBytes)
+		for ci := range totalComp {
+			sx, sy, baseOffset, dstRowBytes, inAlpha := layout.planeSpec(ci)
+			dst := mainData
+			if inAlpha {
+				dst = alphaData
+			}
+			cw, ch := codedW/sx, codedH/sy
+			comp := components[ci]
+			for cy := range ch {
+				if err := ctx.Err(); err != nil {
+					return nil, nil, err
+				}
+				rowDst := dst[baseOffset+uint64(cy)*dstRowBytes:]
+				for cx := range cw {
+					if cx&1023 == 0 {
+						if err := ctx.Err(); err != nil {
+							return nil, nil, err
+						}
+					}
+					dx, dy := jxrRasterPosition(cx, cy, cw, ch, transform)
+					val, err := comp.sampleBitsAt(dx, dy)
+					if err != nil {
+						return nil, nil, err
+					}
+					if err := jxrPackUncompressedSample(rowDst[cx*step:], val, layout.sampleBytes, layout.tenBit); err != nil {
+						return nil, nil, err
+					}
+				}
+			}
+		}
+		return mainData, alphaData, ctx.Err()
+	}
+	var samples [9]uint32
+	for cy := range codedH {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		rowDst := mainData[uint64(cy)*layout.rowBytes:]
+		var alphaRow []byte
+		if layout.separateAlpha {
+			alphaRow = alphaData[uint64(cy)*layout.alphaRowBytes:]
+		}
+		for cx := range codedW {
+			if cx&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, nil, err
+				}
+			}
+			dx, dy := jxrRasterPosition(cx, cy, codedW, codedH, transform)
+			for ci := range totalComp {
+				val, err := components[ci].sampleBitsAt(dx, dy)
+				if err != nil {
+					return nil, nil, err
+				}
+				samples[ci] = val
+			}
+			if err := jxrPackUncompressedPixel(layout, rowDst, alphaRow, cx, samples[:totalComp]); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	return mainData, alphaData, ctx.Err()
 }

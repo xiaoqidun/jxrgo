@@ -31,6 +31,10 @@ type jxrHardTileInput struct {
 	rawWork uint64
 	width   uint64
 	height  uint64
+	left    uint32
+	top     uint32
+	right   uint32
+	bottom  uint32
 	columns uint32
 	rows    uint32
 	window  jxrForwardWindow
@@ -63,7 +67,7 @@ type RasterTileReader func(ctx context.Context, region image.Rectangle, target *
 // 入参: info 完整原生信息, source 全局编码头, tile 原分块序号
 // 返回: jxrHardTileInput 局部计划, error 布局、采样或容量错误
 func planJXRHardTile(info Info, source *jxrStream, tile int) (jxrHardTileInput, error) {
-	if source == nil || source.header.left != 0 || source.header.top != 0 {
+	if source == nil {
 		return jxrHardTileInput{}, fmt.Errorf("%w: local hard tile layout", ErrInvalid)
 	}
 	h := &source.header
@@ -81,9 +85,20 @@ func planJXRHardTile(info Info, source *jxrStream, tile int) (jxrHardTileInput, 
 		window.core = core.Sub(image.Pt(left, top))
 		window.edges = [4]bool{left == 0, top == 0, right == int(h.columns[columns]), bottom == int(h.rows[rows])}
 	}
-	coded := image.Rect(left*16, top*16, int(min(uint64(right)*16, h.width)), int(min(uint64(bottom)*16, h.height)))
+	cx0 := max(0, left*16-int(h.left))
+	cy0 := max(0, top*16-int(h.top))
+	cx1 := min(int(h.width), right*16-int(h.left))
+	cy1 := min(int(h.height), bottom*16-int(h.top))
+	coded := image.Rect(cx0, cy0, cx1, cy1)
 	if coded.Empty() || (source.primary.color == 1 || source.primary.color == 2) && h.overlap == 2 && right-left < 2 {
 		return jxrHardTileInput{}, fmt.Errorf("%w: local hard tile dimensions", ErrInvalid)
+	}
+	localLeft := uint32(cx0 + int(h.left) - left*16)
+	localTop := uint32(cy0 + int(h.top) - top*16)
+	localRight := uint32((right-left)*16) - localLeft - uint32(coded.Dx())
+	localBottom := uint32((bottom-top)*16) - localTop - uint32(coded.Dy())
+	if localLeft > 63 || localTop > 63 || localRight > 63 || localBottom > 63 {
+		return jxrHardTileInput{}, fmt.Errorf("%w: local hard tile window margins", ErrInvalid)
 	}
 	region := jxrRegionPosition(coded, int(h.width), int(h.height), h.transform)
 	work := uint64(1024) + uint64(len(info.Components))*384
@@ -105,7 +120,7 @@ func planJXRHardTile(info Info, source *jxrStream, tile int) (jxrHardTileInput, 
 		}
 		work += count * width
 	}
-	return jxrHardTileInput{region: region, rawWork: work, width: uint64(coded.Dx()), height: uint64(coded.Dy()), columns: uint32(right - left), rows: uint32(bottom - top), window: window}, nil
+	return jxrHardTileInput{region: region, rawWork: work, width: uint64(coded.Dx()), height: uint64(coded.Dy()), left: localLeft, top: localTop, right: localRight, bottom: localBottom, columns: uint32(right - left), rows: uint32(bottom - top), window: window}, nil
 }
 
 // copyJXRHardTile 在预留容量中复制局部原始分量，可复用内部样本存储，不复制ICC或保留其他分块样本引用
@@ -155,7 +170,7 @@ func resizeJXRHardTile(ctx context.Context, input Info, plan jxrHardTileInput, m
 	if plan.rawWork > maximum {
 		return nil, &LimitError{Resource: "local hard tile raw memory", Limit: maximum, Required: plan.rawWork}
 	}
-	input.ICCProfile = nil
+	input.ICCProfile, input.EXIF, input.GPS, input.XMP, input.IPTC, input.Description = nil, nil, nil, nil, nil, nil
 	if local == nil {
 		info, _, err := jxrRegionInfo(input, plan.region)
 		if err != nil {
@@ -288,7 +303,7 @@ func encodeJXRHardTileSourceTo(ctx context.Context, w io.WriteSeeker, info Info,
 			return err
 		}
 		frame.header.width, frame.header.height = plan.width, plan.height
-		frame.header.right, frame.header.bottom = uint32(uint64(plan.columns)*16-plan.width), uint32(uint64(plan.rows)*16-plan.height)
+		frame.header.left, frame.header.top, frame.header.right, frame.header.bottom = plan.left, plan.top, plan.right, plan.bottom
 		var window *jxrForwardWindow
 		localTile := 0
 		if plan.window.core.Empty() {
@@ -378,6 +393,9 @@ func encodeJXRRows(ctx context.Context, w io.WriteSeeker, info Info, read Raster
 	if err := checkJXREncodeOptions(settings); err != nil {
 		return err
 	}
+	if settings.Uncompressed {
+		return fmt.Errorf("%w: row encoder does not support uncompressed mode", ErrUnsupported)
+	}
 	format := FormatCodestream
 	if file {
 		if info.ImageType&ImageTypePreview != 0 {
@@ -402,7 +420,7 @@ func encodeJXRRows(ctx context.Context, w io.WriteSeeker, info Info, read Raster
 		return &LimitError{Resource: "row source pixels", Limit: limits.MaxPixels, Required: jxrSaturatedMul(uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy()))}
 	}
 	input := info
-	input.ICCProfile = nil
+	input.ICCProfile, input.EXIF, input.GPS, input.XMP, input.IPTC, input.Description = nil, nil, nil, nil, nil, nil
 	input.Components = cloneComponentInfo(info.Components)
 	input.ColorEncoding = cloneColorEncoding(info.ColorEncoding)
 	if err := normalizeRasterInfo(&input); err != nil {
@@ -644,7 +662,7 @@ func encodeJXRCodestreamTileInput(ctx context.Context, w io.WriteSeeker, info In
 	return encodeJXRProvidedTilesTo(ctx, w, info, &source, output.stream, read)
 }
 
-// prepareJXRTileInfo 预检并复制逐块源描述，文件路径保留ICC而独立码流明确丢弃文件元数据
+// prepareJXRTileInfo 预检并复制逐块源描述，文件路径保留全部容器元数据而独立码流明确丢弃文件元数据
 // 入参: ctx Context, info 原始描述, settings 已校验的逐块编码选项
 // 返回: Info 独占描述快照, uint64 常驻元数据额度, error 采样、资源、能力或取消错误
 func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) (Info, uint64, error) {
@@ -662,13 +680,20 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 	}
 	if settings.Format == FormatJXR {
 		info = jxrWithContainerMetadata(info, &settings)
-		for _, blob := range [][]byte{info.ICCProfile, info.EXIF, info.XMP, info.IPTC} {
+		for _, blob := range [][]byte{info.ICCProfile, info.EXIF, info.GPS, info.XMP, info.IPTC} {
 			if uint64(len(blob)) > math.MaxUint32 {
 				return Info{}, 0, &LimitError{Resource: "tiled file metadata field capacity", Limit: math.MaxUint32, Required: uint64(len(blob))}
 			}
 			amount := uint64(cap(blob)) + uint64(len(blob))
 			if retained > limits.MaxMemoryBytes || amount > limits.MaxMemoryBytes-retained {
 				return Info{}, 0, &LimitError{Resource: "tiled file retained metadata memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, amount)}
+			}
+			retained += amount
+		}
+		if descWork := jxrDescriptionWork(info.Description); descWork != 0 {
+			amount := descWork * 2
+			if retained > limits.MaxMemoryBytes || amount > limits.MaxMemoryBytes-retained {
+				return Info{}, 0, &LimitError{Resource: "tiled file retained description memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, amount)}
 			}
 			retained += amount
 		}
@@ -691,7 +716,7 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 		return Info{}, 0, fmt.Errorf("%w: tile input requires explicit alpha float parameters", ErrUnsupported)
 	}
 	if settings.Format == FormatJXR {
-		for _, target := range []*[]byte{&info.ICCProfile, &info.EXIF, &info.XMP, &info.IPTC} {
+		for _, target := range []*[]byte{&info.ICCProfile, &info.EXIF, &info.GPS, &info.XMP, &info.IPTC} {
 			if len(*target) == 0 {
 				*target = nil
 				continue
@@ -709,8 +734,9 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 			}
 			*target = copied
 		}
+		info.Description = cloneImageDescription(info.Description)
 	} else {
-		info.ICCProfile, info.EXIF, info.XMP, info.IPTC = nil, nil, nil, nil
+		info.ICCProfile, info.EXIF, info.GPS, info.XMP, info.IPTC, info.Description = nil, nil, nil, nil, nil, nil
 	}
 	return info, retained, nil
 }

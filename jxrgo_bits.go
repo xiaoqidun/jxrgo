@@ -788,7 +788,7 @@ func (m *jxrModel) update(mean [2]int, p *jxrPlane, band uint8) {
 		}
 	} else {
 		others := p.channels - 1
-		mean[1] = (mean[1]*jxrModelLumaWeight[band] + others/2) / others
+		mean[1] = (mean[1] * jxrModelLumaWeight[band]) / others
 	}
 	count := 2
 	if p.color == 0 {

@@ -224,7 +224,7 @@ func jxrScanImageDirectories(ctx context.Context, current jxrDirectory, anchor, 
 // retainedHeaderWork 计算首图索引及元数据的活动容量，不重复计入共享文件字节
 // 返回: uint64 首图仍保留的头部及信息容量
 func (d *Decoder) retainedHeaderWork() uint64 {
-	work := uint64(512) + d.source.primary.headerWork() + uint64(cap(d.source.container.profiles))*4 + uint64(len(d.info.Components))*128
+	work := uint64(512) + d.source.primary.headerWork() + uint64(cap(d.source.container.profiles))*4 + uint64(len(d.info.Components))*128 + jxrDescriptionWork(d.source.container.description) + jxrDescriptionWork(d.info.Description)
 	if d.source.alpha != nil {
 		work += d.source.alpha.headerWork()
 	}
@@ -286,7 +286,7 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	extra := uint64(0)
 	if d.fileInput != nil {
 		limits.MaxMemoryBytes -= input - uint64(cap(d.data)) - jxrReaderAtWork
-		extra = uint64(cap(container.profile)) + uint64(cap(container.exif)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc))
+		extra = uint64(cap(container.profile)) + uint64(cap(container.exif)) + uint64(cap(container.gps)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc)) + jxrDescriptionWork(container.description)
 	}
 	selected := &Decoder{data: d.data, source: source, info: info, limits: limits, fileInput: d.fileInput, inputExtra: extra, legacyHighpassPrediction: d.legacyHighpassPrediction, keepOrientation: d.keepOrientation}
 	selected.setWorkers(d.workers)
@@ -492,7 +492,33 @@ func writeJXRFileImageTo(ctx context.Context, w io.WriteSeeker, raster *Raster, 
 	}
 	var end, link uint64
 	var err error
-	if options.SeparateAlpha {
+	if options.Uncompressed {
+		selected := *options
+		selected.MaxOutputBytes = min(selected.MaxOutputBytes, maximum-start+8)
+		data, packErr := encodeUncompressedJXR(ctx, raster, selected)
+		if packErr != nil {
+			return 0, 0, packErr
+		}
+		link, err = relocateJXRImageDirectory(data, start)
+		if err == nil {
+			position, seekErr := w.Seek(0, io.SeekCurrent)
+			if seekErr != nil {
+				return 0, 0, seekErr
+			}
+			wanted, payload := int64(start), data
+			if start == 8 {
+				wanted = 0
+			} else {
+				payload = data[8:]
+			}
+			if position != wanted {
+				return 0, 0, fmt.Errorf("%w: incremental uncompressed file output position", ErrInvalid)
+			}
+			if err = writeEncoderOutput(ctx, w, payload); err == nil {
+				end = uint64(wanted) + uint64(len(payload))
+			}
+		}
+	} else if options.SeparateAlpha {
 		selected := *options
 		selected.MaxOutputBytes = min(selected.MaxOutputBytes, maximum-start+8)
 		end, link, err = writeJXRSeparateFileAt(ctx, w, raster, selected, start)
@@ -551,8 +577,23 @@ func relocateJXRImageDirectory(data []byte, start uint64) (uint64, error) {
 		if typ == 0 || typ > 12 {
 			return 0, fmt.Errorf("%w: JPEG XR generated field type", ErrInvalid)
 		}
+		count := uint64(binary.LittleEndian.Uint32(entry[4:]))
 		width := jxrTIFFTypeWidth[typ]
-		size := width * uint64(binary.LittleEndian.Uint32(entry[4:]))
+		size := width * count
+		if (tag == 0x8769 || tag == 0x8825) && typ == 4 && count == 1 {
+			if start > 8 {
+				localOffset := uint64(binary.LittleEndian.Uint32(entry[8:]))
+				if err := relocateJXRSubIFD(data, localOffset, start-8, tag == 0x8769, 0); err != nil {
+					return 0, err
+				}
+				position := localOffset + start - 8
+				if position > math.MaxUint32 {
+					return 0, fmt.Errorf("%w: JPEG XR relocated Sub-IFD offset", ErrLimit)
+				}
+				binary.LittleEndian.PutUint32(entry[8:], uint32(position))
+			}
+			continue
+		}
 		if size > 4 || tag == 0xbcc0 || tag == 0xbcc2 {
 			position := uint64(binary.LittleEndian.Uint32(entry[8:])) + start - 8
 			if position > math.MaxUint32 {
@@ -845,6 +886,18 @@ func snapshotJXRTileOptions(ctx context.Context, info Info, options EncodeOption
 	if options.Float != nil {
 		value := *options.Float
 		options.Float = &value
+	}
+	if options.Window != nil {
+		value := *options.Window
+		options.Window = &value
+	}
+	if options.ChromaCenteringX != nil {
+		value := *options.ChromaCenteringX
+		options.ChromaCenteringX = &value
+	}
+	if options.ChromaCenteringY != nil {
+		value := *options.ChromaCenteringY
+		options.ChromaCenteringY = &value
 	}
 	if options.Quantization != nil {
 		quantization, amount, err := snapshotJXRQuantization(ctx, options.Quantization, maximum-work, false)

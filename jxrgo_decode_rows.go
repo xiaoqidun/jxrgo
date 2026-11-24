@@ -511,6 +511,9 @@ func (d *Decoder) decodeStripsLocked(ctx context.Context, write RasterStripWrite
 	if write == nil || len(d.data) == 0 {
 		return fmt.Errorf("%w: JPEG XR strip consumer", ErrInvalid)
 	}
+	if d.source.container.uncompressed {
+		return d.decodeUncompressedStripsLocked(ctx, write)
+	}
 	plan, err := d.planStrips(ctx, 0)
 	if err != nil {
 		return err
@@ -1154,11 +1157,11 @@ func walkJXRReconstructedRows(ctx context.Context, s *jxrStream, reader jxrCoeff
 		if err != nil {
 			return err
 		}
-		views := row.primary.componentViewsStorage(&row.header, true, storage[:16])
+		views := row.primary.componentViewsStorage(&row.header, true, storage[:16:16])
 		var alpha *jxrComponentView
 		if row.alpha != nil {
-			views := row.alpha.componentViewsStorage(&row.header, true, storage[16:])
-			alpha = &views[0]
+			alphaViews := row.alpha.componentViewsStorage(&row.header, true, storage[16:17:17])
+			alpha = &alphaViews[0]
 		}
 		if err := emit(ctx, &row.header, views, alpha, macroY); err != nil {
 			return err
@@ -1745,11 +1748,11 @@ func (r *jxrUpsampleRows) emit(ctx context.Context, output jxrSampleRowOutput, r
 	r.rows[1] = uint32(min(r.count, 3))
 	r.image.header.height, r.image.header.top = uint64(r.rows[1])*16, uint32(local)*16
 	var storage [17]jxrComponentView
-	views := r.image.primary.componentViewsStorage(&r.image.header, true, storage[:16])
+	views := r.image.primary.componentViewsStorage(&r.image.header, true, storage[:16:16])
 	var alpha *jxrComponentView
 	if r.image.alpha != nil {
-		views := r.image.alpha.componentViewsStorage(&r.image.header, true, storage[16:])
-		alpha = &views[0]
+		alphaViews := r.image.alpha.componentViewsStorage(&r.image.header, true, storage[16:17:17])
+		alpha = &alphaViews[0]
 	}
 	return output.copy(ctx, &r.image.header, views, alpha, row)
 }
@@ -1762,4 +1765,75 @@ func (r *jxrUpsampleRows) finish(ctx context.Context, output jxrSampleRowOutput)
 		return fmt.Errorf("%w: JPEG XR incomplete vertical sample rows", ErrInvalid)
 	}
 	return r.emit(ctx, output, r.count-1, min(r.count, 3)-1)
+}
+
+// decodeUncompressedStripsLocked 按至多十六编码行一批读取无压缩容器图像并同步回调可复用行带
+// 入参: ctx 已规范化Context, write 同步行带消费者
+// 返回: error 数据、读取、资源、取消或消费者错误
+func (d *Decoder) decodeUncompressedStripsLocked(ctx context.Context, write RasterStripWriter) error {
+	d.bindInputContext(ctx)
+	defer d.bindInputContext(nil)
+	c := &d.source.container
+	layout, err := jxrMakeUncompressedLayout(c.pixelFormat[15], c.format, c.width, c.height, c.separateAlpha())
+	if err != nil {
+		return err
+	}
+	codedW, codedH := int(c.width), int(c.height)
+	transform := uint8(c.transform)
+	firstHeight := min(16, codedH)
+	firstRegion := jxrRegionPosition(image.Rect(0, 0, codedW, firstHeight), codedW, codedH, transform)
+	firstInfo, stripWork, err := jxrRegionInfo(d.info, firstRegion)
+	if err != nil {
+		return err
+	}
+	rowWork := layout.rowBufferWork()
+	retained := d.inputWork() + d.retainedHeaderWork()
+	if _, ok := jxrWorkTotal(d.limits.MaxMemoryBytes, retained, stripWork, rowWork); !ok {
+		return &LimitError{Resource: "max memory bytes", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, jxrSaturatedAdd(stripWork, rowWork)), Detail: "uncompressed strip memory budget"}
+	}
+	if rowWork > uint64(^uint(0)>>1) {
+		return &LimitError{Resource: "max memory bytes", Limit: uint64(^uint(0) >> 1), Required: rowWork, Detail: "uncompressed strip row capacity"}
+	}
+	cache, err := newRasterContext(ctx, firstInfo, Limits{MaxPixels: d.limits.MaxPixels, MaxMemoryBytes: stripWork})
+	if err != nil {
+		return err
+	}
+	rowBuf := make([]byte, int(layout.rowBytes))
+	var alphaBuf []byte
+	if !layout.planar && layout.separateAlpha {
+		alphaBuf = make([]byte, int(layout.alphaRowBytes))
+	}
+	view := Raster{planes: make([]imageComponents, len(cache.planes))}
+	viewComponents := make([]ComponentInfo, len(cache.info.Components))
+	for y0 := 0; y0 < codedH; y0 += 16 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		y1 := min(y0+16, codedH)
+		dispRect := jxrRegionPosition(image.Rect(0, y0, codedW, y1), codedW, codedH, transform)
+		copy(viewComponents, cache.info.Components)
+		view.info = cache.info
+		view.info.Bounds = image.Rect(0, 0, dispRect.Dx(), dispRect.Dy())
+		view.info.Components = viewComponents
+		for ci := range view.planes {
+			comp := &viewComponents[ci]
+			comp.Bounds = image.Rect(0, 0, dispRect.Dx()/int(comp.XStep), dispRect.Dy()/int(comp.YStep))
+			count := comp.Bounds.Dx() * comp.Bounds.Dy()
+			plane := cache.planes[ci]
+			plane.bounds = comp.Bounds
+			if plane.words != nil {
+				plane.words = plane.words[:count]
+			} else {
+				plane.values = plane.values[:count]
+			}
+			view.planes[ci] = plane
+		}
+		if err := d.decodeUncompressedInto(ctx, &view, dispRect, &layout, rowBuf, alphaBuf); err != nil {
+			return err
+		}
+		if err := write(ctx, dispRect, &view); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
 }

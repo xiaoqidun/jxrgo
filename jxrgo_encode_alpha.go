@@ -157,23 +157,8 @@ func encodeJXRSeparateAlpha(ctx context.Context, raster *Raster, options EncodeO
 		}
 		retained += amount
 	}
-	c := jxrContainer{width: main.header.width, height: main.header.height, dpi: raster.info.Resolution, format: format, pixelFormat: identifier, transform: uint32(main.header.transform), image: codedPrimary, alpha: codedAlpha, profiles: main.profiles, imageBands: uint32(main.primary.bands), alphaBands: uint32(secondary.alpha.bands), colorHint: raster.info.ColorHint, encoding: raster.info.ColorEncoding, imageType: raster.info.ImageType}
-	meta := jxrWithContainerMetadata(raster.info, &options)
-	if len(meta.ICCProfile) != 0 {
-		c.profile = meta.ICCProfile
-	}
-	if len(meta.EXIF) != 0 {
-		c.exif = meta.EXIF
-	}
-	if len(meta.XMP) != 0 {
-		c.xmp = meta.XMP
-	}
-	if len(meta.IPTC) != 0 {
-		c.iptc = meta.IPTC
-	}
-	if main.header.transform&4 != 0 {
-		c.dpi.X, c.dpi.Y = c.dpi.Y, c.dpi.X
-	}
+	c := jxrContainer{width: main.header.width, height: main.header.height, format: format, pixelFormat: identifier, transform: uint32(main.header.transform), image: codedPrimary, alpha: codedAlpha, profiles: main.profiles, imageBands: uint32(main.primary.bands), alphaBands: uint32(secondary.alpha.bands)}
+	c.setInfoMetadata(jxrWithContainerMetadata(raster.info, &options))
 	w := newJXRBitWriter(ctx, mainOutput.stream.maxBytes, limits.MaxMemoryBytes-retained)
 	writeJXRContainer(&w, &c, limits.MaxPixels)
 	if w.err != nil {
@@ -256,9 +241,14 @@ func jxrSeparateAlphaOptions(ctx context.Context, o EncodeOptions, maximum uint6
 		value := *p.Float
 		p.Float = &value
 	}
+	var window *WindowMargins
+	if o.Window != nil {
+		value := *o.Window
+		window = &value
+	}
 	return EncodeOptions{Format: FormatCodestream, Layout: o.Layout, Overlap: o.Overlap, Orientation: o.Orientation, TileSize: o.TileSize,
 		HardTiles: o.HardTiles, Lossy: o.Lossy, LegacyHighpassPrediction: o.LegacyHighpassPrediction, Workers: o.Workers,
-		Band: p.Band, Trim: o.Trim, Scaled: p.Scaled, Shift: p.Shift, Float: p.Float, Alpha: &p, MaxOutputBytes: o.MaxOutputBytes}, retained + owned, ctx.Err()
+		Band: p.Band, Trim: o.Trim, Scaled: p.Scaled, Shift: p.Shift, Float: p.Float, Alpha: &p, Window: window, MaxOutputBytes: o.MaxOutputBytes}, retained + owned, ctx.Err()
 }
 
 // prepareJXRSeparateAlphaPrimary 确定辅助主平面的灰度布局，镜像时复用透明度的编码参数和量化表
