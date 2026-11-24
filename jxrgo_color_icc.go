@@ -486,6 +486,9 @@ func (mapping *jxrDisplayMapping) color(ctx context.Context, info Info, samples 
 		return red, green, blue, nil
 	}
 	if info.Premultiplied {
+		if !(alpha > 0) {
+			return 0, 0, 0, nil
+		}
 		jxrUnpremultiplyDisplay(samples[:info.Channels], alpha)
 	}
 	return mapping.icc.color(ctx, samples)

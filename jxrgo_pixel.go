@@ -1022,8 +1022,8 @@ func (r *Raster) resample(ctx context.Context, size image.Point, opts *ResampleO
 	info := r.info
 	info.Bounds, info.PixelFormat = image.Rectangle{Max: size}, ""
 	info.Components = cloneComponentInfo(info.Components)
-	info.Resolution.X *= float64(size.X) / float64(r.Bounds().Dx())
-	info.Resolution.Y *= float64(size.Y) / float64(r.Bounds().Dy())
+	info.Resolution.X = scaleJXRResolution(info.Resolution.X, size.X, r.Bounds().Dx())
+	info.Resolution.Y = scaleJXRResolution(info.Resolution.Y, size.Y, r.Bounds().Dy())
 	for index := range info.Components {
 		component := &info.Components[index]
 		component.Bounds, component.XStep, component.YStep = info.Bounds, 1, 1
@@ -1078,6 +1078,23 @@ func (r *Raster) resample(ctx context.Context, size image.Point, opts *ResampleO
 		return nil, err
 	}
 	return output, nil
+}
+
+// scaleJXRResolution 按尺寸比例缩放分辨率，并将正值钳位到float32合法正范围
+// 入参: value 原始分辨率, numerator 目标边长, denominator 原始边长
+// 返回: float64 缩放后的分辨率
+func scaleJXRResolution(value float64, numerator, denominator int) float64 {
+	if !geometryFinite(value) || value <= 0 || numerator <= 0 || denominator <= 0 {
+		return value
+	}
+	scaled := value * (float64(numerator) / float64(denominator))
+	if float32(scaled) == 0 {
+		return float64(math.SmallestNonzeroFloat32)
+	}
+	if math.IsInf(float64(float32(scaled)), 0) {
+		return float64(math.MaxFloat32)
+	}
+	return scaled
 }
 
 // resampleJXRAxis 将完整输出网格中心映射到原分量网格，返回端点延拓后的相邻坐标及权重

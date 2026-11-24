@@ -300,6 +300,9 @@ func displayJXRSample(source Component, x, y, width, height int, filter Resample
 // 返回: float64 非预乘红、绿、蓝显示值
 func displayJXRColor(info Info, values []float64, alpha float64, linear bool) (float64, float64, float64) {
 	if info.Premultiplied {
+		if !(alpha > 0) {
+			return 0, 0, 0
+		}
 		jxrUnpremultiplyDisplay(values[:info.Channels], alpha)
 	}
 	var red, green, blue float64

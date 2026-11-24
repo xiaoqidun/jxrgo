@@ -380,6 +380,9 @@ func encodeJXRRows(ctx context.Context, w io.WriteSeeker, info Info, read Raster
 	}
 	format := FormatCodestream
 	if file {
+		if info.ImageType&ImageTypePreview != 0 {
+			return fmt.Errorf("%w: JPEG XR preview requires corresponding image", ErrInvalid)
+		}
 		format = FormatJXR
 	}
 	settings.Format = format

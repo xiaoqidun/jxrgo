@@ -184,8 +184,8 @@ func jxrReducedInfo(original Info, divisor int, maximum uint64) (Info, uint64, e
 	}
 	info := original
 	info.Bounds, info.PixelFormat = image.Rect(0, 0, width, height), ""
-	info.Resolution.X *= float64(width) / float64(original.Bounds.Dx())
-	info.Resolution.Y *= float64(height) / float64(original.Bounds.Dy())
+	info.Resolution.X = scaleJXRResolution(info.Resolution.X, width, original.Bounds.Dx())
+	info.Resolution.Y = scaleJXRResolution(info.Resolution.Y, height, original.Bounds.Dy())
 	info.Components = cloneComponentInfo(original.Components)
 	for i := range info.Components {
 		c := &info.Components[i]

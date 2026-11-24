@@ -101,6 +101,9 @@ func encodeJXRSeparateAlpha(ctx context.Context, raster *Raster, options EncodeO
 	if err != nil {
 		return nil, err
 	}
+	if inputWork+alphaWork+alphaOptionsWork >= limits.MaxMemoryBytes {
+		return nil, &LimitError{Resource: "separate alpha options memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(inputWork+alphaWork+alphaOptionsWork, 1)}
+	}
 	mainOptions := options
 	mainOptions.Format, mainOptions.SeparateAlpha, mainOptions.MirrorSeparateAlpha, mainOptions.Alpha = FormatCodestream, false, false, nil
 	mainOptions.Limits = limits
@@ -311,6 +314,9 @@ func makeJXRAlphaRowStorage(info Info, scratch io.ReadWriteSeeker, maximum uint6
 // 入参: ctx Context, w 文件输出, info 完整描述, source 共用行缓存, alpha 透明度暂存, options 文件选项
 // 返回: error 参数、资源、源、暂存、取消或输出错误
 func encodeJXRSeparateRows(ctx context.Context, w io.WriteSeeker, info Info, source *jxrRowInput, alpha *jxrAlphaRowStorage, options EncodeOptions) error {
+	if info.ImageType&ImageTypePreview != 0 {
+		return fmt.Errorf("%w: JPEG XR preview requires corresponding image", ErrInvalid)
+	}
 	info, retained, err := prepareJXRTileInfo(ctx, info, options)
 	if err != nil {
 		return err
@@ -491,6 +497,9 @@ func makeJXRSeparateInput(ctx context.Context, raster *Raster, options EncodeOpt
 		return result, err
 	}
 	result.working += alphaOptionsWork
+	if result.working >= limits.MaxMemoryBytes {
+		return result, &LimitError{Resource: "separate alpha metadata memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(result.working, 1)}
+	}
 	for index, source := range [2]*Raster{&result.primary, result.alpha} {
 		selected := mainOptions
 		if index == 1 {
@@ -667,6 +676,9 @@ func makeJXRSeparateTileInput(ctx context.Context, info Info, options EncodeOpti
 		return result, err
 	}
 	working += alphaOptionsWork
+	if working >= limits.MaxMemoryBytes {
+		return result, &LimitError{Resource: "separate tile alpha metadata memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(working, 1)}
+	}
 	for index := range 2 {
 		selected := mainOptions
 		if index == 1 {

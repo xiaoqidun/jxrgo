@@ -52,7 +52,6 @@ type jxrRasterSource struct {
 	primary   jxrStream
 	alpha     *jxrStream
 	format    Format
-	workers   int
 }
 
 // NewDecoder 读取有界输入并检查容器文件或独立码流的头部，不重建像素
@@ -328,7 +327,6 @@ func readDecoderInput(source io.Reader, limits Limits) ([]byte, error) {
 // setWorkers 将并发上限同步至主码流及可选独立透明度码流
 // 入参: workers 已规范化的并发上限
 func (source *jxrRasterSource) setWorkers(workers int) {
-	source.workers = workers
 	source.primary.workers = workers
 	if source.alpha != nil {
 		source.alpha.workers = workers
