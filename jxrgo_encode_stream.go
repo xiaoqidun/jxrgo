@@ -951,6 +951,15 @@ func makeJXRFilePrefixParts(ctx context.Context, info Info, source, alpha *jxrSt
 	if len(info.ICCProfile) != 0 {
 		c.profile = info.ICCProfile
 	}
+	if len(info.EXIF) != 0 {
+		c.exif = info.EXIF
+	}
+	if len(info.XMP) != 0 {
+		c.xmp = info.XMP
+	}
+	if len(info.IPTC) != 0 {
+		c.iptc = info.IPTC
+	}
 	if alpha != nil {
 		if !info.Alpha || source.header.alpha || !alpha.header.alpha || alpha.alpha == nil || source.header.width != alpha.header.width || source.header.height != alpha.header.height || source.header.depth != alpha.header.depth || alpha.primary.channels != 1 {
 			return nil, jxrContainerOffsets{}, fmt.Errorf("%w: incremental separate alpha stream layout", ErrInvalid)

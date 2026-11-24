@@ -235,20 +235,23 @@ func (b *jxrBits) align(zero bool) {
 	}
 }
 
-// variableWord 读取标准的可变长度整数，保留八字节值而不截断为平台整数
-// 返回: uint64 整数或逃逸值，错误保存在读取器中
-func (b *jxrBits) variableWord() uint64 {
+// variableWord 读取标准的可变长度整数，显式返回逃逸字节区分偏移零与逃逸值并保留八字节宽度
+// 返回: uint64 整数值，逃逸时为零, uint8 逃逸字节，非逃逸时为零
+func (b *jxrBits) variableWord() (uint64, uint8) {
 	first := b.read(8)
+	if b.err != nil {
+		return 0, 0
+	}
 	switch {
 	case first < 0xfb:
-		return uint64(first<<8 | b.read(8))
+		return uint64(first<<8 | b.read(8)), 0
 	case first == 0xfb:
-		return uint64(b.read(32))
+		return uint64(b.read(32)), 0
 	case first == 0xfc:
 		high, low := b.read(32), b.read(32)
-		return uint64(high)<<32 | uint64(low)
+		return uint64(high)<<32 | uint64(low), 0
 	default:
-		return 0
+		return 0, uint8(first)
 	}
 }
 
@@ -757,10 +760,10 @@ func (v *jxrMultiVLC) adapt(maximum uint8) {
 
 // checkJXRModelComponents 检查归一化模型的分量支持范围
 // 入参: p 已通过分量布局校验的平面
-// 返回: error 尚未支持的归一化模型错误
+// 返回: error 越界分量数量错误
 func checkJXRModelComponents(p *jxrPlane) error {
-	if p.channels > len(jxrModelComponentWeight[0]) {
-		return fmt.Errorf("%w: JPEG XR component normalization model", ErrUnsupported)
+	if p.channels < 1 || p.channels > rasterMaxComponents {
+		return fmt.Errorf("%w: JPEG XR component normalization model", ErrInvalid)
 	}
 	return nil
 }
@@ -772,17 +775,20 @@ func newJXRModel(band uint8) jxrModel {
 	return jxrModel{bits: [2]uint8{(2 - band) * 4, (2 - band) * 4}}
 }
 
-// update 按宏块非零系数数量更新归一化状态，算术右移保留标准的负数舍入规则
+// update 按宏块非零系数数量更新归一化状态，算术右移保留标准的负数舍入规则，支持至四千一百一十一通道
 // 入参: mean 亮度及其他分量的非零数量, p 图像平面, band 已校验的频带索引
 func (m *jxrModel) update(mean [2]int, p *jxrPlane, band uint8) {
 	mean[0] *= jxrModelLumaWeight[band]
 	if p.color == 1 || p.color == 2 {
 		mean[1] *= jxrModelChromaWeight[p.color-1][band]
-	} else {
+	} else if p.channels <= len(jxrModelComponentWeight[0]) {
 		mean[1] *= jxrModelComponentWeight[band][p.channels-1]
 		if band == 2 {
 			mean[1] >>= 4
 		}
+	} else {
+		others := p.channels - 1
+		mean[1] = (mean[1]*jxrModelLumaWeight[band] + others/2) / others
 	}
 	count := 2
 	if p.color == 0 {

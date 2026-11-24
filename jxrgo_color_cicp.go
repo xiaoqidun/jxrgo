@@ -45,12 +45,8 @@ var (
 	// jxrSRGBToBT2020 将线性sRGB坐标转换到方法A的输入基色
 	jxrSRGBToBT2020 = jxrInvertCompositionMatrix(jxrBT2020ToSRGB)
 
-	// jxrBT2446HDRRho 保存BT.2446方法A中1000 cd/m²输入的ρ减一
-	jxrBT2446HDRRho = 32 * math.Pow(1000.0/10000, 1/2.4)
 	// jxrBT2446SDRRho 保存BT.2446方法A中100 cd/m²输出的ρ减一
 	jxrBT2446SDRRho = 32 * math.Pow(100.0/10000, 1/2.4)
-	// jxrBT2446HDRLog 保存HDR的ρ对数
-	jxrBT2446HDRLog = math.Log1p(jxrBT2446HDRRho)
 	// jxrBT2446SDRLog 保存SDR的ρ对数
 	jxrBT2446SDRLog = math.Log1p(jxrBT2446SDRRho)
 	// jxrIPTToLMSPrime 保存非线性IPT到LMS的逆变换矩阵
@@ -97,17 +93,19 @@ var (
 
 // jxrCICPColorDisplay 保存H.273信号的范围、矩阵及传递参数
 type jxrCICPColorDisplay struct {
-	matrix     [3][3]float64
-	toBT2020   *[3][3]float64
-	offset     [3]float64
-	scale      [3]float64
-	hlgLuma    [3]float64
-	red        float64
-	blue       float64
-	transfer   uint16
-	matrixCode uint16
-	ycgco      jxrCICPYCgCo
-	constant   jxrCICPConstantLuminance
+	matrix       [3][3]float64
+	linearMatrix [3][3]float64
+	toBT2020     *[3][3]float64
+	offset       [3]float64
+	scale        [3]float64
+	hlgLuma      [3]float64
+	red          float64
+	blue         float64
+	peakNits     float64
+	transfer     uint16
+	matrixCode   uint16
+	ycgco        jxrCICPYCgCo
+	constant     jxrCICPConstantLuminance
 }
 
 // jxrCICPYCgCo 保存整数分量范围及YCgCo或YCgCo-R反变换参数
@@ -125,9 +123,9 @@ type jxrCICPConstantLuminance struct {
 }
 
 // jxrCICPDisplay 准备SDR、数字影院XYZ、PQ或HLG到sRGB的转换，PQ和HLG采用BT.2446方法A
-// 入参: info 原生分量描述, specification PTM颜色声明
+// 入参: info 原生分量描述, specification PTM颜色声明, peakNits 可选HDR峰值亮度，零值对PQ默认10000、对HLG默认1000
 // 返回: jxrDisplayMapping 转换, bool 是否支持声明及样本组合
-func jxrCICPDisplay(info Info, specification ColorEncoding) (jxrDisplayMapping, bool) {
+func jxrCICPDisplay(info Info, specification ColorEncoding, peakNits float64) (jxrDisplayMapping, bool) {
 	var mapping jxrDisplayMapping
 	matrixCode := uint16(specification.Matrix)
 	ycc := info.ColorSpace == ColorYCC && info.Channels == 3
@@ -143,8 +141,13 @@ func jxrCICPDisplay(info Info, specification ColorEncoding) (jxrDisplayMapping, 
 	if xyz && !jxrCICPXYZEncoding(specification) || transfer == 17 && !xyz {
 		return mapping, false
 	}
-	if info.Linear && (!rgb || transfer != 8 || !specification.FullRange) {
-		return mapping, false
+	if info.Linear {
+		if !specification.FullRange {
+			return mapping, false
+		}
+		if gray && transfer != 8 || rgb && transfer != 8 && transfer != 13 && transfer != 16 && transfer != 18 {
+			return mapping, false
+		}
 	}
 	hdr := transfer == 16 || transfer == 18
 	hdrMatrix := matrixCode == 14 || matrixCode == 15
@@ -192,6 +195,9 @@ func jxrCICPDisplay(info Info, specification ColorEncoding) (jxrDisplayMapping, 
 	display := &mapping.cicp
 	for index, component := range info.Components[:info.Channels] {
 		if info.Linear && (component.Format == SampleFloat || component.Format == SampleFixed) {
+			if ycgco {
+				return jxrDisplayMapping{}, false
+			}
 			display.scale[index] = 1
 			continue
 		}
@@ -235,7 +241,17 @@ func jxrCICPDisplay(info Info, specification ColorEncoding) (jxrDisplayMapping, 
 	if constant {
 		display.constant = jxrNewCICPConstantLuminance(red, blue, transfer)
 	}
+	linearMatrix := matrix
 	if hdr {
+		peak := peakNits
+		if peak == 0 {
+			if transfer == 16 {
+				peak = 10000
+			} else {
+				peak = 1000
+			}
+		}
+		display.peakNits = peak
 		if transfer == 18 {
 			display.hlgLuma, _ = jxrHLGLuma(specification)
 		}
@@ -248,7 +264,7 @@ func jxrCICPDisplay(info Info, specification ColorEncoding) (jxrDisplayMapping, 
 		}
 		matrix = jxrBT2020ToSRGB
 	}
-	display.matrix, display.transfer, display.matrixCode = matrix, transfer, matrixCode
+	display.matrix, display.linearMatrix, display.transfer, display.matrixCode = matrix, linearMatrix, transfer, matrixCode
 	if !constant && (gray || specification.Primaries == 1) && transfer == 13 {
 		display.transfer = jxrCICPDirectSRGB
 	}
@@ -371,15 +387,21 @@ func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha fl
 			rgb = jxrBT2100Linear(rgb, display.transfer, display.matrixCode)
 		}
 		if display.transfer == 18 {
-			rgb = jxrHLGDisplayLight(rgb, display.hlgLuma)
+			rgb = jxrHLGDisplayLight(rgb, display.hlgLuma, display.peakNits)
+		} else if display.peakNits != 10000 {
+			scale := 10000 / display.peakNits
+			for index := range rgb {
+				rgb[index] *= scale
+			}
 		}
 		if display.toBT2020 != nil {
 			rgb = jxrApplyColorMatrix(*display.toBT2020, rgb)
 		}
-		rgb = jxrBT2446MethodA(rgb)
+		rgb = jxrBT2446MethodA(rgb, display.peakNits)
 	} else if !constant {
+		signed := ycc || info.Linear
 		for index, value := range rgb {
-			rgb[index] = jxrCICPInverseTransfer(value, display.transfer, ycc)
+			rgb[index] = jxrCICPInverseTransfer(value, display.transfer, signed)
 		}
 	}
 	var srgb [3]float64
@@ -387,6 +409,90 @@ func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha fl
 		srgb[index] = displayLinear(row[0]*rgb[0] + row[1]*rgb[1] + row[2]*rgb[2])
 	}
 	return srgb[0], srgb[1], srgb[2]
+}
+
+// linearColor 执行CICP逆矩阵与传递函数线性化，输出未裁剪的D65线性scRGB，PQ与HLG相对100 cd/m²归一化
+// 入参: info 原生描述, samples 归一化原生样本, alpha 原透明度, unpremultiply 是否解除预乘
+// 返回: float64 线性红、绿、蓝scRGB分量
+func (display *jxrCICPColorDisplay) linearColor(info Info, samples []float64, alpha float64, unpremultiply bool) (float64, float64, float64) {
+	ycc := info.ColorSpace == ColorYCC
+	pureLinear := display.transfer == 8 && display.matrixCode == 0 && !ycc
+	repremultiply := false
+	if info.Premultiplied {
+		if !pureLinear || unpremultiply {
+			if !(alpha > 0) || !geometryFinite(alpha) {
+				return 0, 0, 0
+			}
+			for index := range info.Channels {
+				samples[index] /= alpha
+			}
+			repremultiply = !unpremultiply
+		}
+	}
+	var rgb [3]float64
+	for index := range info.Channels {
+		rgb[index] = (samples[index] - display.offset[index]) * display.scale[index]
+	}
+	hdr := display.transfer == 16 || display.transfer == 18
+	if info.Channels == 1 && !hdr {
+		transfer := display.transfer
+		if transfer == jxrCICPDirectSRGB {
+			transfer = 13
+		}
+		value := jxrCICPInverseTransfer(rgb[0], transfer, info.Linear)
+		if repremultiply {
+			value *= alpha
+		}
+		return value, value, value
+	}
+	constant := display.matrixCode == 10 || display.matrixCode == 13
+	if ycc {
+		switch display.matrixCode {
+		case 0:
+			rgb = [3]float64{rgb[2], rgb[0], rgb[1]}
+		case 8, 16, 17:
+			rgb = display.ycgco.rgb(samples)
+		case 10, 13:
+			rgb = display.constant.linear(rgb, display.red, display.blue, display.transfer)
+		case 11:
+			rgb = jxrCICPSMPTE2085ToRGB(rgb)
+		case 14, 15:
+		default:
+			rgb = jxrCICPYCCToRGB(rgb, display.red, display.blue)
+		}
+	}
+	if hdr {
+		if info.Channels == 1 {
+			rgb[1], rgb[2] = rgb[0], rgb[0]
+		}
+		if !constant {
+			rgb = jxrBT2100Linear(rgb, display.transfer, display.matrixCode)
+		}
+		scale := 100.0
+		if display.transfer == 18 {
+			rgb = jxrHLGDisplayLight(rgb, display.hlgLuma, 1000)
+			scale = 10.0
+		}
+		for index := range rgb {
+			rgb[index] *= scale
+		}
+	} else if !constant {
+		transfer := display.transfer
+		if transfer == jxrCICPDirectSRGB {
+			transfer = 13
+		}
+		signed := ycc || info.Linear
+		for index, value := range rgb {
+			rgb[index] = jxrCICPInverseTransfer(value, transfer, signed)
+		}
+	}
+	out := jxrApplyColorMatrix(display.linearMatrix, rgb)
+	if repremultiply {
+		for index := range out {
+			out[index] *= alpha
+		}
+	}
+	return out[0], out[1], out[2]
 }
 
 // jxrCICPYCCToRGB 反解非恒定亮度颜色矩阵
@@ -412,7 +518,10 @@ func jxrCICPInverseTransfer(value float64, transfer uint16, ycc bool) float64 {
 	case 8:
 		return value
 	case 9, 10:
-		return math.Pow(10, jxrCICPLogDecades(transfer)*(max(0, value)-1))
+		if value <= 0 {
+			return 0
+		}
+		return math.Pow(10, jxrCICPLogDecades(transfer)*(value-1))
 	case 17:
 		return (52.37 / 48) * math.Pow(colorClamp(value), 2.6)
 	}
@@ -424,7 +533,7 @@ func jxrCICPInverseTransfer(value float64, transfer uint16, ycc bool) float64 {
 	if transfer == 11 || transfer == 13 && ycc {
 		magnitude = math.Abs(value)
 	}
-	if magnitude < beta*slope {
+	if magnitude <= beta*slope {
 		return value / slope
 	}
 	return math.Copysign(math.Pow((magnitude+alpha-1)/alpha, power), value)
@@ -445,7 +554,7 @@ func jxrCICPForwardSDR(value float64, transfer uint16) float64 {
 		return max(0, 1+math.Log10(value)/jxrCICPLogDecades(transfer))
 	}
 	alpha, beta, slope, power := jxrCICPPiecewiseTransfer(transfer)
-	if value < beta {
+	if value <= beta {
 		return slope * value
 	}
 	return alpha*math.Pow(value, 1/power) - (alpha - 1)
@@ -469,7 +578,7 @@ func jxrCICPPiecewiseTransfer(transfer uint16) (alpha, beta, slope, power float6
 	case 7:
 		return 1.1115721959217313, 0.022821585529445028, 4, 1 / 0.45
 	case 13:
-		return 1.0550107189475866, 0.003041282560127518, 12.92, 2.4
+		return 1.055, 0.0031308, 12.92, 2.4
 	default:
 		return 1.099296826809442, 0.018053968510807, 4.5, 1 / 0.45
 	}
@@ -554,14 +663,14 @@ func jxrBT2100Linear(signal [3]float64, transfer, matrix uint16) [3]float64 {
 	return signal
 }
 
-// jxrHDRInverseTransfer 将PQ转换为相对1000 cd/m²的显示光或将HLG转换为场景光
+// jxrHDRInverseTransfer 将PQ转换为相对10000 cd/m²的标称显示光或将HLG转换为场景光
 // 入参: value 非线性HDR分量, transfer H.273传递特性代码
 // 返回: float64 线性光强度
 func jxrHDRInverseTransfer(value float64, transfer uint16) float64 {
 	value = colorClamp(value)
 	if transfer == 16 {
 		root := math.Pow(value, 1/jxrPQM2)
-		return 10 * math.Pow(max(root-jxrPQC1, 0)/(jxrPQC2-jxrPQC3*root), 1/jxrPQM1)
+		return math.Pow(max(root-jxrPQC1, 0)/(jxrPQC2-jxrPQC3*root), 1/jxrPQM1)
 	}
 	if value <= 0.5 {
 		return value * value / 3
@@ -569,22 +678,26 @@ func jxrHDRInverseTransfer(value float64, transfer uint16) float64 {
 	return (math.Exp((value-jxrHLGC)/jxrHLGA) + jxrHLGB) / 12
 }
 
-// jxrHLGDisplayLight 将HLG场景光转换为参考显示光
-// 入参: rgb 线性场景RGB, weights 场景亮度权重
+// jxrHLGDisplayLight 按BT.2100参考峰值亮度将HLG场景光转换为归一化显示光
+// 入参: rgb 线性场景RGB, weights 场景亮度权重, peakNits 参考显示峰值亮度
 // 返回: [3]float64 参考显示光RGB
-func jxrHLGDisplayLight(rgb, weights [3]float64) [3]float64 {
+func jxrHLGDisplayLight(rgb, weights [3]float64, peakNits float64) [3]float64 {
 	luma := weights[0]*rgb[0] + weights[1]*rgb[1] + weights[2]*rgb[2]
-	gain := math.Pow(max(0, luma), 1.2-1)
+	gamma := 1.2
+	if peakNits != 1000 {
+		gamma = 1.2 + 0.42*math.Log10(peakNits/1000)
+	}
+	gain := math.Pow(max(0, luma), gamma-1)
 	for i := range rgb {
 		rgb[i] *= gain
 	}
 	return rgb
 }
 
-// jxrBT2446MethodA 按BT.2446方法A将1000 cd/m²显示光映射到100 cd/m²并按BT.1886线性化输出
-// 入参: rgb BT.2020线性显示RGB，相对1000 cd/m²
+// jxrBT2446MethodA 按BT.2446方法A将指定峰值显示光映射到100 cd/m²并按BT.1886线性化输出
+// 入参: rgb BT.2020线性显示RGB，相对peakNits峰值归一化, peakNits HDR标称峰值亮度
 // 返回: [3]float64 BT.2020线性SDR显示RGB
-func jxrBT2446MethodA(rgb [3]float64) [3]float64 {
+func jxrBT2446MethodA(rgb [3]float64, peakNits float64) [3]float64 {
 	for index, value := range rgb {
 		rgb[index] = math.Pow(colorClamp(value), 1/2.4)
 	}
@@ -592,7 +705,8 @@ func jxrBT2446MethodA(rgb [3]float64) [3]float64 {
 	if !(luma > 0) {
 		return [3]float64{}
 	}
-	perceptual := math.Log1p(jxrBT2446HDRRho*luma) / jxrBT2446HDRLog
+	hdrRho := 32 * math.Pow(peakNits/10000, 1/2.4)
+	perceptual := math.Log1p(hdrRho*luma) / math.Log1p(hdrRho)
 	var compressed float64
 	switch {
 	case perceptual <= 0.7399:
@@ -703,7 +817,7 @@ func jxrNewCICPConstantLuminance(kr, kb float64, transfer uint16) jxrCICPConstan
 
 // linear 从恒定亮度信号恢复线性RGB，绿色由线性亮度方程求得
 // 入参: signal 已撤销量化的亮度及色差, kr,kb 红蓝权重, transfer 已支持的SDR传递代码
-// 返回: [3]float64 线性RGB，PQ以1000 cd/m²参考显示光为单位，HLG为场景光
+// 返回: [3]float64 线性RGB，PQ以10000 cd/m²参考显示光为单位，HLG为场景光
 func (constant *jxrCICPConstantLuminance) linear(signal [3]float64, kr, kb float64, transfer uint16) [3]float64 {
 	y, cb, cr := signal[0], signal[1], signal[2]
 	b, r := constant.bluePositive, constant.redPositive

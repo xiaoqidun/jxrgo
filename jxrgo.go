@@ -133,6 +133,24 @@ const (
 	ImageTypePage ImageType = 2
 )
 
+const (
+	// IntentRelative 表示ICC媒体相对色度渲染意图
+	IntentRelative RenderingIntent = iota
+	// IntentPerceptual 表示ICC感知渲染意图
+	IntentPerceptual
+	// IntentSaturation 表示ICC饱和度渲染意图
+	IntentSaturation
+)
+
+const (
+	// SubsamplingNone 表示不额外执行内部色度下采样
+	SubsamplingNone Subsampling = iota
+	// Subsampling422 表示编码端执行内部YUV422色度下采样
+	Subsampling422
+	// Subsampling420 表示编码端执行内部YUV420色度下采样
+	Subsampling420
+)
+
 // jxrDimensionLimit 保存长图像头中减一编码可表示的最大可见轴长
 const jxrDimensionLimit uint64 = 1 << 32
 
@@ -169,23 +187,37 @@ type Limits struct {
 	MaxMemoryBytes uint64
 }
 
-// DecodeOptions 指定解码并发上限、资源上限及兼容选项
-// Workers限制并发Goroutine上限，零值按CPU核数和分块规模自动选择
+// DecodeOptions 指定解码并发上限、方向策略、资源上限及兼容选项
+// Workers限制并发Goroutine上限，零值按CPU核数和分块规模自动选择；KeepOrientation为真时保留原始编码方向不旋转翻转
 // 默认按反量化前低通系数确定高通预测方向，LegacyHighpassPrediction启用按反量化后低通系数预测的旧版模式
 type DecodeOptions struct {
 	Workers                  int
 	Limits                   Limits
 	LegacyHighpassPrediction bool
+	KeepOrientation          bool
 }
 
-// EncodeOptions 指定编码格式、布局、精度、并发与资源上限，零值采用无损JXR及全部频带
-// TileSize以编码网格像素计且须为十六倍数，仅Lossy允许精度损失，SeparateAlpha写入独立透明度码流，LegacyHighpassPrediction启用旧版高通预测
-// Workers限制并发Goroutine上限（零值自动，负值报错），MaxOutputBytes零值采用64MiB，Scratch仅供行流式编码暂存独立透明度
+// ProfileLevel 表示JPEG XR码流与容器声明的档次及级别对
+type ProfileLevel struct {
+	Profile uint8
+	Level   uint8
+}
+
+// RenderingIntent 表示ICC色彩转换的渲染意图
+type RenderingIntent uint8
+
+// Subsampling 表示有损编码时可选的内部色度下采样模式
+type Subsampling uint8
+
+// EncodeOptions 指定编码格式、布局、精度、并发、元数据与资源上限，零值采用无损JXR及全部频带
+// TileSize以编码网格像素计且须为十六倍数，仅Lossy允许精度损失与Subsampling下采样，SeparateAlpha写入独立透明度码流
+// Profiles指定档次与级别声明，EXIF、XMP、IPTC为容器可选元数据字节；Workers零值自动，MaxOutputBytes零值采用64MiB
 type EncodeOptions struct {
 	Format                   Format
 	Layout                   Layout
 	Overlap                  Overlap
 	Orientation              Orientation
+	Subsampling              Subsampling
 	TileSize                 image.Point
 	HardTiles                bool
 	Lossy                    bool
@@ -200,6 +232,10 @@ type EncodeOptions struct {
 	Alpha                    *PlaneOptions
 	SeparateAlpha            bool
 	MirrorSeparateAlpha      bool
+	Profiles                 []ProfileLevel
+	EXIF                     []byte
+	XMP                      []byte
+	IPTC                     []byte
 	Scratch                  io.ReadWriteSeeker
 	MaxOutputBytes           uint64
 	Limits                   Limits
@@ -288,12 +324,13 @@ type Resolution struct {
 	Y float64
 }
 
-// Info 保存方向变换后的图像范围、像素格式及颜色信息
-// Channels不含透明度，Premultiplied保持原样不解除预乘，Linear表示扩展范围数值格式，ColorSpace单独说明颜色解释
-// ICCProfile、ColorHint及ColorEncoding保留文件颜色元数据，独立码流不携带这些字段
+// Info 保存图像范围、像素格式、原始方向及颜色与容器元数据
+// Channels不含透明度，Premultiplied保持原样不解除预乘，Linear表示扩展范围数值格式，Orientation为原始声明方向
+// ICCProfile、ColorHint、ColorEncoding、EXIF、XMP及IPTC保留容器元数据，独立码流不携带这些字段
 type Info struct {
 	Format        Format
 	ImageType     ImageType
+	Orientation   Orientation
 	Bounds        image.Rectangle
 	PixelFormat   string
 	Channels      int
@@ -305,6 +342,9 @@ type Info struct {
 	Linear        bool
 	Resolution    Resolution
 	ICCProfile    []byte
+	EXIF          []byte
+	XMP           []byte
+	IPTC          []byte
 	Components    []ComponentInfo
 }
 
@@ -376,16 +416,26 @@ func (r *Raster) Info() Info {
 	return cloneInfo(r.info)
 }
 
-// cloneInfo 独立复制可变元数据，不共享ICC配置、颜色声明或分量描述
+// cloneBytes 按精确容量复制可选字节切片，空切片统一返回nil
+// 入参: src 原始字节切片
+// 返回: []byte 独立副本
+func cloneBytes(src []byte) []byte {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]byte, len(src))
+	copy(dst, src)
+	return dst
+}
+
+// cloneInfo 独立复制可变元数据，不共享ICC配置、容器元数据、颜色声明或分量描述
 // 入参: info 原信息
 // 返回: Info 独立元数据副本
 func cloneInfo(info Info) Info {
-	profile := info.ICCProfile
-	info.ICCProfile = nil
-	if len(profile) != 0 {
-		info.ICCProfile = make([]byte, len(profile))
-		copy(info.ICCProfile, profile)
-	}
+	info.ICCProfile = cloneBytes(info.ICCProfile)
+	info.EXIF = cloneBytes(info.EXIF)
+	info.XMP = cloneBytes(info.XMP)
+	info.IPTC = cloneBytes(info.IPTC)
 	info.Components = cloneComponentInfo(info.Components)
 	info.ColorEncoding = cloneColorEncoding(info.ColorEncoding)
 	return info
@@ -1026,7 +1076,7 @@ func normalizeRasterInfo(info *Info) error {
 	if info.Channels == 0 {
 		info.Channels = count
 	}
-	if count < 1 || count > rasterMaxComponents || info.Channels != count || info.Premultiplied && !info.Alpha || info.Format > FormatCodestream || info.ImageType&^3 != 0 {
+	if count < 1 || count > rasterMaxComponents || info.Channels != count || info.Premultiplied && !info.Alpha || info.Format > FormatCodestream || info.ImageType&^3 != 0 || info.Orientation > OrientationRotate90FlipXY {
 		return fmt.Errorf("%w: raster channels or format", ErrInvalid)
 	}
 	for _, resolution := range []float64{info.Resolution.X, info.Resolution.Y} {
@@ -1262,15 +1312,9 @@ func checkJXRColorMetadata(format jxrPixelFormat, hint ColorHint, encoding *Colo
 	if encoding == nil {
 		return nil
 	}
-	if format.color == 4 || format.color == 5 || format.color == 6 || format.color == 8 || format.depth != 1 && format.depth != 2 && format.depth != 3 && format.depth != 9 {
-		return fmt.Errorf("%w: JPEG XR PTM pixel format", ErrInvalid)
-	}
-	if format.color <= 3 && encoding.Matrix == 0 {
-		return fmt.Errorf("%w: JPEG XR luma color matrix", ErrInvalid)
-	}
-	if format.color == 7 {
+	if format.color == 7 || format.color == 8 {
 		switch encoding.Matrix {
-		case 1, 4, 5, 6, 7, 8, 9, 10, 14:
+		case 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17:
 			return fmt.Errorf("%w: JPEG XR RGB color matrix", ErrInvalid)
 		}
 	}
@@ -1278,11 +1322,11 @@ func checkJXRColorMetadata(format jxrPixelFormat, hint ColorHint, encoding *Colo
 }
 
 // jxrDisplayColorEncoding 选择标记文件PTM颜色声明，并保留无声明图像的基本显示策略
-// 入参: info 原始图像信息
+// 入参: info 原始图像信息, peakNits 可选HDR峰值亮度，零值采用标准标称峰值
 // 返回: jxrDisplayMapping 到sRGB的转换, error 当前显示颜色解释不受支持
-func jxrDisplayColorEncoding(info Info) (jxrDisplayMapping, error) {
+func jxrDisplayColorEncoding(info Info, peakNits float64) (jxrDisplayMapping, error) {
 	if info.ColorEncoding != nil {
-		if mapping, supported := jxrCICPDisplay(info, *info.ColorEncoding); supported {
+		if mapping, supported := jxrCICPDisplay(info, *info.ColorEncoding, peakNits); supported {
 			return mapping, nil
 		}
 		return jxrDisplayMapping{}, fmt.Errorf("%w: display CICP color interpretation", ErrUnsupported)
@@ -1481,8 +1525,8 @@ func jxrSampleInfo(format jxrPixelFormat, index int) ComponentInfo {
 // sampleBytes 返回单个原生样本的实际存储字节数，RGBE分量采用尾数及指数对
 // 返回: uint64 样本存储宽度
 func (s *jxrRasterSource) sampleBytes() uint64 {
-	number, opacity := s.container.format.number, s.opacityFormat().number
-	if number == jxrFixed32 || number == jxrFloat || opacity == jxrFixed32 || opacity == jxrFloat {
+	number := s.container.format.number
+	if number == jxrFixed32 || number == jxrFloat {
 		return 4
 	}
 	return 2

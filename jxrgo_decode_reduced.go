@@ -28,8 +28,8 @@ import (
 type jxrReducedRows struct {
 	low      *jxrLowGridRows
 	half     *jxrReconstructedRows
-	geometry [17]jxrLowGrid
-	offsets  [17]int
+	geometry []jxrLowGrid
+	offsets  []int
 	cache    [2][]int64
 	count    int
 	height   int
@@ -76,8 +76,6 @@ type jxrLowGrid struct {
 	yStep      int
 	xCenter    float64
 	yCenter    float64
-	xKnown     bool
-	yKnown     bool
 	dc         bool
 	longWord   bool
 }
@@ -85,7 +83,7 @@ type jxrLowGrid struct {
 // jxrLowGridRows 将一次低频熵遍历的固定邻行结果逐行投影到粗代表值网格，描述数组原地复用
 type jxrLowGridRows struct {
 	inverse *jxrLowInverseRows
-	primary [16]jxrLowGrid
+	primary []jxrLowGrid
 	alpha   [1]jxrLowGrid
 	divisor int
 }
@@ -221,13 +219,11 @@ func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster
 			if err := checkJXRModelComponents(p); err != nil {
 				return nil, err
 			}
-			if p.channels > 1 && (p.color == 1 || p.color == 2) && !p.chromaPhasesKnown() {
-				return nil, fmt.Errorf("%w: reduced chroma sample position", ErrUnsupported)
-			}
 		}
 	}
 	remaining := min(d.limits.MaxMemoryBytes, uint64(^uint(0)>>1))
-	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), uint64(cap(d.info.ICCProfile)), 4096 + uint64(len(d.info.Components))*128} {
+	metadataExtra := uint64(cap(d.info.ICCProfile)) + uint64(cap(d.info.EXIF)) + uint64(cap(d.info.XMP)) + uint64(cap(d.info.IPTC))
+	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), metadataExtra, 4096 + uint64(len(d.info.Components))*128} {
 		if amount > remaining {
 			return nil, fmt.Errorf("%w: reduced retained storage", ErrLimit)
 		}
@@ -270,10 +266,23 @@ func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster
 	}
 	h := &source.primary.header
 	width, height := (int(h.width)+divisor-1)/divisor, (int(h.height)+divisor-1)/divisor
-	var positions [2][17]int
-	var values [16]int64
-	var codes [16]uint32
-	opacityNumber := source.opacityFormat().number
+	channels := max(3, source.primary.primary.channels, info.Channels)
+	var posStorage [2][17]int
+	var valStorage [16]int64
+	var codeStorage [16]uint32
+	positions := [2][]int{posStorage[0][:], posStorage[1][:]}
+	for i, r := range readers {
+		if r != nil && r.count > len(positions[i]) {
+			positions[i] = make([]int, r.count)
+		}
+	}
+	values, codes := valStorage[:], codeStorage[:]
+	if channels > len(values) {
+		values, codes = make([]int64, channels), make([]uint32, channels)
+	} else {
+		values, codes = values[:channels], codes[:channels]
+	}
+	opacityNumber := source.container.format.number
 	for y := range height {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -331,10 +340,7 @@ func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster
 				if source.alpha != nil {
 					stream, reader, pass = source.alpha, readers[1], 1
 				}
-				component, plane, embedded := stream.primary.channels, stream.alpha, stream.alpha != nil
-				if !embedded {
-					component, plane = 0, &stream.primary
-				}
+				component, plane := stream.primary.channels, stream.alpha
 				ax, _, err := reader.position(component, float64(stream.header.left)+visibleX, float64(stream.header.top)+visibleY)
 				if err != nil {
 					return nil, err
@@ -344,7 +350,7 @@ func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster
 					return nil, err
 				}
 				alphaValues, alphaCodes := [1]int64{value}, [1]uint32{}
-				if _, err := jxrRasterBitsComponents(&stream.header, plane, opacityNumber, alphaValues[:], embedded, alphaCodes[:]); err != nil {
+				if _, err := jxrRasterBitsComponents(&stream.header, plane, opacityNumber, alphaValues[:], true, alphaCodes[:]); err != nil {
 					return nil, err
 				}
 				output.planes[count].storeBits(at, alphaCodes[0])
@@ -376,13 +382,15 @@ func jxrReducedRowWork(source *jxrStream, divisor int) uint64 {
 		return ^uint64(0)
 	}
 	perMacro := uint64(0)
+	totalChannels := uint64(0)
 	for _, plane := range [2]*jxrPlane{&source.primary, source.alpha} {
 		if plane == nil {
 			continue
 		}
-		if plane.channels < 1 || plane.channels > 16 {
+		if plane.channels < 1 || plane.channels > rasterMaxComponents {
 			return ^uint64(0)
 		}
+		totalChannels += uint64(plane.channels)
 		for component := range plane.channels {
 			cells := uint64(1)
 			if divisor != 16 {
@@ -397,14 +405,21 @@ func jxrReducedRowWork(source *jxrStream, divisor int) uint64 {
 			perMacro += cells
 		}
 	}
-	width := uint64(source.header.columns[len(source.header.columns)-1])
-	if perMacro == 0 || width > (^uint64(0)-work-4096)/16/perMacro {
+	overhead := uint64(4096)
+	if totalChannels > 17 {
+		overhead += totalChannels * 128
+	}
+	if work > ^uint64(0)-overhead {
 		return ^uint64(0)
 	}
-	return work + 4096 + width*perMacro*16
+	width := uint64(source.header.columns[len(source.header.columns)-1])
+	if perMacro == 0 || width > (^uint64(0)-work-overhead)/16/perMacro {
+		return ^uint64(0)
+	}
+	return work + overhead + width*perMacro*16
 }
 
-// newJXRReducedRows 预检总额度后建立必要频带的重建游标及两行缓存，保留未知相位而不自行补中心
+// newJXRReducedRows 预检总额度后建立必要频带的重建游标及两行缓存
 // 入参: ctx Context, data 可选原始流切片, source 完整流, divisor 缩减分母, maximum 总阶段额度
 // 返回: *jxrReducedRows 固定邻行缓存, error 资源、结构、能力或取消错误
 func newJXRReducedRows(ctx context.Context, data []byte, source *jxrStream, divisor int, maximum uint64) (*jxrReducedRows, error) {
@@ -423,7 +438,11 @@ func newJXRReducedRows(ctx context.Context, data []byte, source *jxrStream, divi
 	if err != nil {
 		return nil, err
 	}
-	r := &jxrReducedRows{low: low, height: int(source.header.rows[len(source.header.rows)-1])}
+	totalChannels := source.primary.channels
+	if source.alpha != nil {
+		totalChannels += source.alpha.channels
+	}
+	r := &jxrReducedRows{low: low, height: int(source.header.rows[len(source.header.rows)-1]), geometry: make([]jxrLowGrid, totalChannels), offsets: make([]int, totalChannels)}
 	coeff := &low.inverse.rows.image
 	samples := 0
 	for _, c := range [2]*jxrCoefficients{&coeff.primary, coeff.alpha} {
@@ -443,7 +462,11 @@ func newJXRReducedRows(ctx context.Context, data []byte, source *jxrStream, divi
 			r.count++
 		}
 	}
-	if uint64(samples)*16+4096 > work-lowWork {
+	overhead := uint64(4096)
+	if totalChannels > 17 {
+		overhead += uint64(totalChannels) * 128
+	}
+	if uint64(samples)*16+overhead > work-lowWork {
 		return nil, fmt.Errorf("%w: reduced representative storage accounting", ErrInvalid)
 	}
 	for i := range r.cache {
@@ -504,15 +527,12 @@ func (r *jxrReducedRows) ensure(ctx context.Context, row int) error {
 
 // position 根据原编码支持中心选择最近粗样点，平局选较大坐标，图外采用端点延拓
 // 入参: component 实际内部颜色或透明度分量, x, y 原编码坐标
-// 返回: int 粗列坐标, int 粗行坐标, error 分量或未知相位错误
+// 返回: int 粗列坐标, int 粗行坐标, error 分量序号错误
 func (r *jxrReducedRows) position(component int, x, y float64) (int, int, error) {
 	if component < 0 || component >= r.count {
 		return 0, 0, fmt.Errorf("%w: reduced representative component", ErrInvalid)
 	}
 	v := &r.geometry[component]
-	if !v.xKnown || !v.yKnown {
-		return 0, 0, fmt.Errorf("%w: reduced representative requires known phase", ErrUnsupported)
-	}
 	px := int(math.Floor((x-v.xCenter)/float64(v.xStep) + 0.5))
 	py := int(math.Floor((y-v.yCenter)/float64(v.yStep) + 0.5))
 	return min(v.width-1, max(0, px)), min(r.height*v.height-1, max(0, py)), nil
@@ -555,14 +575,16 @@ func newJXRLowFrequencyPlan(ctx context.Context, source *jxrStream, bands int, m
 	if work > maximum || uint64(len(source.packets)) > (maximum-work)/8 || 256 > maximum-work-uint64(len(source.packets))*8 {
 		return nil, fmt.Errorf("%w: low frequency packet directory budget", ErrLimit)
 	}
-	physical := make([]uint64, len(source.packets))
+	physical := make([]uint64, 0, len(source.packets))
 	for index, offset := range source.packets {
 		if index&1023 == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
-		physical[index] = offset
+		if offset != jxrPacketEscape {
+			physical = append(physical, offset)
+		}
 	}
 	slices.Sort(physical)
 	if err := ctx.Err(); err != nil {
@@ -579,7 +601,7 @@ func (p *jxrLowFrequencyPlan) packet(ctx context.Context, data []byte, index int
 		return jxrBits{}, err
 	}
 	s := p.source
-	if index < 0 || index >= len(s.packets) {
+	if index < 0 || index >= len(s.packets) || s.packets[index] == jxrPacketEscape {
 		return jxrBits{}, fmt.Errorf("%w: low frequency packet index", ErrInvalid)
 	}
 	length := uint64(len(data))
@@ -816,23 +838,21 @@ func (c *jxrCoefficients) lowGridViews(h *jxrHeader, divisor int, storage []jxrL
 	}
 	for i := range views {
 		sx, sy, bw, bh := 1, 1, 4, 4
-		phaseX, phaseY, knownX, knownY := 0.0, 0.0, true, true
+		phaseX, phaseY := 0.0, 0.0
 		if i > 0 && (c.plane.color == 1 || c.plane.color == 2) {
 			chromaX, chromaY := c.plane.chromaPhase(i)
-			sx, bw = 2, 2
-			knownX = chromaX <= 4
-			if knownX {
+			sx, bw, phaseX = 2, 2, 0.5
+			if chromaX <= 4 {
 				phaseX = float64(chromaX) / 4
 			}
 			if c.plane.color == 1 {
-				sy, bh = 2, 2
-				knownY = chromaY <= 4
-				if knownY {
+				sy, bh, phaseY = 2, 2, 0.5
+				if chromaY <= 4 {
 					phaseY = float64(chromaY) / 4
 				}
 			}
 		}
-		v := jxrLowGrid{data: c.low, columns: int(columns), blockWidth: bw, stride: int(stride), offset: i * 16, gain: 1, longWord: h.longWord, xKnown: knownX, yKnown: knownY}
+		v := jxrLowGrid{data: c.low, columns: int(columns), blockWidth: bw, stride: int(stride), offset: i * 16, gain: 1, longWord: h.longWord}
 		if divisor == 16 {
 			v.dc, v.group, v.blockRows, v.shift = true, 1, 1, 4
 			v.width, v.height = int(columns), int(rows)
@@ -901,11 +921,15 @@ func jxrLowGridRowWork(source *jxrStream, divisor int) uint64 {
 	if divisor == 16 {
 		bands = 1
 	}
+	overhead := uint64(4096)
+	if source.primary.channels > 16 {
+		overhead += uint64(source.primary.channels) * 128
+	}
 	work := jxrLowInverseRowWork(source, bands)
-	if work > ^uint64(0)-4096 {
+	if work > ^uint64(0)-overhead {
 		return ^uint64(0)
 	}
-	return work + 4096
+	return work + overhead
 }
 
 // newJXRLowGridRows 在任何输入读取前预留全部阶段工作额度，粗网格中心仍采用原编码坐标
@@ -921,7 +945,7 @@ func newJXRLowGridRows(ctx context.Context, data []byte, source *jxrStream, divi
 	if source == nil {
 		return nil, fmt.Errorf("%w: reduced row source", ErrInvalid)
 	}
-	if source.primary.channels > 16 || source.alpha != nil && source.alpha.channels > 1 {
+	if source.primary.channels < 1 || source.primary.channels > rasterMaxComponents || source.alpha != nil && source.alpha.channels > 1 {
 		return nil, fmt.Errorf("%w: reduced row component capacity", ErrLimit)
 	}
 	if jxrLowGridRowWork(source, divisor) > min(maximum, uint64(^uint(0)>>1)) {
@@ -931,11 +955,15 @@ func newJXRLowGridRows(ctx context.Context, data []byte, source *jxrStream, divi
 	if divisor == 16 {
 		bands = 1
 	}
-	inverse, err := newJXRLowInverseRows(ctx, data, source, bands, maximum-4096)
+	overhead := uint64(4096)
+	if source.primary.channels > 16 {
+		overhead += uint64(source.primary.channels) * 128
+	}
+	inverse, err := newJXRLowInverseRows(ctx, data, source, bands, maximum-overhead)
 	if err != nil {
 		return nil, err
 	}
-	return &jxrLowGridRows{inverse: inverse, divisor: divisor}, ctx.Err()
+	return &jxrLowGridRows{inverse: inverse, primary: make([]jxrLowGrid, source.primary.channels), divisor: divisor}, ctx.Err()
 }
 
 // next 交出一个宏块行内的粗网格借用视图，下一次调用会覆盖系数及描述，透明度与主平面同步
@@ -991,7 +1019,11 @@ func newJXRHalfReducedRows(ctx context.Context, data []byte, source *jxrStream, 
 	if err != nil {
 		return nil, err
 	}
-	r := &jxrReducedRows{half: rows, height: rows.height}
+	totalChannels := source.primary.channels
+	if source.alpha != nil {
+		totalChannels += source.alpha.channels
+	}
+	r := &jxrReducedRows{half: rows, height: rows.height, geometry: make([]jxrLowGrid, totalChannels), offsets: make([]int, totalChannels)}
 	columns := int(source.header.columns[len(source.header.columns)-1])
 	samples := 0
 	for _, p := range [2]*jxrPlane{&source.primary, source.alpha} {
@@ -1003,27 +1035,31 @@ func newJXRHalfReducedRows(ctx context.Context, data []byte, source *jxrStream, 
 		}
 		for c := range p.channels {
 			sx, sy := 1, 1
-			phaseX, phaseY, knownX, knownY := 0.0, 0.0, true, true
+			phaseX, phaseY := 0.0, 0.0
 			if c > 0 && (p.color == 1 || p.color == 2) {
 				chromaX, chromaY := p.chromaPhase(c)
-				sx, knownX = 2, chromaX <= 4
-				if knownX {
+				sx, phaseX = 2, 0.5
+				if chromaX <= 4 {
 					phaseX = float64(chromaX) / 4
 				}
 				if p.color == 1 {
-					sy, knownY = 2, chromaY <= 4
-					if knownY {
+					sy, phaseY = 2, 0.5
+					if chromaY <= 4 {
 						phaseY = float64(chromaY) / 4
 					}
 				}
 			}
-			v := jxrLowGrid{width: columns * 8 / sx, height: 8 / sy, xStep: 2 * sx, yStep: 2 * sy, xCenter: float64(sx)/2 + phaseX, yCenter: float64(sy)/2 + phaseY, xKnown: knownX, yKnown: knownY}
+			v := jxrLowGrid{width: columns * 8 / sx, height: 8 / sy, xStep: 2 * sx, yStep: 2 * sy, xCenter: float64(sx)/2 + phaseX, yCenter: float64(sy)/2 + phaseY}
 			r.geometry[r.count], r.offsets[r.count] = v, samples
 			samples += v.width * v.height
 			r.count++
 		}
 	}
-	if uint64(samples)*16+4096 > work-base {
+	overhead := uint64(4096)
+	if totalChannels > 17 {
+		overhead += uint64(totalChannels) * 128
+	}
+	if uint64(samples)*16+overhead > work-base {
 		return nil, fmt.Errorf("%w: half reduced storage accounting", ErrInvalid)
 	}
 	for i := range r.cache {
@@ -1049,7 +1085,7 @@ func (r *jxrReducedRows) readHalf(ctx context.Context) error {
 		if plane == nil {
 			continue
 		}
-		views := plane.componentViewsStorage(&coeff.header, true, storage[component:component])
+		views := plane.componentViewsStorage(&coeff.header, true, storage[:])
 		for _, v := range views {
 			geometry := &r.geometry[component]
 			first := int(coeff.header.top) / (geometry.yStep / 2)

@@ -23,6 +23,9 @@ import (
 // jxrCoefficientLimit 限制有符号整数重建的计算容量，为后续变换保留运算余量
 const jxrCoefficientLimit int64 = 1 << 50
 
+// jxrPacketEscape 标记索引表中以VLW_ESC显式省略的频率模式精细位包
+const jxrPacketEscape = ^uint64(0)
+
 // jxrOutputDepth 保存允许的逐输出颜色位深组合
 var jxrOutputDepth = [9]uint16{
 	1<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<6 | 1<<7 | 1<<15,
@@ -168,10 +171,11 @@ func (parser *jxrParser) streamReader(b jxrBits, maxPixels uint64) (jxrStream, e
 // 返回: jxrStream 完整码流索引, error 数据、读取、能力或资源错误
 func (parser *jxrParser) streamIndex(b jxrBits, s jxrStream) (jxrStream, error) {
 	var err error
-	count := uint64(len(s.header.columns)-1) * uint64(len(s.header.rows)-1)
+	bands := uint64(1)
 	if s.header.frequency {
-		count *= uint64(4 - s.primary.bands)
+		bands = uint64(4 - s.primary.bands)
 	}
+	count := uint64(len(s.header.columns)-1) * uint64(len(s.header.rows)-1) * bands
 	if count > uint64(^uint(0)>>1)/8 {
 		return s, &LimitError{Resource: "JPEG XR packet index budget", Limit: uint64(^uint(0)>>1) / 8, Required: count}
 	}
@@ -198,15 +202,31 @@ func (parser *jxrParser) streamIndex(b jxrBits, s jxrStream) (jxrStream, error) 
 					return s, err
 				}
 			}
-			s.packets[i] = b.variableWord()
+			value, escape := b.variableWord()
 			if b.err != nil {
 				return s, b.err
 			}
+			switch {
+			case escape == 0:
+				if value == jxrPacketEscape {
+					return s, fmt.Errorf("%w: JPEG XR packet offset", ErrInvalid)
+				}
+			case escape == 0xfe && i == 0:
+				value = 0
+			case s.header.frequency && uint64(i)%bands == 3:
+				value = jxrPacketEscape
+			default:
+				return s, fmt.Errorf("%w: JPEG XR escaped packet offset", ErrInvalid)
+			}
+			s.packets[i] = value
 		}
 	}
-	subsequent := b.variableWord()
+	subsequent, escape := b.variableWord()
 	if b.err != nil {
 		return s, b.err
+	}
+	if escape != 0 {
+		return s, fmt.Errorf("%w: JPEG XR escaped subsequent header bytes", ErrInvalid)
 	}
 	if subsequent > b.length()-b.bit/8 {
 		return s, fmt.Errorf("%w: JPEG XR subsequent header bytes", ErrInvalid)
@@ -228,14 +248,62 @@ func (parser *jxrParser) streamIndex(b jxrBits, s jxrStream) (jxrStream, error) 
 				return s, err
 			}
 		}
-		if offset > b.length()-s.dataStart || b.length()-s.dataStart-offset < 4 {
+		if offset == jxrPacketEscape {
+			continue
+		}
+		if offset > b.length()-s.dataStart {
+			return s, fmt.Errorf("%w: JPEG XR packet offset", ErrInvalid)
+		}
+		if (!s.header.frequency || uint64(index)%bands != 3) && b.length()-s.dataStart-offset < 4 {
 			return s, fmt.Errorf("%w: JPEG XR packet offset", ErrInvalid)
 		}
 	}
+	jxrNormalizeEmptyFlexPackets(&s, b.length())
 	if err := s.checkProfile(); err != nil {
 		return s, err
 	}
 	return s, nil
+}
+
+// jxrNormalizeEmptyFlexPackets 将频率模式中物理长度不足四字节的精细位包统一标记为逃逸空包
+// 入参: s 已校验包偏移的码流头, length 码流总字节数
+func jxrNormalizeEmptyFlexPackets(s *jxrStream, length uint64) {
+	if !s.header.frequency || s.primary.bands != 0 || len(s.packets) < 4 {
+		return
+	}
+	var stack [64]uint64
+	sorted := stack[:0]
+	if len(s.packets) > len(stack) {
+		sorted = make([]uint64, 0, len(s.packets))
+	}
+	for _, offset := range s.packets {
+		if offset != jxrPacketEscape {
+			sorted = append(sorted, offset)
+		}
+	}
+	slices.Sort(sorted)
+	for index := 3; index < len(s.packets); index += 4 {
+		offset := s.packets[index]
+		if offset == jxrPacketEscape {
+			continue
+		}
+		if length-s.dataStart-offset < 4 {
+			s.packets[index] = jxrPacketEscape
+			continue
+		}
+		lo, hi := 0, len(sorted)
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if sorted[mid] < offset {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo+1 < len(sorted) && sorted[lo+1]-offset < 4 {
+			s.packets[index] = jxrPacketEscape
+		}
+	}
 }
 
 // reserve 在新增解析存储分配前检查剩余预算及累计地址容量，失败时不增加已保留容量
@@ -611,6 +679,8 @@ func writeJXRStreamHeader(b *jxrBitWriter, s *jxrStream, maxPixels uint64, wideI
 				b.write(0xfc, 8)
 				b.write(uint32(offset>>32), 32)
 				b.write(uint32(offset), 32)
+			} else if offset == jxrPacketEscape {
+				b.write(0xff, 8)
 			} else {
 				b.variableWord(offset)
 			}
@@ -647,6 +717,15 @@ func checkJXRStreamOutput(s *jxrStream, maxPixels uint64) error {
 	if uint64(len(s.packets)) != count || count == 1 && s.packets[0] != 0 {
 		return fmt.Errorf("%w: JPEG XR output packet index", ErrInvalid)
 	}
+	bands := uint64(1)
+	if h.frequency {
+		bands = uint64(4 - s.primary.bands)
+	}
+	for index, offset := range s.packets {
+		if offset == jxrPacketEscape && (!h.frequency || uint64(index)%bands != 3) {
+			return fmt.Errorf("%w: JPEG XR output escaped packet index", ErrInvalid)
+		}
+	}
 	if err := checkJXRProfileDeclarations(s.profiles); err != nil {
 		return err
 	}
@@ -681,18 +760,6 @@ func (p *jxrPlane) chromaPhase(component int) (uint8, uint8) {
 		return phase[0], phase[1]
 	}
 	return p.chromaX, p.chromaY
-}
-
-// chromaPhasesKnown 检查两个色度分量的全部子采样轴是否有明确相位
-// 返回: bool 色度采样相位是否均已明确
-func (p *jxrPlane) chromaPhasesKnown() bool {
-	for _, component := range [...]int{1, 2} {
-		x, y := p.chromaPhase(component)
-		if x > 4 || p.color == 1 && y > 4 {
-			return false
-		}
-	}
-	return true
 }
 
 // readJXRPlane 读取有界图像平面头，透明度平面独立校验而不沿用主平面的颜色参数

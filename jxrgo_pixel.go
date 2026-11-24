@@ -882,7 +882,7 @@ func (s *jxrRasterSource) decodeSubsampled(ctx context.Context, state *jxrCoeffi
 	}
 	info := s.info()
 	raster := &Raster{info: info, planes: make([]imageComponents, len(info.Components))}
-	opacityNumber := s.opacityFormat().number
+	opacityNumber := s.container.format.number
 	for index, component := range info.Components {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -972,10 +972,20 @@ func jxrSamplePosition(position, length int, centering uint8) (int, int, int64) 
 	return k, min(length-1, k+1), 4 - int64(centering)
 }
 
+// jxrEffectiveOffset 返回分量采样偏移，未知色度相位按ITU-T T.832默认居中相位计算
+// 入参: offset 声明采样偏移, step 采样步长, known 位置是否明确
+// 返回: float64 有效采样偏移
+func jxrEffectiveOffset(offset float64, step uint8, known bool) float64 {
+	if known {
+		return offset
+	}
+	return float64(step-1) * 0.5
+}
+
 // Resample 将原生分量重采样到指定尺寸的完整采样网格并同步调整分辨率，保持颜色空间、ICC与预乘状态，opts为nil默认最近邻
-// 边界采用端点延拓，未知分量相位、RGBE双线性及双线性非有限插值返回错误，返回独立新图像
+// 边界采用端点延拓，未知色度相位按标准居中相位处理，RGBE双线性及双线性非有限插值返回错误，返回独立新图像
 // 入参: ctx Context，nil采用Background, size 输出可见尺寸, opts 滤波及输出限制
-// 返回: *Raster 独立完整采样原生图像, error 参数、相位、能力、数值、资源或取消错误
+// 返回: *Raster 独立完整采样原生图像, error 参数、能力、数值、资源或取消错误
 func (r *Raster) Resample(ctx context.Context, size image.Point, opts *ResampleOptions) (*Raster, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1012,9 +1022,6 @@ func (r *Raster) resample(ctx context.Context, size image.Point, opts *ResampleO
 		return nil, &LimitError{Resource: "max pixels", Limit: limits.MaxPixels, Required: jxrSaturatedMul(uint64(size.X), uint64(size.Y)), Detail: "resampling output pixels"}
 	}
 	for _, component := range r.info.Components {
-		if !component.XPositionKnown || !component.YPositionKnown {
-			return nil, fmt.Errorf("%w: resampling requires known sample positions", ErrUnsupported)
-		}
 		if filter == ResampleBilinear && component.Format == SampleRGBE {
 			return nil, fmt.Errorf("%w: bilinear resampling sample encoding", ErrUnsupported)
 		}
@@ -1040,11 +1047,13 @@ func (r *Raster) resample(ctx context.Context, size image.Point, opts *ResampleO
 		if err != nil {
 			return nil, err
 		}
+		offsetX := jxrEffectiveOffset(source.info.XOffset, source.info.XStep, source.info.XPositionKnown)
+		offsetY := jxrEffectiveOffset(source.info.YOffset, source.info.YStep, source.info.YPositionKnown)
 		for y := range size.Y {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			y0, y1, fy := resampleJXRAxis(y, size.Y, r.Bounds().Dy(), source.info.Bounds.Dy(), source.info.YOffset, source.info.YStep)
+			y0, y1, fy := resampleJXRAxis(y, size.Y, r.Bounds().Dy(), source.info.Bounds.Dy(), offsetY, source.info.YStep)
 			if filter == ResampleNearest && fy >= 0.5 {
 				y0 = y1
 			}
@@ -1054,7 +1063,7 @@ func (r *Raster) resample(ctx context.Context, size image.Point, opts *ResampleO
 						return nil, err
 					}
 				}
-				x0, x1, fx := resampleJXRAxis(x, size.X, r.Bounds().Dx(), source.info.Bounds.Dx(), source.info.XOffset, source.info.XStep)
+				x0, x1, fx := resampleJXRAxis(x, size.X, r.Bounds().Dx(), source.info.Bounds.Dx(), offsetX, source.info.XStep)
 				if filter == ResampleNearest {
 					if fx >= 0.5 {
 						x0 = x1

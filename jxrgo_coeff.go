@@ -264,6 +264,27 @@ func newJXRCoefficients(plane *jxrPlane, count int, longWord bool) jxrCoefficien
 	return jxrCoefficients{plane: *plane, longWord: longWord, low: make([]int64, count*plane.channels*16), high: make([]int64, count*plane.channels*256), info: make([]jxrMacroInfo, count)}
 }
 
+// jxrEmptyFlexPacket 判断频率模式精细位包是否因逃逸值或不足四字节而为空包
+// 入参: s 已校验码流头, data 独立码流, index 逻辑包编号
+// 返回: bool 为空精细位包时为真
+func jxrEmptyFlexPacket(s *jxrStream, data []byte, index int) bool {
+	offset := s.packets[index]
+	if offset == jxrPacketEscape {
+		return true
+	}
+	length := uint64(len(data))
+	if s.input != nil {
+		length = s.input.size
+	}
+	if s.dataStart > length || offset > length-s.dataStart || length-s.dataStart-offset < 4 {
+		return true
+	}
+	if index+1 < len(s.packets) && s.packets[index+1] != jxrPacketEscape && s.packets[index+1] >= offset && s.packets[index+1]-offset < 4 {
+		return true
+	}
+	return false
+}
+
 // jxrPacketReader 按已校验的包偏移定位并返回码流位读取器
 // 入参: data 独立码流, s 已校验的码流头, index 包编号
 // 返回: jxrBits 包起点读取器
@@ -533,13 +554,21 @@ func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		b := jxrPacketReader(data, s, tile*count+band)
-		packet, err := readJXRPacket(&b, s, band, &q)
-		if err != nil {
-			return err
-		}
-		if !packet.valid {
+		var b jxrBits
+		var packet jxrPacket
+		var err error
+		packetIndex := tile*count + band
+		if band == 3 && jxrEmptyFlexPacket(s, data, packetIndex) {
 			packet.trim = 15
+		} else {
+			b = jxrPacketReader(data, s, packetIndex)
+			packet, err = readJXRPacket(&b, s, band, &q)
+			if err != nil {
+				return err
+			}
+			if !packet.valid {
+				packet.trim = 15
+			}
 		}
 		for _, row := range rows {
 			if row != nil {
@@ -600,9 +629,11 @@ func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, 
 				}
 			}
 		}
-		b.align(true)
-		if b.err != nil {
-			return b.err
+		if packet.valid {
+			b.align(true)
+			if b.err != nil {
+				return b.err
+			}
 		}
 	}
 	return nil
@@ -769,6 +800,10 @@ func readJXRPacket(b *jxrBits, s *jxrStream, band int, q *[2]jxrTileQuant) (jxrP
 	var packet jxrPacket
 	if band < -1 || band > 3 || s.header.frequency != (band >= 0) {
 		return packet, fmt.Errorf("%w: JPEG XR packet band", ErrInvalid)
+	}
+	if band == 3 && (b.bit/8 > b.length() || b.length()-b.bit/8 < 4) {
+		packet.trim = 15
+		return packet, nil
 	}
 	start := b.read(24)
 	_ = b.read(8)

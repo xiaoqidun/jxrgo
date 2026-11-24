@@ -274,6 +274,9 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	if err != nil {
 		return nil, err
 	}
+	if d.keepOrientation {
+		source.container.transform = 0
+	}
 	info, err := parser.info(&source)
 	if err != nil {
 		return nil, err
@@ -283,9 +286,9 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	extra := uint64(0)
 	if d.fileInput != nil {
 		limits.MaxMemoryBytes -= input - uint64(cap(d.data)) - jxrReaderAtWork
-		extra = uint64(cap(container.profile))
+		extra = uint64(cap(container.profile)) + uint64(cap(container.exif)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc))
 	}
-	selected := &Decoder{data: d.data, source: source, info: info, limits: limits, fileInput: d.fileInput, inputExtra: extra, legacyHighpassPrediction: d.legacyHighpassPrediction}
+	selected := &Decoder{data: d.data, source: source, info: info, limits: limits, fileInput: d.fileInput, inputExtra: extra, legacyHighpassPrediction: d.legacyHighpassPrediction, keepOrientation: d.keepOrientation}
 	selected.setWorkers(d.workers)
 	selected.bindInputContext(nil)
 	return selected, nil
@@ -507,7 +510,7 @@ func writeJXRFileImageTo(ctx context.Context, w io.WriteSeeker, raster *Raster, 
 			return 0, 0, sourceErr
 		}
 		output.stream.maxBytes = min(output.stream.maxBytes, maximum-start+8)
-		end, link, err = writeJXRFileAt(ctx, w, raster.info, &layout, output.stream, retained, start, func(settings jxrStreamOutput) error {
+		end, link, err = writeJXRFileAt(ctx, w, jxrWithContainerMetadata(raster.info, options), &layout, output.stream, retained, start, func(settings jxrStreamOutput) error {
 			return encodeJXRCodestreamTo(ctx, w, raster, layout, settings)
 		})
 	}

@@ -55,6 +55,7 @@ type jxrICCTransform struct {
 	matrix   [3][3]float64
 	channels int
 	grayLab  bool
+	extended bool
 	lut      *jxrICCLUT
 	floating *jxrICCFloatTransform
 }
@@ -154,13 +155,16 @@ type jxrICCStageLayout struct {
 	count   int
 }
 
-// jxrReadICCTransform 在预算内读取ICC设备到PCS的矩阵曲线或查表转换
-// 入参: ctx 已规范化Context, profile 原始ICC, info 解码分量, maximum 活动工作内存
+// jxrReadICCTransform 在预算内按指定渲染意图读取ICC设备到PCS的矩阵曲线、整数查表或浮点转换
+// 入参: ctx 已规范化Context, profile 原始ICC, info 解码分量, maximum 活动工作内存, intent 渲染意图
 // 返回: jxrICCTransform 转换, error 配置格式、转换能力、资源或取消错误
-func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum uint64) (jxrICCTransform, error) {
+func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum uint64, intent RenderingIntent) (jxrICCTransform, error) {
 	var result jxrICCTransform
 	if err := ctx.Err(); err != nil {
 		return result, err
+	}
+	if intent > IntentSaturation {
+		return result, fmt.Errorf("%w: ICC rendering intent", ErrInvalid)
 	}
 	profile, err := jxrICCProfileView(profile)
 	if err != nil {
@@ -195,8 +199,9 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 		return jxrICCTransform{}, fmt.Errorf("%w: ICC media white point", ErrInvalid)
 	}
 	available := maximum - uint64(len(tags))*16
+	d2bTag, a2bPrimary, a2bFallback := jxrICCIntentTags(intent)
 	if profile[8] == 4 {
-		if data := jxrICCData(profile, tags, 0x44324231); data != nil {
+		if data := jxrICCData(profile, tags, d2bTag); data != nil {
 			result.floating, err = jxrReadICCFloatTransform(ctx, data, result.channels, pcs == "Lab ", available)
 			if err == nil {
 				result.matrix = jxrICCXYZToSRGB()
@@ -207,39 +212,67 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 			}
 		}
 	}
-	if !unsigned {
-		return jxrICCTransform{}, fmt.Errorf("%w: ICC extended samples require a floating-point transform", ErrUnsupported)
-	}
-	for _, id := range [...]uint32{0x41324231, 0x41324230} {
-		if data := jxrICCData(profile, tags, id); data != nil {
-			result.lut, err = jxrReadICCLUT(data, result.channels, pcs == "Lab ", available)
-			if err != nil {
-				return jxrICCTransform{}, err
+	if unsigned {
+		for _, id := range [...]uint32{a2bPrimary, a2bFallback} {
+			if id == 0 {
+				continue
 			}
-			result.matrix = jxrICCXYZToSRGB()
-			return result, ctx.Err()
+			if data := jxrICCData(profile, tags, id); data != nil {
+				result.lut, err = jxrReadICCLUT(data, result.channels, pcs == "Lab ", available)
+				if err != nil {
+					return jxrICCTransform{}, err
+				}
+				result.matrix = jxrICCXYZToSRGB()
+				return result, ctx.Err()
+			}
 		}
 	}
 	if class == "spac" || device != "GRAY" && (device != "RGB " || pcs != "XYZ " || class == "prtr") {
 		return jxrICCTransform{}, fmt.Errorf("%w: ICC profile transform", ErrUnsupported)
 	}
 	result.grayLab = pcs == "Lab "
+	result.extended = !unsigned
 	if result.channels == 1 {
-		result.curves[0], err = jxrReadICCCurve(jxrICCData(profile, tags, 0x6b545243))
+		data := jxrICCData(profile, tags, 0x6b545243)
+		if data == nil && !unsigned {
+			return jxrICCTransform{}, fmt.Errorf("%w: ICC extended samples require a floating-point or TRC transform", ErrUnsupported)
+		}
+		result.curves[0], err = jxrReadICCCurve(data)
 		return result, err
 	}
 	for col, id := range [...]uint32{0x72545243, 0x67545243, 0x62545243} {
-		result.curves[col], err = jxrReadICCCurve(jxrICCData(profile, tags, id))
+		data := jxrICCData(profile, tags, id)
+		if data == nil && !unsigned {
+			return jxrICCTransform{}, fmt.Errorf("%w: ICC extended samples require a floating-point or matrix-TRC transform", ErrUnsupported)
+		}
+		result.curves[col], err = jxrReadICCCurve(data)
 		if err != nil {
 			return jxrICCTransform{}, err
 		}
 	}
 	colorants, err := jxrICCColorants(profile, tags)
 	if err != nil {
+		if !unsigned && jxrICCData(profile, tags, 0x7258595a) == nil {
+			return jxrICCTransform{}, fmt.Errorf("%w: ICC extended samples require a floating-point or matrix-TRC transform", ErrUnsupported)
+		}
 		return jxrICCTransform{}, err
 	}
 	result.matrix = jxrICCsRGBMatrix(colorants)
 	return result, ctx.Err()
+}
+
+// jxrICCIntentTags 按ICC.1规范返回渲染意图对应的D2B与A2B标签签名及回退标签
+// 入参: intent 已校验的渲染意图
+// 返回: uint32 D2B标签, uint32 首选A2B标签, uint32 回退A2B标签，无需回退时为零
+func jxrICCIntentTags(intent RenderingIntent) (uint32, uint32, uint32) {
+	switch intent {
+	case IntentPerceptual:
+		return 0x44324230, 0x41324230, 0
+	case IntentSaturation:
+		return 0x44324232, 0x41324232, 0x41324230
+	default:
+		return 0x44324231, 0x41324231, 0x41324230
+	}
 }
 
 // jxrICCColorants 读取三个PCS XYZ色度矩阵列
@@ -286,6 +319,10 @@ func jxrICCDeviceChannels(device string, info Info) int {
 		}
 	case "RGB ":
 		if info.ColorSpace == ColorRGB || info.ColorSpace == ColorMultiChannel {
+			count = 3
+		}
+	case "YCbr":
+		if info.ColorSpace == ColorYCC || info.ColorSpace == ColorMultiChannel {
 			count = 3
 		}
 	case "CMYK":
@@ -418,16 +455,15 @@ func jxrICCXYZToSRGB() [3][3]float64 {
 	}
 }
 
-// color 应用ICC转换及目标sRGB传递函数
+// linearColor 应用ICC转换输出未裁剪的D65线性scRGB三通道
 // 入参: ctx Context, values 已解除预乘的源通道
-// 返回: float64 非预乘红、绿、蓝sRGB值, error 数值或取消错误
-func (transform *jxrICCTransform) color(ctx context.Context, values []float64) (float64, float64, float64, error) {
+// 返回: float64 线性红、绿、蓝scRGB值, error 数值或取消错误
+func (transform *jxrICCTransform) linearColor(ctx context.Context, values []float64) (float64, float64, float64, error) {
 	if transform.lut == nil && transform.floating == nil && transform.channels == 1 {
-		gray := transform.curves[0].value(values[0])
+		gray := transform.curves[0].eval(values[0], transform.extended)
 		if transform.grayLab {
 			gray = jxrICCLabInverse((100*gray + 16) / 116)
 		}
-		gray = displayLinear(gray)
 		return gray, gray, gray, nil
 	}
 	var linear [3]float64
@@ -442,34 +478,45 @@ func (transform *jxrICCTransform) color(ctx context.Context, values []float64) (
 		linear = transform.lut.xyz(values[:transform.channels])
 	default:
 		for index := range linear {
-			linear[index] = transform.curves[index].value(values[index])
+			linear[index] = transform.curves[index].eval(values[index], transform.extended)
 		}
 	}
 	var rgb [3]float64
 	for i, row := range transform.matrix {
-		rgb[i] = displayLinear(row[0]*linear[0] + row[1]*linear[1] + row[2]*linear[2])
+		rgb[i] = row[0]*linear[0] + row[1]*linear[1] + row[2]*linear[2]
 	}
 	return rgb[0], rgb[1], rgb[2], nil
 }
 
+// color 应用ICC转换及目标sRGB传递函数
+// 入参: ctx Context, values 已解除预乘的源通道
+// 返回: float64 非预乘红、绿、蓝sRGB值, error 数值或取消错误
+func (transform *jxrICCTransform) color(ctx context.Context, values []float64) (float64, float64, float64, error) {
+	red, green, blue, err := transform.linearColor(ctx, values)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return displayLinear(red), displayLinear(green), displayLinear(blue), nil
+}
+
 // jxrBasicRasterDisplay 选择原有的基本显示解释，保留显式色彩变换入口的能力界限
-// 入参: info 原生元数据
+// 入参: info 原生元数据, peakNits 可选HDR峰值亮度，零值采用标准标称峰值
 // 返回: jxrDisplayMapping 基本显示转换, error 颜色能力错误
-func jxrBasicRasterDisplay(info Info) (jxrDisplayMapping, error) {
+func jxrBasicRasterDisplay(info Info, peakNits float64) (jxrDisplayMapping, error) {
 	if len(info.ICCProfile) != 0 {
 		return jxrDisplayMapping{}, fmt.Errorf("%w: display color interpretation", ErrUnsupported)
 	}
-	return jxrDisplayColorEncoding(info)
+	return jxrDisplayColorEncoding(info, peakNits)
 }
 
 // jxrManagedRasterDisplay 启用支持的ICC模型，缺少ICC时沿用基本显示策略
-// 入参: ctx 已规范化Context, info 原生元数据, maximum 色彩转换工作额度
+// 入参: ctx 已规范化Context, info 原生元数据, maximum 色彩转换工作额度, peakNits 可选HDR峰值亮度, intent ICC渲染意图
 // 返回: jxrDisplayMapping 显示转换, error 颜色、格式、资源或取消错误
-func jxrManagedRasterDisplay(ctx context.Context, info Info, maximum uint64) (jxrDisplayMapping, error) {
+func jxrManagedRasterDisplay(ctx context.Context, info Info, maximum uint64, peakNits float64, intent RenderingIntent) (jxrDisplayMapping, error) {
 	if len(info.ICCProfile) == 0 {
-		return jxrBasicRasterDisplay(info)
+		return jxrBasicRasterDisplay(info, peakNits)
 	}
-	icc, err := jxrReadICCTransform(ctx, info.ICCProfile, info, maximum)
+	icc, err := jxrReadICCTransform(ctx, info.ICCProfile, info, maximum, intent)
 	return jxrDisplayMapping{icc: icc}, err
 }
 
@@ -540,6 +587,7 @@ func jxrReadICCCurve(data []byte) (jxrICCCurve, error) {
 		switch {
 		case size == 14:
 			curve.params[0] = float64(binary.BigEndian.Uint16(data[12:])) / 256
+		case size == 16 && binary.BigEndian.Uint16(data[12:]) == 0 && binary.BigEndian.Uint16(data[14:]) == 65535:
 		case size > 14:
 			curve.table = data[12:]
 		}
@@ -585,6 +633,63 @@ func (curve *jxrICCCurve) checkDomain() error {
 		return fmt.Errorf("%w: ICC parametric curve power domain", ErrInvalid)
 	}
 	return nil
+}
+
+// eval 按单位区间或浮点扩展范围计算ICC曲线值
+// 入参: input 设备分量, extended 是否允许未裁剪的扩展范围输入输出
+// 返回: float64 曲线计算结果
+func (curve *jxrICCCurve) eval(input float64, extended bool) float64 {
+	if !extended {
+		return curve.value(input)
+	}
+	if math.IsNaN(input) {
+		return 0
+	}
+	if len(curve.table) != 0 {
+		end := len(curve.table)/2 - 1
+		if input >= 0 && input <= 1 {
+			return curve.value(input)
+		}
+		if input < 0 {
+			y0 := float64(binary.BigEndian.Uint16(curve.table[0:2])) / 65535
+			y1 := float64(binary.BigEndian.Uint16(curve.table[2:4])) / 65535
+			return y0 + (y1-y0)*float64(end)*input
+		}
+		y0 := float64(binary.BigEndian.Uint16(curve.table[2*(end-1):])) / 65535
+		y1 := float64(binary.BigEndian.Uint16(curve.table[2*end:])) / 65535
+		return y1 + (y1-y0)*float64(end)*(input-1)
+	}
+	p := &curve.params
+	if curve.function == 0 {
+		if p[0] == 1 {
+			return input
+		}
+		return math.Copysign(math.Pow(math.Abs(input), p[0]), input)
+	}
+	sign, mag := 1.0, input
+	if mag < 0 {
+		sign, mag = -1, -mag
+	}
+	if mag < curve.threshold {
+		switch curve.function {
+		case 1:
+			return 0
+		case 2:
+			return sign * p[3]
+		case 3:
+			return sign * p[3] * mag
+		default:
+			return sign * (p[3]*mag + p[6])
+		}
+	}
+	y := math.Pow(max(0, p[1]*mag+p[2]), p[0])
+	switch curve.function {
+	case 2:
+		y += p[3]
+	case 4:
+		y += p[5]
+	}
+	return sign * y
 }
 
 // value 按已校验的ICC函数或一维查表解释归一化设备值
@@ -654,11 +759,7 @@ func jxrReadICCLUT(data []byte, channels int, lab bool, maximum uint64) (*jxrICC
 			return nil, fmt.Errorf("%w: ICC multi-stage lookup storage", ErrLimit)
 		}
 		return jxrReadICCStages(data, channels, lab)
-	case "mft1":
-		if !lab {
-			return nil, fmt.Errorf("%w: ICC 8-bit XYZ lookup encoding", ErrUnsupported)
-		}
-	case "mft2":
+	case "mft1", "mft2":
 	default:
 		return nil, fmt.Errorf("%w: ICC lookup type", ErrUnsupported)
 	}
@@ -848,14 +949,18 @@ func (lut *jxrICCLUT) xyz(values []float64) [3]float64 {
 		}
 	}
 	if !lut.lab {
+		scale := 65535.0 / 32768.0
+		if lut.stages == nil && lut.grid.precision == 1 {
+			scale = 255.0 / 128.0
+		}
 		for index := range pcs {
-			pcs[index] *= 65535.0 / 32768.0
+			pcs[index] *= scale
 		}
 		return pcs
 	}
 	if lut.legacyLab {
 		for index := range pcs {
-			pcs[index] = min(1, pcs[index]*(65535.0/65280.0))
+			pcs[index] *= 65535.0 / 65280.0
 		}
 	}
 	return jxrICCLabXYZ(100*pcs[0], 255*pcs[1]-128, 255*pcs[2]-128)
@@ -987,9 +1092,6 @@ func jxrReadICCPositions(p *jxrParser, data []byte, begin int, count uint64) ([]
 		}
 		return cmp.Compare(a.start, b.start)
 	})
-	if uint64(positions[0].start) != first {
-		return nil, fmt.Errorf("%w: ICC first element position", ErrInvalid)
-	}
 	for index := 1; index < len(positions); index++ {
 		if index&1023 == 0 {
 			if err := p.check(); err != nil {

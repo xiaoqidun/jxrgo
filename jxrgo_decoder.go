@@ -35,6 +35,7 @@ type Decoder struct {
 	info                     Info
 	closed                   bool
 	legacyHighpassPrediction bool
+	keepOrientation          bool
 	workers                  int
 	fileInput                *jxrReaderAt
 	inputExtra               uint64
@@ -82,6 +83,7 @@ func newDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder
 	limits := DefaultLimits()
 	workers := 0
 	legacyHighpass := false
+	keepOrientation := false
 	if opts != nil {
 		if opts.Workers < 0 {
 			return nil, fmt.Errorf("%w: negative decode workers", ErrInvalid)
@@ -89,6 +91,7 @@ func newDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder
 		limits = opts.Limits.normalized()
 		workers = opts.Workers
 		legacyHighpass = opts.LegacyHighpassPrediction
+		keepOrientation = opts.KeepOrientation
 	}
 	data, err := readDecoderInput(&decoderInput{ctx: ctx, source: r}, limits)
 	if err != nil {
@@ -105,6 +108,9 @@ func newDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder
 	if err != nil {
 		return nil, err
 	}
+	if keepOrientation {
+		source.container.transform = 0
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -112,7 +118,7 @@ func newDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder
 	if err != nil {
 		return nil, err
 	}
-	decoder := &Decoder{data: data, source: source, limits: limits, info: info, legacyHighpassPrediction: legacyHighpass}
+	decoder := &Decoder{data: data, source: source, limits: limits, info: info, legacyHighpassPrediction: legacyHighpass, keepOrientation: keepOrientation}
 	decoder.setWorkers(workers)
 	if err := decoder.checkInfoCopy(); err != nil {
 		return nil, err
@@ -144,7 +150,7 @@ func (d *Decoder) Info() Info {
 // 返回: error 容量不足时返回资源错误
 func (d *Decoder) checkInfoCopy() error {
 	retained := d.inputWork() + d.retainedHeaderWork()
-	work := uint64(len(d.info.Components))*128 + uint64(len(d.info.ICCProfile))
+	work := uint64(len(d.info.Components))*128 + uint64(len(d.info.ICCProfile)) + uint64(len(d.info.EXIF)) + uint64(len(d.info.XMP)) + uint64(len(d.info.IPTC))
 	if d.info.ColorEncoding != nil {
 		work += 4
 	}
@@ -524,21 +530,17 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 	if err != nil {
 		return nil, err
 	}
-	alphaHeader, alphaPlane, embedded := &state.header, state.alpha, true
+	alphaHeader, alphaPlane := &state.header, state.alpha
 	if source.alpha != nil {
 		alphaState, err := source.alpha.coefficientsContext(ctx, c.alpha, jxrWorkerBudgetAllowance(slack, source.alpha.coefficientWork()))
 		if err != nil {
 			return nil, err
 		}
-		opacity, interleaved, err := alphaState.reconstructContext(ctx)
+		_, interleaved, err := alphaState.reconstructContext(ctx)
 		if err != nil {
 			return nil, err
 		}
 		alphaHeader, alphaPlane, alphaView = &alphaState.header, alphaState.alpha, interleaved
-		embedded = alphaPlane != nil
-		if !embedded {
-			alphaPlane, alphaView = &alphaState.primary, &opacity[0]
-		}
 	}
 	if c.format.color == 1 || c.format.color == 2 {
 		return source.decodeSubsampled(ctx, state, views, alphaView, alphaHeader, alphaPlane, maxPixels)
@@ -552,8 +554,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 	if err != nil {
 		return nil, err
 	}
-	opacityNumber := source.opacityFormat().number
-	if done, err := source.decodeUnsignedFast(ctx, state, views, alphaView, alphaHeader, alphaPlane, embedded, opacityNumber, pixels); err != nil {
+	if done, err := source.decodeUnsignedFast(ctx, state, views, alphaView, alphaHeader, alphaPlane, pixels); err != nil {
 		return nil, err
 	} else if done {
 		return &Raster{native: pixels, info: source.info()}, nil
@@ -605,7 +606,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 			if alphaView != nil {
 				sample := [1]int64{alphaView.at(x+int(alphaHeader.left), y+int(alphaHeader.top))}
 				var codes [1]uint32
-				_, err := jxrRasterBitsComponents(alphaHeader, &alphaPlane.plane, opacityNumber, sample[:], embedded, codes[:])
+				_, err := jxrRasterBitsComponents(alphaHeader, &alphaPlane.plane, c.format.number, sample[:], true, codes[:])
 				if err != nil {
 					return nil, err
 				}
@@ -628,9 +629,9 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 }
 
 // decodeUnsignedFast 对无旋转无子采样的常规八位与十六位无符号整数格式直接重建像素存储
-// 入参: ctx Context, state 主码流重建状态, views 主平面样本视图, alphaView 透明度样本视图, alphaHeader 透明度图像头, alphaPlane 透明度平面, embedded 是否内嵌透明度, opacityNumber 透明度数值格式, pixels 目标像素存储
+// 入参: ctx Context, state 主码流重建状态, views 主平面样本视图, alphaView 透明度样本视图, alphaHeader 透明度图像头, alphaPlane 透明度平面, pixels 目标像素存储
 // 返回: bool 是否已由快路径完成, error 数值范围或取消错误
-func (source *jxrRasterSource) decodeUnsignedFast(ctx context.Context, state *jxrCoefficientImage, views []jxrComponentView, alphaView *jxrComponentView, alphaHeader *jxrHeader, alphaPlane *jxrCoefficients, embedded bool, opacityNumber uint8, pixels *imageComponents) (bool, error) {
+func (source *jxrRasterSource) decodeUnsignedFast(ctx context.Context, state *jxrCoefficientImage, views []jxrComponentView, alphaView *jxrComponentView, alphaHeader *jxrHeader, alphaPlane *jxrCoefficients, pixels *imageComponents) (bool, error) {
 	c := &source.container
 	h, p := &state.header, &state.primary.plane
 	if c.format.number != jxrUnsigned || c.transform != 0 || pixels.words != nil {
@@ -687,7 +688,7 @@ func (source *jxrRasterSource) decodeUnsignedFast(ctx context.Context, state *jx
 	var aOff, aRound, aHigh int64
 	var aScale uint8
 	if alphaView != nil {
-		if opacityNumber != jxrUnsigned || alphaPlane == nil || alphaPlane.plane.color != 0 || alphaPlane.plane.channels != 1 || !embedded && alphaHeader.color != 0 {
+		if alphaPlane == nil || alphaPlane.plane.color != 0 || alphaPlane.plane.channels != 1 {
 			return false, nil
 		}
 		if alphaHeader.depth != 1 && (alphaHeader.depth != 2 || alphaPlane.plane.shift != 0) {
@@ -961,7 +962,7 @@ func Decode(r io.Reader) (image.Image, error) {
 }
 
 // DecodeContext 在资源上限内解码并转换为非预乘十六位sRGB图像，不关闭调用方输入流
-// 支持CICP、文件颜色提示及未配置ICC的常规CMYK转换，BT.2100 PQ与HLG按BT.2446方法A映射到100 cd/m²
+// 默认启用合法内嵌ICC、CICP、文件颜色提示及常规CMYK转换，BT.2100 PQ与HLG按BT.2446方法A映射到100 cd/m²
 // 入参: ctx Context，nil采用Background, r 输入流, opts 解码选项，nil采用默认上限
 // 返回: image.Image 非预乘十六位标准图像, error 输入、颜色、资源或取消错误
 func DecodeContext(ctx context.Context, r io.Reader, opts *DecodeOptions) (image.Image, error) {
@@ -985,13 +986,6 @@ func decodeContextImage(ctx context.Context, r io.Reader, opts *DecodeOptions) (
 	}
 	defer d.Close()
 	info := d.info
-	mapping, err := jxrBasicRasterDisplay(info)
-	if err != nil {
-		return nil, err
-	}
-	if err := checkJXRDisplayPositions(info); err != nil {
-		return nil, err
-	}
 	bounds := info.Bounds
 	count := uint64(bounds.Dx()) * uint64(bounds.Dy())
 	maxInt := uint64(^uint(0) >> 1)
@@ -1000,6 +994,10 @@ func decodeContextImage(ctx context.Context, r io.Reader, opts *DecodeOptions) (
 	}
 	if count*8 >= d.limits.MaxMemoryBytes {
 		return nil, &LimitError{Resource: "max memory bytes", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(count*8, 1), Detail: "display image memory"}
+	}
+	mapping, err := jxrManagedRasterDisplay(ctx, info, d.limits.MaxMemoryBytes-count*8, 0, IntentRelative)
+	if err != nil {
+		return nil, err
 	}
 	raster, err := d.decodeReserved(ctx, count*8)
 	if err != nil {

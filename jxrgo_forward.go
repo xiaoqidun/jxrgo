@@ -281,8 +281,12 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 	if alpha {
 		count, base = 1, raster.info.Channels
 	}
-	if !alpha && ((c.plane.color == 1 || c.plane.color == 2) && format.color != c.plane.color || (format.color == 1 || format.color == 2) && format.color != c.plane.color) {
+	downsample := !alpha && (c.plane.color == 1 || c.plane.color == 2) && (format.color == 3 || format.color == 7)
+	if !alpha && !downsample && ((c.plane.color == 1 || c.plane.color == 2) && format.color != c.plane.color || (format.color == 1 || format.color == 2) && format.color != c.plane.color) {
 		return fmt.Errorf("%w: explicit JPEG XR source chroma resampling required", ErrUnsupported)
+	}
+	if downsample && exact {
+		return fmt.Errorf("%w: chroma downsampling requires lossy encoding", ErrUnsupported)
 	}
 	var componentStorage [4]Component
 	components := componentStorage[:]
@@ -291,7 +295,11 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 	} else {
 		components = components[:count]
 	}
-	source := jxrRasterSource{container: jxrContainer{width: h.width, height: h.height, transform: uint32(h.transform), format: format}, primary: jxrStream{primary: c.plane}}
+	sourcePlane := c.plane
+	if downsample {
+		sourcePlane.color, sourcePlane.chromaX, sourcePlane.chromaY = format.color, 0, 0
+	}
+	source := jxrRasterSource{container: jxrContainer{width: h.width, height: h.height, transform: uint32(h.transform), format: format}, primary: jxrStream{primary: sourcePlane}}
 	for index := range components {
 		components[index], err = raster.component(base + index)
 		if err != nil {
@@ -302,7 +310,7 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 		if actual.Bounds != expected.Bounds || actual.XStep != expected.XStep || actual.YStep != expected.YStep {
 			return fmt.Errorf("%w: JPEG XR source sampling grid", ErrInvalid)
 		}
-		if !alpha && index > 0 && (c.plane.color == 1 || c.plane.color == 2) {
+		if !alpha && !downsample && index > 0 && (c.plane.color == 1 || c.plane.color == 2) {
 			if actual.XPositionKnown != expected.XPositionKnown || actual.YPositionKnown != expected.YPositionKnown || actual.XPositionKnown && actual.XOffset != expected.XOffset || actual.YPositionKnown && actual.YOffset != expected.YOffset {
 				return fmt.Errorf("%w: JPEG XR source chroma centering", ErrInvalid)
 			}
@@ -310,6 +318,9 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 	}
 	var viewStorage [4]jxrComponentView
 	views := c.componentViewsStorage(h, true, viewStorage[:])
+	if downsample {
+		return c.loadDownsampledSamples(ctx, h, components, views)
+	}
 	if !alpha && (c.plane.color == 1 || c.plane.color == 2) {
 		color, _, bias, precision, shift, scale, err := jxrIntegerInputConfig(h, &c.plane, false)
 		if err != nil {
@@ -372,6 +383,74 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 		bits, values = bits[:count], values[:count]
 	}
 	return c.loadFullSamplesRange(ctx, h, components, views, alpha, exact, 0, views[0].height, bits, values)
+}
+
+// loadDownsampledSamples 对全采样RGB或YCC444源执行正向色彩变换并以居中盒式均值下采样到YUV422或YUV420视图
+// 入参: ctx 已规范化Context, h 图像头, components 全采样源分量, views 目标编码视图
+// 返回: error 采样、数值或取消错误
+func (c *jxrCoefficients) loadDownsampledSamples(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView) error {
+	color, _, bias, precision, shift, scale, err := jxrIntegerInputConfig(h, &c.plane, false)
+	if err != nil {
+		return err
+	}
+	cw, ch := int(h.width), int(h.height)
+	sy := 1
+	if c.plane.color == 1 {
+		sy = 2
+	}
+	var rowValues [3]int64
+	for cy := range views[1].height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		yBase := cy * sy
+		for cx := range views[1].width {
+			if cx&511 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			xBase := cx * 2
+			var sumU, sumV int64
+			for dy := range sy {
+				y := yBase + dy
+				py := min(max(y-int(h.top), 0), ch-1)
+				for dx := range 2 {
+					x := xBase + dx
+					px := min(max(x-int(h.left), 0), cw-1)
+					rx, ry := jxrRasterPosition(px, py, cw, ch, h.transform)
+					for index := range 3 {
+						bits, err := components[index].sampleBitsAt(rx, ry)
+						if err != nil {
+							return err
+						}
+						value, err := jxrIntegerInputSample(h, color, bias, precision, shift, scale, index, bits, false)
+						if err != nil {
+							return err
+						}
+						rowValues[index] = value
+					}
+					if actual, err := jxrForwardColor(h, &c.plane, rowValues[:], false); err != nil || actual != 3 {
+						if err != nil {
+							return err
+						}
+						return fmt.Errorf("%w: JPEG XR downsampled component count", ErrInvalid)
+					}
+					views[0].set(x, y, rowValues[0])
+					sumU += rowValues[1]
+					sumV += rowValues[2]
+				}
+			}
+			if sy == 2 {
+				views[1].set(cx, cy, (sumU+2)>>2)
+				views[2].set(cx, cy, (sumV+2)>>2)
+			} else {
+				views[1].set(cx, cy, (sumU+1)>>1)
+				views[2].set(cx, cy, (sumV+1)>>1)
+			}
+		}
+	}
+	return ctx.Err()
 }
 
 // loadFullSamplesParallel 将大尺寸全采样图像按宏块行分片并行装载到编码视图

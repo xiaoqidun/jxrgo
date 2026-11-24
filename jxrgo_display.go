@@ -27,20 +27,48 @@ import (
 // 返回值仅在最终显示输出时裁剪并量化，非nil错误直接中止显示转换
 type ColorTransform func(samples []float64, alpha float64) (red, green, blue float64, err error)
 
-// DisplayOptions 指定原生分量取样、显式颜色变换及输出限制，零值采用最近邻和内建基本显示策略
-// Transform非nil时由调用方负责色彩和预乘；ApplyICC启用内建ICC颜色解释，Transform优先
-// Limits计入输出及库内临时存储，不计调用方原图、既往输出和变换函数自行持有或分配的存储
+// DisplayOptions 指定原生分量取样、显式颜色变换、ICC意图、HDR峰值亮度及输出限制，零值采用最近邻和内建基本显示策略
+// Transform非nil时由调用方负责色彩和预乘；ApplyICC启用内建ICC颜色解释并按Intent选择渲染意图，Transform优先
+// HDRPeakNits指定BT.2446方法A的HDR标称峰值亮度（零值对PQ默认10000、对HLG默认1000）；Limits计入输出及库内临时存储
 type DisplayOptions struct {
-	Filter    ResampleFilter
-	Transform ColorTransform
-	Limits    Limits
-	ApplyICC  bool
+	Filter      ResampleFilter
+	Transform   ColorTransform
+	Limits      Limits
+	ApplyICC    bool
+	Intent      RenderingIntent
+	HDRPeakNits float64
 }
 
-// Display 按已知分量相位将原生图像绘制为十六位非预乘sRGB图像，不修改原图也不构造整幅重采样中间图
-// 色彩按Transform优先、ApplyICC内建ICC或默认CICP与BT.2446方法A策略转换，并发调用须保证原图只读与Transform并发安全
+// LinearOptions 指定线性浮点行读取的采样滤波、色彩管理、渲染意图、解预乘及资源限制
+// opts为nil时默认采用双线性滤波；ApplyICC启用内建ICC，ApplyCICP启用PTM CICP，ApplyICC优先于ApplyCICP
+// Unpremultiply为真时对预乘图像解除预乘，否则保持线性域预乘；输出为未裁剪的D65线性scRGB
+type LinearOptions struct {
+	Filter        ResampleFilter
+	ApplyCICP     bool
+	ApplyICC      bool
+	Unpremultiply bool
+	Intent        RenderingIntent
+	Limits        Limits
+}
+
+// LinearReader 提供面向文档与HDR渲染引擎的按行线性scRGB浮点读取视图
+// 每像素按顺序写入红、绿、蓝与透明度四个未裁剪float64值，保留负色域与大于一的高动态范围亮度
+type LinearReader struct {
+	raster        *Raster
+	info          Info
+	components    []Component
+	mapping       jxrDisplayMapping
+	filter        ResampleFilter
+	unpremultiply bool
+	defaultLinear bool
+	yccFallback   bool
+	useNearest    bool
+}
+
+// Display 按分量相位将原生图像绘制为十六位非预乘sRGB图像，不修改原图也不构造整幅重采样中间图
+// 未知色度相位按ITU-T T.832默认居中相位处理；色彩按Transform优先、ApplyICC内建ICC或默认CICP与BT.2446方法A策略转换
 // 入参: ctx Context，nil采用Background, opts 显示策略及限制，nil采用默认值
-// 返回: *image.NRGBA64 独立显示图像, error 参数、相位、颜色、数值、资源、变换或取消错误
+// 返回: *image.NRGBA64 独立显示图像, error 参数、颜色、数值、资源、变换或取消错误
 func (r *Raster) Display(ctx context.Context, opts *DisplayOptions) (*image.NRGBA64, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -54,7 +82,7 @@ func (r *Raster) Display(ctx context.Context, opts *DisplayOptions) (*image.NRGB
 
 // display 执行原生分量的十六位sRGB显示转换，由公开入口统一归一化错误
 // 入参: ctx 已规范化Context, opts 显示策略及限制
-// 返回: *image.NRGBA64 独立显示图像, error 参数、相位、颜色、数值、资源、变换或取消错误
+// 返回: *image.NRGBA64 独立显示图像, error 参数、颜色、数值、资源、变换或取消错误
 func (r *Raster) display(ctx context.Context, opts *DisplayOptions) (*image.NRGBA64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -62,13 +90,19 @@ func (r *Raster) display(ctx context.Context, opts *DisplayOptions) (*image.NRGB
 	if r == nil || r.Bounds().Empty() || r.info.Channels < 1 || r.info.Channels > rasterMaxComponents {
 		return nil, fmt.Errorf("%w: display raster", ErrInvalid)
 	}
-	filter, limits := ResampleNearest, DefaultLimits()
+	filter, limits, intent, peakNits := ResampleNearest, DefaultLimits(), IntentRelative, 0.0
 	var transform ColorTransform
 	if opts != nil {
-		filter, limits, transform = opts.Filter, opts.Limits.normalized(), opts.Transform
+		filter, limits, transform, intent, peakNits = opts.Filter, opts.Limits.normalized(), opts.Transform, opts.Intent, opts.HDRPeakNits
 	}
 	if filter > ResampleBilinear {
 		return nil, fmt.Errorf("%w: display filter", ErrInvalid)
+	}
+	if intent > IntentSaturation {
+		return nil, fmt.Errorf("%w: display rendering intent", ErrInvalid)
+	}
+	if peakNits != 0 && (!geometryFinite(peakNits) || peakNits < 100) {
+		return nil, fmt.Errorf("%w: display HDR peak luminance", ErrInvalid)
 	}
 	info := r.info
 	bounds := info.Bounds
@@ -83,13 +117,10 @@ func (r *Raster) display(ctx context.Context, opts *DisplayOptions) (*image.NRGB
 	var mapping jxrDisplayMapping
 	if transform == nil && !managed {
 		var err error
-		mapping, err = jxrBasicRasterDisplay(info)
+		mapping, err = jxrBasicRasterDisplay(info, peakNits)
 		if err != nil {
 			return nil, err
 		}
-	}
-	if err := checkJXRDisplayPositions(info); err != nil {
-		return nil, err
 	}
 	pixels := uint64(bounds.Dx()) * uint64(bounds.Dy())
 	scratch := uint64(512) + uint64(count)*136
@@ -108,7 +139,7 @@ func (r *Raster) display(ctx context.Context, opts *DisplayOptions) (*image.NRGB
 	}
 	if managed {
 		var err error
-		mapping, err = jxrManagedRasterDisplay(ctx, info, limits.MaxMemoryBytes-scratch-pixels*8)
+		mapping, err = jxrManagedRasterDisplay(ctx, info, limits.MaxMemoryBytes-scratch-pixels*8, peakNits, intent)
 		if err != nil {
 			return nil, err
 		}
@@ -116,16 +147,305 @@ func (r *Raster) display(ctx context.Context, opts *DisplayOptions) (*image.NRGB
 	return renderJXRDisplay(ctx, r, info, mapping, filter, transform)
 }
 
-// checkJXRDisplayPositions 校验全部原生分量在显示采样前具备已知位置相位
-// 入参: info 原生图像信息
-// 返回: error 存在未知采样位置时返回不支持错误
-func checkJXRDisplayPositions(info Info) error {
-	for _, component := range info.Components {
-		if !component.XPositionKnown || !component.YPositionKnown {
-			return fmt.Errorf("%w: display requires known sample positions", ErrUnsupported)
+// NewLinearReader 为原生图像创建按行读取未裁剪线性scRGB浮点像素的读取器，不修改原图也不分配整幅输出缓冲
+// 支持灰度、RGB、全十六种YCC子采样及CMYK与多通道ICC图像，未知色度相位按标准居中相位处理
+// 入参: ctx Context，nil采用Background, opts 线性读取配置，nil默认双线性滤波
+// 返回: *LinearReader 线性行读取器, error 参数、颜色、资源或取消错误
+func (r *Raster) NewLinearReader(ctx context.Context, opts *LinearOptions) (*LinearReader, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reader, err := r.newLinearReader(ctx, opts)
+	if err != nil {
+		return nil, wrapJXRError("Raster.NewLinearReader", err)
+	}
+	return reader, nil
+}
+
+// newLinearReader 执行LinearReader的预算校验、色彩管线装配与分量绑定，由公开入口归一化错误
+// 入参: ctx 已规范化Context, opts 线性读取配置
+// 返回: *LinearReader 线性行读取器, error 参数、颜色、资源或取消错误
+func (r *Raster) newLinearReader(ctx context.Context, opts *LinearOptions) (*LinearReader, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if r == nil || r.Bounds().Empty() || r.info.Channels < 1 || r.info.Channels > rasterMaxComponents {
+		return nil, fmt.Errorf("%w: linear reader raster", ErrInvalid)
+	}
+	filter, limits, intent := ResampleBilinear, DefaultLimits(), IntentRelative
+	applyCICP, applyICC, unpremultiply := false, false, false
+	if opts != nil {
+		filter, limits, intent = opts.Filter, opts.Limits.normalized(), opts.Intent
+		applyCICP, applyICC, unpremultiply = opts.ApplyCICP, opts.ApplyICC, opts.Unpremultiply
+	}
+	if filter > ResampleBilinear {
+		return nil, fmt.Errorf("%w: linear reader filter", ErrInvalid)
+	}
+	if intent > IntentSaturation {
+		return nil, fmt.Errorf("%w: linear reader rendering intent", ErrInvalid)
+	}
+	info := r.info
+	count := info.Channels
+	if info.Alpha {
+		count++
+	}
+	if count != len(info.Components) {
+		return nil, fmt.Errorf("%w: linear reader components", ErrInvalid)
+	}
+	scratch := uint64(512) + uint64(count)*136
+	if scratch > limits.MaxMemoryBytes {
+		return nil, &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: scratch, Detail: "linear reader working memory"}
+	}
+	var mapping jxrDisplayMapping
+	defaultLinear, yccFallback := false, false
+	switch {
+	case applyICC && len(info.ICCProfile) != 0:
+		icc, err := jxrReadICCTransform(ctx, info.ICCProfile, info, limits.MaxMemoryBytes-scratch, intent)
+		if err != nil {
+			return nil, err
+		}
+		mapping.icc = icc
+	case applyCICP && info.ColorEncoding != nil:
+		var supported bool
+		mapping, supported = jxrCICPDisplay(info, *info.ColorEncoding, 0)
+		if !supported {
+			return nil, fmt.Errorf("%w: linear CICP color interpretation", ErrUnsupported)
+		}
+	default:
+		switch info.ColorSpace {
+		case ColorGray:
+			if info.Channels != 1 {
+				return nil, fmt.Errorf("%w: linear gray channels", ErrUnsupported)
+			}
+		case ColorRGB:
+			if info.Channels != 3 {
+				return nil, fmt.Errorf("%w: linear RGB channels", ErrUnsupported)
+			}
+		case ColorYCC:
+			if info.Channels != 3 {
+				return nil, fmt.Errorf("%w: linear YCC channels", ErrUnsupported)
+			}
+			yccFallback = true
+		case ColorCMYK, ColorCMYKDirect:
+			if info.Channels != 4 {
+				return nil, fmt.Errorf("%w: linear CMYK channels", ErrUnsupported)
+			}
+		default:
+			return nil, fmt.Errorf("%w: linear color interpretation", ErrUnsupported)
+		}
+		defaultLinear = true
+	}
+	components := make([]Component, count)
+	for index := range count {
+		if index&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		var err error
+		components[index], err = r.component(index)
+		if err != nil {
+			return nil, err
 		}
 	}
+	return &LinearReader{
+		raster:        r,
+		info:          info,
+		components:    components,
+		mapping:       mapping,
+		filter:        filter,
+		unpremultiply: unpremultiply,
+		defaultLinear: defaultLinear,
+		yccFallback:   yccFallback,
+		useNearest:    filter == ResampleNearest && info.Bounds.Min == (image.Point{}),
+	}, ctx.Err()
+}
+
+// ReadRow 读取指定显示行并按每像素红、绿、蓝、透明度四个float64写入dst，输出未裁剪的D65线性scRGB
+// dst长度须不少于图像宽度乘以四，并发读取须由调用方保证源Raster保持只读且不共享ICCFloat管线状态
+// 入参: ctx Context，nil采用Background, y 目标行坐标, dst 输出浮点切片
+// 返回: error 参数、坐标、数值或取消错误
+func (lr *LinearReader) ReadRow(ctx context.Context, y int, dst []float64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := lr.readRow(ctx, y, dst); err != nil {
+		return wrapJXRError("LinearReader.ReadRow", err)
+	}
 	return nil
+}
+
+// readRow 执行单行原生采样、线性色彩转换及预乘处理，由公开入口归一化错误
+// 入参: ctx 已规范化Context, y 目标行坐标, dst 输出浮点切片
+// 返回: error 参数、坐标、数值或取消错误
+func (lr *LinearReader) readRow(ctx context.Context, y int, dst []float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lr == nil || lr.raster == nil {
+		return fmt.Errorf("%w: nil linear reader", ErrInvalid)
+	}
+	bounds := lr.info.Bounds
+	width, height := bounds.Dx(), bounds.Dy()
+	row := y - bounds.Min.Y
+	if row < 0 || row >= height || len(dst) < width*4 {
+		return fmt.Errorf("%w: linear reader row or destination", ErrInvalid)
+	}
+	count := len(lr.components)
+	var valueStorage [9]float64
+	values := valueStorage[:]
+	if count > len(values) {
+		values = make([]float64, count)
+	} else {
+		values = values[:count]
+	}
+	for x := range width {
+		if x&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if lr.useNearest {
+			if err := jxrDisplayNearestPixel(lr.raster, x, row, values); err != nil {
+				return err
+			}
+		} else {
+			for index, component := range lr.components {
+				var err error
+				values[index], err = displayJXRSample(component, x, row, width, height, lr.filter)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		alpha := 1.0
+		if lr.info.Alpha {
+			alpha = values[lr.info.Channels]
+		}
+		red, green, blue, err := lr.linearPixel(ctx, values, alpha)
+		if err != nil {
+			return err
+		}
+		base := x * 4
+		dst[base], dst[base+1], dst[base+2], dst[base+3] = red, green, blue, alpha
+	}
+	return ctx.Err()
+}
+
+// linearPixel 将单个已采样原生像素转换为未裁剪的D65线性scRGB三通道
+// 入参: ctx 已规范化Context, values 可复用原生样本工作区, alpha 当前像素透明度
+// 返回: float64 线性红、绿、蓝scRGB值, error ICC数值或取消错误
+func (lr *LinearReader) linearPixel(ctx context.Context, values []float64, alpha float64) (float64, float64, float64, error) {
+	info := lr.info
+	if lr.mapping.icc.channels != 0 {
+		repremultiply := false
+		if info.Premultiplied {
+			if !(alpha > 0) || !geometryFinite(alpha) {
+				return 0, 0, 0, nil
+			}
+			for index := range info.Channels {
+				values[index] /= alpha
+			}
+			repremultiply = !lr.unpremultiply
+		}
+		red, green, blue, err := lr.mapping.icc.linearColor(ctx, values)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		if repremultiply {
+			red *= alpha
+			green *= alpha
+			blue *= alpha
+		}
+		return red, green, blue, nil
+	}
+	if lr.mapping.cicp.transfer != 0 {
+		red, green, blue := lr.mapping.cicp.linearColor(info, values, alpha, lr.unpremultiply)
+		return red, green, blue, nil
+	}
+	srcLinear := lr.mapping.linear
+	if lr.defaultLinear {
+		srcLinear = info.Linear
+	}
+	if lr.yccFallback {
+		repremultiply := false
+		if info.Premultiplied {
+			if !(alpha > 0) || !geometryFinite(alpha) {
+				return 0, 0, 0, nil
+			}
+			for index := range 3 {
+				values[index] /= alpha
+			}
+			repremultiply = !lr.unpremultiply
+		}
+		signal := [3]float64{values[0], values[1], values[2]}
+		for index := 1; index < 3; index++ {
+			component := info.Components[index]
+			if component.Format == SampleUnsigned {
+				bits := int(component.Precision)
+				signal[index] -= math.Ldexp(1, bits-1) / (math.Ldexp(1, bits) - 1)
+			}
+		}
+		rgb := jxrCICPYCCToRGB(signal, 0.299, 0.114)
+		if !srcLinear {
+			for index := range rgb {
+				rgb[index] = jxrCICPInverseTransfer(rgb[index], 13, true)
+			}
+		}
+		if repremultiply {
+			for index := range rgb {
+				rgb[index] *= alpha
+			}
+		}
+		return rgb[0], rgb[1], rgb[2], nil
+	}
+	if srcLinear && (info.ColorSpace == ColorGray || info.ColorSpace == ColorRGB) {
+		var red, green, blue float64
+		if info.ColorSpace == ColorGray {
+			red, green, blue = values[0], values[0], values[0]
+		} else {
+			red, green, blue = values[0], values[1], values[2]
+		}
+		if info.Premultiplied && lr.unpremultiply {
+			if !(alpha > 0) || !geometryFinite(alpha) {
+				return 0, 0, 0, nil
+			}
+			red /= alpha
+			green /= alpha
+			blue /= alpha
+		}
+		return red, green, blue, nil
+	}
+	repremultiply := false
+	if info.Premultiplied {
+		if !(alpha > 0) || !geometryFinite(alpha) {
+			return 0, 0, 0, nil
+		}
+		for index := range info.Channels {
+			values[index] /= alpha
+		}
+		repremultiply = !lr.unpremultiply
+	}
+	var red, green, blue float64
+	switch info.ColorSpace {
+	case ColorGray:
+		v := jxrCICPInverseTransfer(values[0], 13, true)
+		red, green, blue = v, v, v
+	case ColorRGB:
+		red = jxrCICPInverseTransfer(values[0], 13, true)
+		green = jxrCICPInverseTransfer(values[1], 13, true)
+		blue = jxrCICPInverseTransfer(values[2], 13, true)
+	case ColorCMYK, ColorCMYKDirect:
+		red = jxrCICPInverseTransfer((1-values[0])*(1-values[3]), 13, true)
+		green = jxrCICPInverseTransfer((1-values[1])*(1-values[3]), 13, true)
+		blue = jxrCICPInverseTransfer((1-values[2])*(1-values[3]), 13, true)
+	}
+	if repremultiply {
+		red *= alpha
+		green *= alpha
+		blue *= alpha
+	}
+	return red, green, blue, nil
 }
 
 // renderJXRDisplay 共用标准解码与原生显示转换的直通整数快路径与通用采样渲染循环
@@ -247,9 +567,6 @@ func jxrDisplayNearestPixel(raster *Raster, x, y int, values []float64) error {
 			values[index] = sampleValue(plane.sampleBits(at), info)
 			continue
 		}
-		if !info.XPositionKnown || !info.YPositionKnown {
-			return fmt.Errorf("%w: display requires known sample positions", ErrUnsupported)
-		}
 		var err error
 		values[index], err = displayJXRSample(Component{source: plane, info: info}, x, y, width, height, ResampleNearest)
 		if err != nil {
@@ -264,8 +581,8 @@ func jxrDisplayNearestPixel(raster *Raster, x, y int, values []float64) error {
 // 返回: float64 原生分量数值, error 样本或非有限插值错误
 func displayJXRSample(source Component, x, y, width, height int, filter ResampleFilter) (float64, error) {
 	info := source.info
-	x0, x1, fx := resampleJXRAxis(x, width, width, info.Bounds.Dx(), info.XOffset, info.XStep)
-	y0, y1, fy := resampleJXRAxis(y, height, height, info.Bounds.Dy(), info.YOffset, info.YStep)
+	x0, x1, fx := resampleJXRAxis(x, width, width, info.Bounds.Dx(), jxrEffectiveOffset(info.XOffset, info.XStep, info.XPositionKnown), info.XStep)
+	y0, y1, fy := resampleJXRAxis(y, height, height, info.Bounds.Dy(), jxrEffectiveOffset(info.YOffset, info.YStep, info.YPositionKnown), info.YStep)
 	if filter == ResampleNearest {
 		if fx >= 0.5 {
 			x0 = x1
@@ -384,7 +701,10 @@ func canDisplayJXRDirect(raster *Raster, info Info, mapping jxrDisplayMapping) (
 	}
 	for _, component := range info.Components {
 		if component.Format != SampleUnsigned || component.Inverted || component.Precision != precision ||
-			component.XStep != 1 || component.YStep != 1 || component.XOffset != 0 || component.YOffset != 0 || component.Bounds != bounds {
+			component.XStep != 1 || component.YStep != 1 ||
+			jxrEffectiveOffset(component.XOffset, component.XStep, component.XPositionKnown) != 0 ||
+			jxrEffectiveOffset(component.YOffset, component.YStep, component.YPositionKnown) != 0 ||
+			component.Bounds != bounds {
 			return 0, false, false
 		}
 	}

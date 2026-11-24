@@ -73,20 +73,21 @@ type jxrSpatialRows struct {
 
 // jxrFrequencyRows 持有各频带连续位位置、独立预测行及共享的当前行系数工作，不保留整块系数
 type jxrFrequencyRows struct {
-	bits     [4]jxrBits
-	quant    [2]jxrTileQuant
-	rows     [3][2]*jxrTileRow
-	scratch  [2]*jxrDecodedMacro
-	dc       [2]jxrDC
-	lp       [2]jxrLP
-	hp       [2]jxrHP
-	channels [2]int
-	bands    [2]uint8
-	width    int
-	height   int
-	next     int
-	count    int
-	trim     uint8
+	bits      [4]jxrBits
+	quant     [2]jxrTileQuant
+	rows      [3][2]*jxrTileRow
+	scratch   [2]*jxrDecodedMacro
+	dc        [2]jxrDC
+	lp        [2]jxrLP
+	hp        [2]jxrHP
+	channels  [2]int
+	bands     [2]uint8
+	width     int
+	height    int
+	next      int
+	count     int
+	trim      uint8
+	flexValid bool
 }
 
 // jxrReconstructedRow 定义只读消费已完成两级逆变换及重叠滤波宏块行的回调函数类型
@@ -137,7 +138,7 @@ type jxrUpsampleRows struct {
 	count  int
 }
 
-// jxrSampleRowOutput 以具体目标描述分派最终样本，避免接口调用使每行临时分量视图逃逸到堆
+// jxrSampleRowOutput 以具体目标描述分派最终样本，避免Interface调用使每行临时分量视图逃逸到堆
 type jxrSampleRowOutput struct {
 	region *jxrRegionRowOutput
 	strip  *jxrStripRowOutput
@@ -347,21 +348,17 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 	if err != nil {
 		return true, err
 	}
-	alphaHeader, alphaPlane, embedded := &state.header, state.alpha, true
+	alphaHeader, alphaPlane := &state.header, state.alpha
 	if d.source.alpha != nil {
 		alphaState, err := d.source.alpha.coefficientsContext(ctx, c.alpha, jxrWorkerBudgetAllowance(slack, d.source.alpha.coefficientWork()))
 		if err != nil {
 			return true, err
 		}
-		opacity, interleaved, err := alphaState.reconstructContext(ctx)
+		_, interleaved, err := alphaState.reconstructContext(ctx)
 		if err != nil {
 			return true, err
 		}
 		alphaHeader, alphaPlane, alphaView = &alphaState.header, alphaState.alpha, interleaved
-		embedded = alphaPlane != nil
-		if !embedded {
-			alphaPlane, alphaView = &alphaState.primary, &opacity[0]
-		}
 	}
 	p := &state.primary.plane
 	if err := checkJXRPlaneComponents(p); err != nil {
@@ -376,7 +373,7 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 	srcWidth, srcHeight := int(c.width), int(c.height)
 	dstWidth := target.Bounds().Dx()
 	transform := uint8(c.transform)
-	opacityNumber := d.source.opacityFormat().number
+	opacityNumber := c.format.number
 	outChannels := c.format.channels
 	hasAlpha := c.format.alpha
 	workers, chunkRows, tasks := jxrMacroChunkPlan(srcHeight, 16, d.workers)
@@ -424,7 +421,7 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 				if alphaView != nil {
 					sample := [1]int64{alphaView.at(x+int(alphaHeader.left), y+int(alphaHeader.top))}
 					var codes [1]uint32
-					_, err := jxrRasterBitsComponents(alphaHeader, &alphaPlane.plane, opacityNumber, sample[:], embedded, codes[:])
+					_, err := jxrRasterBitsComponents(alphaHeader, &alphaPlane.plane, opacityNumber, sample[:], true, codes[:])
 					if err != nil {
 						return err
 					}
@@ -631,7 +628,7 @@ func (d *Decoder) walkStrips(ctx context.Context, write RasterStripWriter, plan 
 		if err != nil {
 			return err
 		}
-		output.alpha = &jxrStripAlphaRows{source: source.alpha, rows: rows, row: -1, number: source.opacityFormat().number}
+		output.alpha = &jxrStripAlphaRows{source: source.alpha, rows: rows, row: -1, number: source.container.format.number}
 	}
 	emit := jxrReconstructedRow(output.copy)
 	var samples *jxrUpsampleRows
@@ -750,10 +747,7 @@ func (a *jxrStripAlphaRows) copy(ctx context.Context, output *jxrRegionRowOutput
 		if a.row != wanted || a.state == nil {
 			return fmt.Errorf("%w: JPEG XR strip alpha pairing", ErrInvalid)
 		}
-		plane, embedded := a.state.alpha, a.state.alpha != nil
-		if !embedded {
-			plane = &a.state.primary
-		}
+		plane := a.state.alpha
 		views := plane.componentViewsStorage(&a.state.header, true, storage[:])
 		sy := (y+int(a.source.header.top))%16 + int(a.state.header.top)
 		for x := range output.width {
@@ -764,7 +758,7 @@ func (a *jxrStripAlphaRows) copy(ctx context.Context, output *jxrRegionRowOutput
 			}
 			values := [1]int64{views[0].at(x+int(a.source.header.left), sy)}
 			var codes [1]uint32
-			if _, err := jxrRasterBitsComponents(&a.state.header, &plane.plane, a.number, values[:], embedded, codes[:]); err != nil {
+			if _, err := jxrRasterBitsComponents(&a.state.header, &plane.plane, a.number, values[:], true, codes[:]); err != nil {
 				return err
 			}
 			px, py := jxrRasterPosition(x, y, output.width, output.height, output.transform)
@@ -991,7 +985,12 @@ func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile in
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		r.bits[band] = jxrPacketReader(data, s, tile*count+band)
+		packetIndex := tile*count + band
+		if band == 3 && jxrEmptyFlexPacket(s, data, packetIndex) {
+			r.trim = 15
+			continue
+		}
+		r.bits[band] = jxrPacketReader(data, s, packetIndex)
 		if s.input != nil {
 			r.bits[band].input = &jxrReaderAt{source: s.input.source, ctx: ctx, base: s.input.base, size: s.input.size}
 		}
@@ -1000,7 +999,7 @@ func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile in
 			return nil, err
 		}
 		if band == 3 {
-			r.trim = packet.trim
+			r.trim, r.flexValid = packet.trim, packet.valid
 			if !packet.valid {
 				r.trim = 15
 			}
@@ -1120,6 +1119,9 @@ func (r *jxrFrequencyRows) readRow(ctx context.Context, target *jxrCoefficientIm
 	r.next++
 	if r.next == r.height {
 		for band := range r.count {
+			if band == 3 && !r.flexValid {
+				continue
+			}
 			r.bits[band].align(true)
 			if r.bits[band].err != nil {
 				return r.bits[band].err

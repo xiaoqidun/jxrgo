@@ -158,8 +158,18 @@ func encodeJXRSeparateAlpha(ctx context.Context, raster *Raster, options EncodeO
 		retained += amount
 	}
 	c := jxrContainer{width: main.header.width, height: main.header.height, dpi: raster.info.Resolution, format: format, pixelFormat: identifier, transform: uint32(main.header.transform), image: codedPrimary, alpha: codedAlpha, profiles: main.profiles, imageBands: uint32(main.primary.bands), alphaBands: uint32(secondary.alpha.bands), colorHint: raster.info.ColorHint, encoding: raster.info.ColorEncoding, imageType: raster.info.ImageType}
-	if len(raster.info.ICCProfile) != 0 {
-		c.profile = raster.info.ICCProfile
+	meta := jxrWithContainerMetadata(raster.info, &options)
+	if len(meta.ICCProfile) != 0 {
+		c.profile = meta.ICCProfile
+	}
+	if len(meta.EXIF) != 0 {
+		c.exif = meta.EXIF
+	}
+	if len(meta.XMP) != 0 {
+		c.xmp = meta.XMP
+	}
+	if len(meta.IPTC) != 0 {
+		c.iptc = meta.IPTC
 	}
 	if main.header.transform&4 != 0 {
 		c.dpi.X, c.dpi.Y = c.dpi.Y, c.dpi.X
@@ -553,7 +563,7 @@ func writeJXRSeparateFileAt(ctx context.Context, w io.WriteSeeker, raster *Raste
 		return 0, 0, err
 	}
 	limits := options.Limits.normalized()
-	file := jxrSeparateOutput{info: raster.info, layout: input.layout, maximum: input.output[0].maxBytes, prefixMemory: limits.MaxMemoryBytes - input.working, maxPixels: limits.MaxPixels}
+	file := jxrSeparateOutput{info: jxrWithContainerMetadata(raster.info, &options), layout: input.layout, maximum: input.output[0].maxBytes, prefixMemory: limits.MaxMemoryBytes - input.working, maxPixels: limits.MaxPixels}
 	return writeJXRSeparatePacketsAt(ctx, w, file, directory, func(index int, maximum uint64) error {
 		source := &input.primary
 		if index == 1 {

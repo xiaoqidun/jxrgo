@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"image"
+	"image/color"
 	"io"
 	"math"
 	"slices"
@@ -33,10 +34,13 @@ var errJXRInputHeaderMemory = fmt.Errorf("%w: JPEG XR input header fixed memory"
 // errJXREncodingPlanMemory 预构造原图扣减后的额度错误，资源拒绝路径不再临时分配诊断
 var errJXREncodingPlanMemory = fmt.Errorf("%w: encoding plan retained source memory", ErrLimit)
 
-// jxrNativeOutput 保存原生编码的文件类型、可选格式标识及完整码流输出参数
+// jxrNativeOutput 保存原生编码的文件类型、可选格式标识、容器元数据及完整码流输出参数
 type jxrNativeOutput struct {
 	format      Format
 	pixelFormat [16]byte
+	exif        []byte
+	xmp         []byte
+	iptc        []byte
 	stream      jxrStreamOutput
 }
 
@@ -75,7 +79,7 @@ func Encode(w io.Writer, m image.Image, opts *EncodeOptions) error {
 	return wrapJXRError("Encode", encodeContextCore(context.Background(), w, m, opts))
 }
 
-// EncodeContext 编码标准图像并保留颜色精度与预乘状态，自定义图像与YCbCr按Color.RGBA转为十六位预乘色，输出原点归零
+// EncodeContext 编码标准图像并保留颜色精度与预乘状态，特化支持YCbCr、Paletted及Alpha类型，其余自定义图像转为十六位预乘色，输出原点归零
 // opts为nil时默认无损JXR，工作内存计入内部原生副本但不含调用方图像存储，不关闭输出流
 // 入参: ctx Context，nil采用Background, w 输出流, m 标准图像, opts 编码选项
 // 返回: error 图像、资源、精度、取消或写入错误
@@ -110,7 +114,7 @@ func encodeContextCore(ctx context.Context, w io.Writer, m image.Image, opts *En
 	return encodeRasterCore(ctx, w, raster, opts)
 }
 
-// standardImageRaster 将标准图像读取为独立原生样本，不通过八位RGBA缩减十六位精度
+// standardImageRaster 将标准图像读取为独立原生样本，特化YCbCr、调色板及Alpha格式避免无意义转为64bppPRGBA
 // 入参: ctx Context, m 标准图像, limits 内部原生图像资源限制
 // 返回: *Raster 原点为零的原生图像, error 颜色、资源或取消错误
 func standardImageRaster(ctx context.Context, m image.Image, limits Limits) (*Raster, error) {
@@ -123,7 +127,8 @@ func standardImageRaster(ctx context.Context, m image.Image, limits Limits) (*Ra
 		return nil, err
 	}
 	precision, count, space, alpha, premultiply := uint8(16), 4, ColorRGB, true, true
-	switch m.(type) {
+	var paletteTable [][4]uint16
+	switch src := m.(type) {
 	case *image.Gray:
 		precision, count, space, alpha, premultiply = 8, 1, ColorGray, false, false
 	case *image.Gray16:
@@ -136,6 +141,17 @@ func standardImageRaster(ctx context.Context, m image.Image, limits Limits) (*Ra
 		premultiply = false
 	case *image.RGBA:
 		precision = 8
+	case *image.Alpha:
+		precision = 8
+	case *image.Alpha16:
+	case *image.YCbCr:
+		precision, count, space, alpha, premultiply = 8, 3, ColorRGB, false, false
+	case *image.Paletted:
+		var err error
+		precision, count, alpha, premultiply, paletteTable, err = prepareStandardPalette(src.Palette)
+		if err != nil {
+			return nil, err
+		}
 	}
 	info := Info{Bounds: image.Rect(0, 0, width, height), ColorSpace: space, Alpha: alpha, Premultiplied: premultiply, Components: make([]ComponentInfo, count)}
 	for index := range info.Components {
@@ -178,6 +194,26 @@ func standardImageRaster(ctx context.Context, m image.Image, limits Limits) (*Ra
 		return raster, nil
 	case *image.RGBA64:
 		if err := copyStandardRGBA16(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.Alpha:
+		if err := copyStandardAlpha8(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.Alpha16:
+		if err := copyStandardAlpha16(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.YCbCr:
+		if err := copyStandardYCbCr(ctx, src, bounds, raster); err != nil {
+			return nil, err
+		}
+		return raster, nil
+	case *image.Paletted:
+		if err := copyStandardPaletted(ctx, src.Pix, src.Stride, src.PixOffset(bounds.Min.X, bounds.Min.Y), width, height, paletteTable, count, raster); err != nil {
 			return nil, err
 		}
 		return raster, nil
@@ -373,6 +409,222 @@ func copyStandardRGBA16(ctx context.Context, pix []byte, stride, offset0, width,
 		}
 	}
 	return ctx.Err()
+}
+
+// prepareStandardPalette 分析调色板精度与透明状态并生成紧凑查表，优先选用八位三通道或四通道格式
+// 入参: palette 标准调色板
+// 返回: uint8 样本位深, int 分量数, bool 是否含透明度, bool 是否预乘, [][4]uint16 查表项, error 调色板非法错误
+func prepareStandardPalette(palette color.Palette) (uint8, int, bool, bool, [][4]uint16, error) {
+	if len(palette) == 0 {
+		return 0, 0, false, false, nil, fmt.Errorf("%w: empty image palette", ErrInvalid)
+	}
+	hasAlpha, allEight, allNRGBA := false, true, true
+	raw := make([][4]uint32, len(palette))
+	for i, c := range palette {
+		if c == nil {
+			return 0, 0, false, false, nil, fmt.Errorf("%w: nil palette colour", ErrInvalid)
+		}
+		if _, ok := c.(color.NRGBA); !ok {
+			allNRGBA = false
+		}
+		r, g, b, a := c.RGBA()
+		if r > 65535 || g > 65535 || b > 65535 || a > 65535 {
+			return 0, 0, false, false, nil, fmt.Errorf("%w: palette colour channel range", ErrInvalid)
+		}
+		raw[i] = [4]uint32{r, g, b, a}
+		if a < 65535 {
+			hasAlpha = true
+		}
+		if r != (r>>8)*257 || g != (g>>8)*257 || b != (b>>8)*257 || a != (a>>8)*257 {
+			allEight = false
+		}
+	}
+	table := make([][4]uint16, len(palette))
+	if allNRGBA && hasAlpha {
+		for i, c := range palette {
+			n := c.(color.NRGBA)
+			table[i] = [4]uint16{uint16(n.R), uint16(n.G), uint16(n.B), uint16(n.A)}
+		}
+		return 8, 4, true, false, table, nil
+	}
+	if allEight {
+		for i, v := range raw {
+			table[i] = [4]uint16{uint16(v[0] >> 8), uint16(v[1] >> 8), uint16(v[2] >> 8), uint16(v[3] >> 8)}
+		}
+		if !hasAlpha {
+			return 8, 3, false, false, table, nil
+		}
+		return 8, 4, true, true, table, nil
+	}
+	for i, v := range raw {
+		table[i] = [4]uint16{uint16(v[0]), uint16(v[1]), uint16(v[2]), uint16(v[3])}
+	}
+	if !hasAlpha {
+		return 16, 3, false, false, table, nil
+	}
+	return 16, 4, true, true, table, nil
+}
+
+// copyStandardAlpha8 将八位Alpha单通道图像快速展开为八位四通道预乘原生存储
+// 入参: ctx Context, pix 源透明度字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 返回: error 缓冲校验或取消错误
+func copyStandardAlpha8(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
+	if err := checkStandardPix(len(pix), stride, offset0, width, height, 1); err != nil {
+		return err
+	}
+	p0, p1, p2, p3 := raster.planes[0].values, raster.planes[1].values, raster.planes[2].values, raster.planes[3].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		row := pix[offset0+y*stride:]
+		rowBase := y * width
+		for start := 0; start < width; start += 1024 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := min(start+1024, width)
+			n := end - start
+			src := row[start:end]
+			d0, d1, d2, d3 := p0[rowBase+start:rowBase+end], p1[rowBase+start:rowBase+end], p2[rowBase+start:rowBase+end], p3[rowBase+start:rowBase+end]
+			_ = src[n-1]
+			_ = d0[n-1]
+			_ = d1[n-1]
+			_ = d2[n-1]
+			_ = d3[n-1]
+			for i := range n {
+				v := uint16(src[i])
+				d0[i], d1[i], d2[i], d3[i] = v, v, v, v
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// copyStandardAlpha16 将十六位Alpha16单通道图像快速展开为十六位四通道预乘原生存储
+// 入参: ctx Context, pix 源大端透明度字节, stride 行字节步长, offset0 首像素偏移, width, height 尺寸, raster 目标原生图像
+// 返回: error 缓冲校验或取消错误
+func copyStandardAlpha16(ctx context.Context, pix []byte, stride, offset0, width, height int, raster *Raster) error {
+	if err := checkStandardPix(len(pix), stride, offset0, width, height, 2); err != nil {
+		return err
+	}
+	p0, p1, p2, p3 := raster.planes[0].values, raster.planes[1].values, raster.planes[2].values, raster.planes[3].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		row := pix[offset0+y*stride:]
+		rowBase := y * width
+		for start := 0; start < width; start += 1024 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := min(start+1024, width)
+			n := end - start
+			src := row[start*2 : end*2]
+			d0, d1, d2, d3 := p0[rowBase+start:rowBase+end], p1[rowBase+start:rowBase+end], p2[rowBase+start:rowBase+end], p3[rowBase+start:rowBase+end]
+			_ = src[n*2-1]
+			_ = d0[n-1]
+			_ = d1[n-1]
+			_ = d2[n-1]
+			_ = d3[n-1]
+			for i := range n {
+				o := i * 2
+				v := uint16(src[o])<<8 | uint16(src[o+1])
+				d0[i], d1[i], d2[i], d3[i] = v, v, v, v
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// copyStandardYCbCr 将标准YCbCr图像直接转为八位三通道RGB原生存储，避免膨胀为十六位预乘RGBA
+// 入参: ctx Context, src 源YCbCr图像, bounds 有效矩形, raster 目标三通道八位原生图像
+// 返回: error 缓冲边界或取消错误
+func copyStandardYCbCr(ctx context.Context, src *image.YCbCr, bounds image.Rectangle, raster *Raster) error {
+	width, height := bounds.Dx(), bounds.Dy()
+	p0, p1, p2 := raster.planes[0].values, raster.planes[1].values, raster.planes[2].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		sy := bounds.Min.Y + y
+		rowBase := y * width
+		for x := range width {
+			if x&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			sx := bounds.Min.X + x
+			yi, ci := src.YOffset(sx, sy), src.COffset(sx, sy)
+			if yi < 0 || yi >= len(src.Y) || ci < 0 || ci >= len(src.Cb) || ci >= len(src.Cr) {
+				return fmt.Errorf("%w: standard YCbCr pixel buffer", ErrInvalid)
+			}
+			r, g, b := color.YCbCrToRGB(src.Y[yi], src.Cb[ci], src.Cr[ci])
+			at := rowBase + x
+			p0[at], p1[at], p2[at] = uint16(r), uint16(g), uint16(b)
+		}
+	}
+	return ctx.Err()
+}
+
+// copyStandardPaletted 通过预计算调色板查找表高速写入三通道或四通道原生存储
+// 入参: ctx Context, pix 索引字节, stride 行步长, offset0 首像素偏移, width, height 尺寸, table 颜色查表, count 通道数, raster 目标原生图像
+// 返回: error 缓冲、调色板越界或取消错误
+func copyStandardPaletted(ctx context.Context, pix []byte, stride, offset0, width, height int, table [][4]uint16, count int, raster *Raster) error {
+	if err := checkStandardPix(len(pix), stride, offset0, width, height, 1); err != nil {
+		return err
+	}
+	p0, p1, p2 := raster.planes[0].values, raster.planes[1].values, raster.planes[2].values
+	var p3 []uint16
+	if count == 4 {
+		p3 = raster.planes[3].values
+	}
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		row := pix[offset0+y*stride:]
+		rowBase := y * width
+		for x := range width {
+			if x&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			idx := int(row[x])
+			if idx >= len(table) {
+				return fmt.Errorf("%w: palette index out of range", ErrInvalid)
+			}
+			entry := table[idx]
+			at := rowBase + x
+			p0[at], p1[at], p2[at] = entry[0], entry[1], entry[2]
+			if count == 4 {
+				p3[at] = entry[3]
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// jxrWithContainerMetadata 合并编码选项覆盖的EXIF、XMP及IPTC容器元数据，不修改原Info
+// 入参: info 原生图像元数据, opts 可选编码选项
+// 返回: Info 合并后的图像元数据
+func jxrWithContainerMetadata(info Info, opts *EncodeOptions) Info {
+	if opts == nil {
+		return info
+	}
+	if len(opts.EXIF) != 0 {
+		info.EXIF = opts.EXIF
+	}
+	if len(opts.XMP) != 0 {
+		info.XMP = opts.XMP
+	}
+	if len(opts.IPTC) != 0 {
+		info.IPTC = opts.IPTC
+	}
+	return info
 }
 
 // jxrInputTransform 按原生四二二采样方向确定编码网格的转置位，其他颜色保留明确请求的方向
@@ -647,6 +899,19 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 		o.Format = FormatJXR
 	}
 	output := jxrNativeOutput{format: o.Format, stream: jxrStreamOutput{exact: !o.Lossy, workers: normalizeJXRWorkers(o.Workers), maxPixels: limits.MaxPixels, maxBytes: o.MaxOutputBytes, maxMemory: limits.MaxMemoryBytes}}
+	if o.Format == FormatJXR {
+		merged := jxrWithContainerMetadata(raster.info, &o)
+		output.exif, output.xmp, output.iptc = merged.EXIF, merged.XMP, merged.IPTC
+		for _, pair := range [3][2][]byte{{o.EXIF, raster.info.EXIF}, {o.XMP, raster.info.XMP}, {o.IPTC, raster.info.IPTC}} {
+			if len(pair[0]) != 0 && uint64(cap(pair[0])) > uint64(cap(pair[1])) {
+				delta := uint64(cap(pair[0])) - uint64(cap(pair[1]))
+				if retained > limits.MaxMemoryBytes || delta > limits.MaxMemoryBytes-retained {
+					return jxrStream{}, output, errJXREncodingPlanMemory
+				}
+				retained += delta
+			}
+		}
+	}
 	if output.stream.maxBytes == 0 {
 		output.stream.maxBytes = 64 << 20
 	}
@@ -658,10 +923,31 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 		return jxrStream{}, output, errJXREncodingPlanMemory
 	}
 	layout := jxrStream{header: jxrHeader{frequency: o.Layout == LayoutFrequency, overlap: uint8(o.Overlap), transform: uint8(o.Orientation), hardTiles: o.HardTiles, trim: o.Trim != 0}}
+	if len(o.Profiles) != 0 {
+		layout.profiles = make([]jxrProfileLevel, len(o.Profiles))
+		for index, item := range o.Profiles {
+			layout.profiles[index] = jxrProfileLevel{profile: item.Profile, level: item.Level}
+		}
+	}
 	main := PlaneOptions{Band: o.Band, Scaled: o.Scaled, Shift: o.Shift, Float: o.Float, Quantization: o.Quantization}
 	p, err := makeJXREncodePlane(ctx, raster, main, false, o.Alpha == nil, o.Lossy)
 	if err != nil {
 		return layout, output, err
+	}
+	if o.Subsampling != SubsamplingNone {
+		f, err := rasterPixelFormat(raster.info)
+		if err != nil {
+			return layout, output, err
+		}
+		if f.color != 3 && (f.color != 7 || f.depth == 4 || f.depth == 7) {
+			return layout, output, fmt.Errorf("%w: encode subsampling requires non-floating RGB or YCC444", ErrUnsupported)
+		}
+		p.channels, p.chromaX = 3, 2
+		if o.Subsampling == Subsampling422 {
+			p.color, p.chromaY = 2, 0
+		} else {
+			p.color, p.chromaY = 1, 2
+		}
 	}
 	p.legacyHighpassPrediction = o.LegacyHighpassPrediction
 	layout.primary = p
@@ -728,8 +1014,20 @@ func checkJXREncodeOptions(o EncodeOptions) error {
 	if o.SeparateAlpha && o.Format == FormatCodestream {
 		return fmt.Errorf("%w: separate alpha requires a file container", ErrInvalid)
 	}
-	if o.Format > FormatCodestream || o.Band > BandDC || o.Layout > LayoutFrequency || o.Overlap > OverlapTwo || o.Orientation > OrientationRotate90FlipXY || o.Trim > 15 || o.Alpha != nil && o.Alpha.Band > BandDC {
+	if o.Format > FormatCodestream || o.Band > BandDC || o.Layout > LayoutFrequency || o.Overlap > OverlapTwo || o.Orientation > OrientationRotate90FlipXY || o.Subsampling > Subsampling420 || o.Subsampling != SubsamplingNone && !o.Lossy || o.Trim > 15 || o.Alpha != nil && o.Alpha.Band > BandDC {
 		return fmt.Errorf("%w: encode options", ErrInvalid)
+	}
+	if len(o.Profiles) != 0 {
+		if len(o.Profiles) > 4096 {
+			return &LimitError{Resource: "encode profile declaration count", Limit: 4096, Required: uint64(len(o.Profiles))}
+		}
+		profiles := make([]jxrProfileLevel, len(o.Profiles))
+		for index, item := range o.Profiles {
+			profiles[index] = jxrProfileLevel{profile: item.Profile, level: item.Level}
+		}
+		if err := checkJXRProfileDeclarations(profiles); err != nil {
+			return err
+		}
 	}
 	if (o.TileSize.X != 0 || o.TileSize.Y != 0) && (o.TileSize.X <= 0 || o.TileSize.Y <= 0 || o.TileSize.X%16 != 0 || o.TileSize.Y%16 != 0 || o.TileSize.X/16 > 65535 || o.TileSize.Y/16 > 65535) {
 		return fmt.Errorf("%w: encode tile dimensions", ErrInvalid)
@@ -1368,6 +1666,15 @@ func encodeJXRNative(ctx context.Context, raster *Raster, layout jxrStream, opti
 	if len(raster.info.ICCProfile) != 0 {
 		c.profile = raster.info.ICCProfile
 	}
+	if len(options.exif) != 0 {
+		c.exif = options.exif
+	}
+	if len(options.xmp) != 0 {
+		c.xmp = options.xmp
+	}
+	if len(options.iptc) != 0 {
+		c.iptc = options.iptc
+	}
 	w := newJXRBitWriter(ctx, options.stream.maxBytes, budget.limit)
 	w.budget = &budget
 	writeJXRContainer(&w, &c, options.stream.maxPixels)
@@ -1512,7 +1819,7 @@ func jxrRasterWork(raster *Raster, maximum uint64) (uint64, error) {
 	if raster.info.ColorEncoding != nil {
 		work += 4
 	}
-	for _, size := range []uint64{uint64(cap(raster.info.Components)) * 128, uint64(cap(raster.planes)) * 128, uint64(cap(raster.info.ICCProfile))} {
+	for _, size := range []uint64{uint64(cap(raster.info.Components)) * 128, uint64(cap(raster.planes)) * 128, uint64(cap(raster.info.ICCProfile)), uint64(cap(raster.info.EXIF)), uint64(cap(raster.info.XMP)), uint64(cap(raster.info.IPTC))} {
 		if work > maximum || size > maximum-work {
 			return 0, &LimitError{Resource: "JPEG XR retained raster metadata", Limit: maximum, Required: jxrSaturatedAdd(work, size)}
 		}

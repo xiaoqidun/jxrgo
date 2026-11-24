@@ -661,14 +661,17 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 		retained += 4
 	}
 	if settings.Format == FormatJXR {
-		if uint64(len(info.ICCProfile)) > math.MaxUint32 {
-			return Info{}, 0, &LimitError{Resource: "tiled file ICC field capacity", Limit: math.MaxUint32, Required: uint64(len(info.ICCProfile))}
+		info = jxrWithContainerMetadata(info, &settings)
+		for _, blob := range [][]byte{info.ICCProfile, info.EXIF, info.XMP, info.IPTC} {
+			if uint64(len(blob)) > math.MaxUint32 {
+				return Info{}, 0, &LimitError{Resource: "tiled file metadata field capacity", Limit: math.MaxUint32, Required: uint64(len(blob))}
+			}
+			amount := uint64(cap(blob)) + uint64(len(blob))
+			if retained > limits.MaxMemoryBytes || amount > limits.MaxMemoryBytes-retained {
+				return Info{}, 0, &LimitError{Resource: "tiled file retained metadata memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, amount)}
+			}
+			retained += amount
 		}
-		profile := uint64(cap(info.ICCProfile)) + uint64(len(info.ICCProfile))
-		if retained > limits.MaxMemoryBytes || profile > limits.MaxMemoryBytes-retained {
-			return Info{}, 0, &LimitError{Resource: "tiled file retained ICC memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, profile)}
-		}
-		retained += profile
 	}
 	if retained > limits.MaxMemoryBytes || jxrInputHeaderReserve > limits.MaxMemoryBytes-retained {
 		return Info{}, 0, &LimitError{Resource: "tiled source header memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, jxrInputHeaderReserve)}
@@ -687,20 +690,27 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 	if info.Alpha && settings.Alpha != nil && info.Components[info.Channels].Format == SampleFloat && info.Components[info.Channels].Precision == 32 && settings.Alpha.Float == nil {
 		return Info{}, 0, fmt.Errorf("%w: tile input requires explicit alpha float parameters", ErrUnsupported)
 	}
-	if settings.Format == FormatJXR && len(info.ICCProfile) != 0 {
-		if err := ctx.Err(); err != nil {
-			return Info{}, 0, err
-		}
-		original := info.ICCProfile
-		info.ICCProfile = make([]byte, len(original))
-		for at := 0; at < len(original); at += 16384 {
+	if settings.Format == FormatJXR {
+		for _, target := range []*[]byte{&info.ICCProfile, &info.EXIF, &info.XMP, &info.IPTC} {
+			if len(*target) == 0 {
+				*target = nil
+				continue
+			}
 			if err := ctx.Err(); err != nil {
 				return Info{}, 0, err
 			}
-			copy(info.ICCProfile[at:min(at+16384, len(original))], original[at:min(at+16384, len(original))])
+			original := *target
+			copied := make([]byte, len(original))
+			for at := 0; at < len(original); at += 16384 {
+				if err := ctx.Err(); err != nil {
+					return Info{}, 0, err
+				}
+				copy(copied[at:min(at+16384, len(original))], original[at:min(at+16384, len(original))])
+			}
+			*target = copied
 		}
 	} else {
-		info.ICCProfile = nil
+		info.ICCProfile, info.EXIF, info.XMP, info.IPTC = nil, nil, nil, nil
 	}
 	return info, retained, nil
 }

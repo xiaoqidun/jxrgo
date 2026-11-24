@@ -1114,8 +1114,14 @@ func (c *jxrHP) writeComponents(b *jxrBitWriter, p *jxrPlane, pattern []uint16, 
 		b.err = fmt.Errorf("%w: JPEG XR highpass output layout or model", ErrInvalid)
 		return bits
 	}
-	var expected [16]uint16
-	if err := makeJXRHighPatternChecked(p, values, bits, expected[:]); err != nil {
+	var expectedStorage [16]uint16
+	expected := expectedStorage[:]
+	if p.channels > len(expected) {
+		expected = make([]uint16, p.channels)
+	} else {
+		expected = expected[:p.channels]
+	}
+	if err := makeJXRHighPatternChecked(p, values, bits, expected); err != nil {
 		b.err = err
 		return bits
 	}
