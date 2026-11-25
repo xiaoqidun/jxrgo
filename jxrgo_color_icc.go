@@ -239,12 +239,8 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 	available := maximum - uint64(len(tags))*16
 	baseMatrix := jxrICCXYZToSRGB()
 	outMatrix := baseMatrix
-	if intent == IntentAbsolute && class != "link" {
-		reference := jxrICCD50White
-		if profile[8] == 2 && class == "mntr" && !jxrICCHasValidChad(profile, tags) {
-			reference = jxrD65White
-		}
-		scale := [3]float64{white[0] / reference[0], white[1] / reference[1], white[2] / reference[2]}
+	if intent == IntentAbsolute && class != "link" && class != "abst" && !(profile[8] == 2 && class == "mntr") {
+		scale := [3]float64{white[0] / jxrICCD50White[0], white[1] / jxrICCD50White[1], white[2] / jxrICCD50White[2]}
 		outMatrix = jxrICCScaleMatrix(baseMatrix, scale)
 	}
 	d2bTag, a2bPrimary, a2bFallback := jxrICCIntentTags(intent)
@@ -252,7 +248,7 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 		d2bTag, a2bPrimary, a2bFallback = 0x44324230, 0x41324230, 0
 	}
 	if profile[8] == 4 {
-		if intent == IntentAbsolute && class != "link" {
+		if intent == IntentAbsolute && class != "link" && class != "abst" {
 			if data := jxrICCData(profile, tags, 0x44324233); data != nil {
 				result.floating, err = jxrReadICCFloatTransformTarget(ctx, data, result.channels, outputs, target, available)
 				if err == nil {
@@ -348,14 +344,6 @@ func jxrICCTargetSpec(class, pcs string) (int, uint8, bool) {
 		}
 	}
 	return 0, 0, false
-}
-
-// jxrICCHasValidChad 判断ICC配置是否包含合法的九系数色度适应矩阵标签
-// 入参: profile ICC配置字节, tags 已排序标签目录
-// 返回: bool 是否存在合法chad标签
-func jxrICCHasValidChad(profile []byte, tags []jxrICCTag) bool {
-	data := jxrICCData(profile, tags, 0x63686164)
-	return len(data) == 44 && string(data[:4]) == "sf32" && binary.BigEndian.Uint32(data[4:]) == 0
 }
 
 // jxrICCScaleMatrix 按列缩放三阶输出矩阵，等价于矩阵右乘对角白点缩放阵

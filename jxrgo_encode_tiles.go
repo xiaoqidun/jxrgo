@@ -16,6 +16,7 @@ package jxrgo
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"io"
@@ -422,7 +423,7 @@ func encodeJXRRows(ctx context.Context, w io.WriteSeeker, info Info, read Raster
 		return err
 	}
 	if settings.Uncompressed {
-		return fmt.Errorf("%w: row encoder does not support uncompressed mode", ErrUnsupported)
+		return encodeJXRRowsUncompressed(ctx, w, info, read, settings)
 	}
 	format := FormatCodestream
 	if file {
@@ -737,11 +738,13 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 	if err := checkJXRModelComponents(&jxrPlane{channels: info.Channels}); err != nil {
 		return Info{}, 0, err
 	}
-	if info.Components[0].Format == SampleFloat && info.Components[0].Precision == 32 && settings.Float == nil {
-		return Info{}, 0, fmt.Errorf("%w: tile input requires explicit float parameters", ErrUnsupported)
-	}
-	if info.Alpha && settings.Alpha != nil && info.Components[info.Channels].Format == SampleFloat && info.Components[info.Channels].Precision == 32 && settings.Alpha.Float == nil {
-		return Info{}, 0, fmt.Errorf("%w: tile input requires explicit alpha float parameters", ErrUnsupported)
+	if !settings.Uncompressed {
+		if info.Components[0].Format == SampleFloat && info.Components[0].Precision == 32 && settings.Float == nil {
+			return Info{}, 0, fmt.Errorf("%w: tile input requires explicit float parameters", ErrUnsupported)
+		}
+		if info.Alpha && settings.Alpha != nil && info.Components[info.Channels].Format == SampleFloat && info.Components[info.Channels].Precision == 32 && settings.Alpha.Float == nil {
+			return Info{}, 0, fmt.Errorf("%w: tile input requires explicit alpha float parameters", ErrUnsupported)
+		}
 	}
 	if settings.Format == FormatJXR {
 		for _, target := range []*[]byte{&info.ICCProfile, &info.EXIF, &info.GPS, &info.XMP, &info.IPTC} {
@@ -794,4 +797,362 @@ func encodeJXRProvidedTilesTo(ctx context.Context, w io.WriteSeeker, info Info, 
 		}
 		return local, nil
 	})
+}
+
+// encodeJXRRowsUncompressed 将顺序行带按0xBC03无压缩容器格式写出，无转置方向使用行级流式缓冲，转置方向在预算内打包
+// 入参: ctx 已规范化Context, w 起点为零的可定位输出, info 原始图像描述, read 顺序行带读取回调, settings 已校验无压缩选项
+// 返回: error 格式、样本、资源、源、取消或I/O错误
+func encodeJXRRowsUncompressed(ctx context.Context, w io.WriteSeeker, info Info, read RasterRowReader, settings EncodeOptions) error {
+	if info.ImageType&ImageTypePreview != 0 {
+		return fmt.Errorf("%w: JPEG XR preview requires corresponding image", ErrInvalid)
+	}
+	settings.Format = FormatJXR
+	info, retained, err := prepareJXRTileInfo(ctx, info, settings)
+	if err != nil {
+		return err
+	}
+	if settings.SeparateAlpha && !info.Alpha {
+		return fmt.Errorf("%w: separate alpha without source alpha", ErrInvalid)
+	}
+	limits := settings.Limits.normalized()
+	maxBytes := settings.MaxOutputBytes
+	if maxBytes == 0 {
+		maxBytes = 64 << 20
+	}
+	maxBytes = min(maxBytes, uint64(math.MaxUint32))
+	identifier, format, err := jxrRasterIdentifier(info, [16]byte{})
+	if err != nil {
+		return err
+	}
+	transform := jxrInputTransform(info, format.color, uint8(settings.Orientation))
+	codedW, codedH := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
+	if transform&4 != 0 {
+		codedW, codedH = codedH, codedW
+	}
+	layout, err := jxrMakeUncompressedLayout(identifier[15], format, codedW, codedH, settings.SeparateAlpha)
+	if err != nil {
+		return err
+	}
+	if format.name == "BlackWhite" && format.depth == 15 {
+		format.depth = 0
+	}
+	c := jxrContainer{width: codedW, height: codedH, format: format, pixelFormat: identifier, transform: uint32(transform), uncompressed: true}
+	c.setInfoMetadata(info)
+	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(&c, limits.MaxPixels, settings.SeparateAlpha)
+	if err != nil {
+		return err
+	}
+	b := newJXRBitWriter(ctx, maxBytes, limits.MaxMemoryBytes-retained)
+	if b.err != nil {
+		return b.err
+	}
+	var offsets jxrContainerOffsets
+	writeJXRContainerBytes(&b, &c, true, settings.SeparateAlpha, &offsets, exifNode, gpsNode)
+	if b.err != nil {
+		return b.err
+	}
+	header := b.data
+	mainStart := uint64(len(header))
+	if layout.mainBytes > maxBytes-mainStart {
+		return &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(mainStart, layout.mainBytes), Detail: "uncompressed row output bytes"}
+	}
+	total := mainStart + layout.mainBytes
+	alphaStart, padMain := uint64(0), false
+	if settings.SeparateAlpha {
+		if total&1 != 0 {
+			if total >= maxBytes {
+				return &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(total, 1), Detail: "uncompressed row alpha alignment"}
+			}
+			total++
+			padMain = true
+		}
+		alphaStart = total
+		if layout.alphaBytes > maxBytes-total {
+			return &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(total, layout.alphaBytes), Detail: "uncompressed row alpha output bytes"}
+		}
+		total += layout.alphaBytes
+	}
+	binary.LittleEndian.PutUint32(header[offsets.imageSize:], uint32(layout.mainBytes))
+	if settings.SeparateAlpha {
+		binary.LittleEndian.PutUint32(header[offsets.alphaOffset:], uint32(alphaStart))
+		binary.LittleEndian.PutUint32(header[offsets.alphaSize:], uint32(layout.alphaBytes))
+	}
+	position, err := w.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if position != 0 {
+		return fmt.Errorf("%w: uncompressed row output position", ErrInvalid)
+	}
+	step := 1
+	for _, component := range info.Components {
+		step = max(step, int(component.YStep))
+	}
+	cleanInfo := info
+	cleanInfo.ICCProfile, cleanInfo.EXIF, cleanInfo.GPS, cleanInfo.XMP, cleanInfo.IPTC, cleanInfo.Description = nil, nil, nil, nil, nil, nil
+	rowInfo, rowRasterWork, err := jxrRegionInfo(cleanInfo, image.Rect(0, 0, info.Bounds.Dx(), step))
+	if err != nil {
+		return err
+	}
+	baseHeld := retained + uint64(cap(header))
+	if transform&4 != 0 {
+		return writeJXRUncompressedRowTransposed(ctx, w, info, rowInfo, read, &layout, header, transform, step, padMain, baseHeld, rowRasterWork, limits)
+	}
+	return writeJXRUncompressedRowStream(ctx, w, info, rowInfo, read, &layout, header, transform, step, mainStart, alphaStart, total, baseHeld, rowRasterWork, limits)
+}
+
+// writeJXRUncompressedRowStream 在无转置方向下以单行带常量高度流式打包并写出无压缩容器图像
+// 入参: ctx Context, w 起点为零的可定位输出, info 完整图像信息, rowInfo 单行带描述, read 行带回调, layout 无压缩布局, header 完整文件前缀, transform 编码方向, step 单次读取行高, mainStart 主区起点, alphaStart 透明区起点, total 文件总长度, baseHeld 已占内存, rowRasterWork 行带内存, limits 资源限制
+// 返回: error 样本、资源、源、取消或I/O错误
+func writeJXRUncompressedRowStream(ctx context.Context, w io.WriteSeeker, info, rowInfo Info, read RasterRowReader, layout *jxrUncompressedLayout, header []byte, transform uint8, step int, mainStart, alphaStart, total, baseHeld, rowRasterWork uint64, limits Limits) error {
+	bufWork := layout.rowBufferWork()
+	if bufWork > uint64(^uint(0)>>1) {
+		return &LimitError{Resource: "max memory bytes", Limit: uint64(^uint(0) >> 1), Required: bufWork, Detail: "uncompressed row buffer capacity"}
+	}
+	if _, ok := jxrWorkTotal(limits.MaxMemoryBytes, baseHeld, rowRasterWork, bufWork); !ok {
+		return &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(baseHeld, jxrSaturatedAdd(rowRasterWork, bufWork)), Detail: "uncompressed row streaming memory"}
+	}
+	rowRaster, err := newRasterContext(ctx, rowInfo, Limits{MaxPixels: limits.MaxPixels, MaxMemoryBytes: rowRasterWork})
+	if err != nil {
+		return err
+	}
+	rowBuf := make([]byte, int(layout.rowBytes))
+	var alphaBuf []byte
+	if !layout.planar && layout.separateAlpha {
+		alphaBuf = make([]byte, int(layout.alphaRowBytes))
+	}
+	if err := writeEncoderOutput(ctx, w, header); err != nil {
+		return err
+	}
+	needSeek := layout.planar || layout.separateAlpha || transform&1 != 0
+	if needSeek {
+		var zeros [32768]byte
+		for remaining := total - uint64(len(header)); remaining != 0; {
+			chunk := min(remaining, uint64(len(zeros)))
+			if err := writeEncoderOutput(ctx, w, zeros[:int(chunk)]); err != nil {
+				return err
+			}
+			remaining -= chunk
+		}
+	}
+	dispW, dispH := info.Bounds.Dx(), info.Bounds.Dy()
+	codedW, codedH := int(layout.width), int(layout.height)
+	totalComp := len(info.Components)
+	var samples [9]uint32
+	for y := 0; y < dispH; y += step {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for pi := range rowRaster.planes {
+			clear(rowRaster.planes[pi].values)
+			clear(rowRaster.planes[pi].words)
+		}
+		view := *rowRaster
+		if err := read(ctx, y, &view); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if layout.planar {
+			stepBytes := int(layout.sampleBytes)
+			for ci := range totalComp {
+				sx, sy, baseOffset, dstRowBytes, inAlpha := layout.planeSpec(ci)
+				cw, ch := codedW/sx, codedH/sy
+				plane := &rowRaster.planes[ci]
+				baseFile := mainStart + baseOffset
+				if inAlpha {
+					baseFile = alphaStart + baseOffset
+				}
+				for ry := range step / sy {
+					dy := y/sy + ry
+					cy := dy
+					if transform&1 != 0 {
+						cy = ch - 1 - dy
+					}
+					rowOut := rowBuf[:int(dstRowBytes)]
+					for dx := range cw {
+						if dx&1023 == 0 {
+							if err := ctx.Err(); err != nil {
+								return err
+							}
+						}
+						cx := dx
+						if transform&2 != 0 {
+							cx = cw - 1 - dx
+						}
+						val := plane.sampleBits(ry*cw + dx)
+						if err := jxrPackUncompressedSample(rowOut[cx*stepBytes:], val, layout.sampleBytes, layout.tenBit); err != nil {
+							return err
+						}
+					}
+					if err := seekJXRImageOutput(ctx, w, baseFile+uint64(cy)*dstRowBytes); err != nil {
+						return err
+					}
+					if err := writeEncoderOutput(ctx, w, rowOut); err != nil {
+						return err
+					}
+				}
+			}
+			continue
+		}
+		clear(rowBuf)
+		cy := y
+		if transform&1 != 0 {
+			cy = codedH - 1 - y
+		}
+		for dx := range dispW {
+			if dx&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			cx := dx
+			if transform&2 != 0 {
+				cx = codedW - 1 - dx
+			}
+			for ci := range totalComp {
+				samples[ci] = rowRaster.planes[ci].sampleBits(dx)
+			}
+			if err := jxrPackUncompressedPixel(layout, rowBuf, alphaBuf, cx, samples[:totalComp]); err != nil {
+				return err
+			}
+		}
+		if !needSeek {
+			if err := writeEncoderOutput(ctx, w, rowBuf); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := seekJXRImageOutput(ctx, w, mainStart+uint64(cy)*layout.rowBytes); err != nil {
+			return err
+		}
+		if err := writeEncoderOutput(ctx, w, rowBuf); err != nil {
+			return err
+		}
+		if layout.separateAlpha {
+			if err := seekJXRImageOutput(ctx, w, alphaStart+uint64(cy)*layout.alphaRowBytes); err != nil {
+				return err
+			}
+			if err := writeEncoderOutput(ctx, w, alphaBuf); err != nil {
+				return err
+			}
+		}
+	}
+	if needSeek {
+		if err := seekJXRImageOutput(ctx, w, total); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+// writeJXRUncompressedRowTransposed 在转置方向下以单遍行带散射打包无压缩载荷并顺序写出
+// 入参: ctx Context, w 起点为零的可定位输出, info 完整图像信息, rowInfo 单行带描述, read 行带回调, layout 无压缩布局, header 完整文件前缀, transform 编码方向, step 单次读取行高, padMain 主区后是否需偶数对齐零字节, baseHeld 已占内存, rowRasterWork 行带内存, limits 资源限制
+// 返回: error 样本、资源、源、取消或I/O错误
+func writeJXRUncompressedRowTransposed(ctx context.Context, w io.WriteSeeker, info, rowInfo Info, read RasterRowReader, layout *jxrUncompressedLayout, header []byte, transform uint8, step int, padMain bool, baseHeld, rowRasterWork uint64, limits Limits) error {
+	rawTotal := layout.mainBytes + layout.alphaBytes
+	if rawTotal > uint64(^uint(0)>>1) {
+		return &LimitError{Resource: "max memory bytes", Limit: uint64(^uint(0) >> 1), Required: rawTotal, Detail: "uncompressed transposed payload capacity"}
+	}
+	if _, ok := jxrWorkTotal(limits.MaxMemoryBytes, baseHeld, rowRasterWork, rawTotal); !ok {
+		return &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(baseHeld, jxrSaturatedAdd(rowRasterWork, rawTotal)), Detail: "uncompressed transposed row memory"}
+	}
+	rowRaster, err := newRasterContext(ctx, rowInfo, Limits{MaxPixels: limits.MaxPixels, MaxMemoryBytes: rowRasterWork})
+	if err != nil {
+		return err
+	}
+	mainData := make([]byte, int(layout.mainBytes))
+	var alphaData []byte
+	if layout.separateAlpha {
+		alphaData = make([]byte, int(layout.alphaBytes))
+	}
+	inverse := [8]uint8{0, 1, 2, 3, 7, 5, 6, 4}
+	inv := inverse[transform]
+	dispW, dispH := info.Bounds.Dx(), info.Bounds.Dy()
+	totalComp := len(info.Components)
+	var samples [9]uint32
+	for y := 0; y < dispH; y += step {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for pi := range rowRaster.planes {
+			clear(rowRaster.planes[pi].values)
+			clear(rowRaster.planes[pi].words)
+		}
+		view := *rowRaster
+		if err := read(ctx, y, &view); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if layout.planar {
+			stepBytes := int(layout.sampleBytes)
+			for ci := range totalComp {
+				_, _, baseOffset, dstRowBytes, inAlpha := layout.planeSpec(ci)
+				dst := mainData
+				if inAlpha {
+					dst = alphaData
+				}
+				comp := info.Components[ci]
+				dsx, dsy := int(comp.XStep), int(comp.YStep)
+				dw, dh := dispW/dsx, dispH/dsy
+				plane := &rowRaster.planes[ci]
+				for ry := range step / dsy {
+					dy := y/dsy + ry
+					for dx := range dw {
+						if dx&1023 == 0 {
+							if err := ctx.Err(); err != nil {
+								return err
+							}
+						}
+						val := plane.sampleBits(ry*dw + dx)
+						cx, cy := jxrRasterPosition(dx, dy, dw, dh, inv)
+						rowDst := dst[baseOffset+uint64(cy)*dstRowBytes:]
+						if err := jxrPackUncompressedSample(rowDst[cx*stepBytes:], val, layout.sampleBytes, layout.tenBit); err != nil {
+							return err
+						}
+					}
+				}
+			}
+			continue
+		}
+		for dx := range dispW {
+			if dx&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			for ci := range totalComp {
+				samples[ci] = rowRaster.planes[ci].sampleBits(dx)
+			}
+			cx, cy := jxrRasterPosition(dx, y, dispW, dispH, inv)
+			rowDst := mainData[uint64(cy)*layout.rowBytes:]
+			var alphaRow []byte
+			if layout.separateAlpha {
+				alphaRow = alphaData[uint64(cy)*layout.alphaRowBytes:]
+			}
+			if err := jxrPackUncompressedPixel(layout, rowDst, alphaRow, cx, samples[:totalComp]); err != nil {
+				return err
+			}
+		}
+	}
+	if err := writeEncoderOutput(ctx, w, header); err != nil {
+		return err
+	}
+	if err := writeEncoderOutput(ctx, w, mainData); err != nil {
+		return err
+	}
+	if padMain {
+		if err := writeEncoderOutput(ctx, w, []byte{0}); err != nil {
+			return err
+		}
+	}
+	if layout.separateAlpha {
+		if err := writeEncoderOutput(ctx, w, alphaData); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
 }

@@ -16,6 +16,7 @@ package jxrgo
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -119,6 +120,12 @@ type jxrSubIFDEntry struct {
 	subIFD     bool
 	swapEndian bool
 	children   []*jxrSubIFDNode
+}
+
+// jxrSubIFDOrder 保存重排Sub-IFD目录项时的标签值与原槽位序号
+type jxrSubIFDOrder struct {
+	tag   uint16
+	index int
 }
 
 // jxrSubIFDScan 保存递归扫描Sub-IFD时的边界、深度、节点计数与防环路状态
@@ -735,6 +742,7 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 		binary.LittleEndian.PutUint16(outTable[0:2], uint16(count))
 	}
 	node := &jxrSubIFDNode{table: outTable, count: count, totalBytes: tableLen}
+	prevTag, ordered := -1, true
 	for i := range count {
 		if s.parser != nil {
 			if err := s.parser.check(); err != nil {
@@ -743,6 +751,10 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 		}
 		entry := table[2+i*12 : 2+(i+1)*12]
 		tag, typ, n := s.order.Uint16(entry), s.order.Uint16(entry[2:]), uint64(s.order.Uint32(entry[4:]))
+		if int(tag) <= prevTag {
+			ordered = false
+		}
+		prevTag = int(tag)
 		width := jxrExifTypeWidth(typ)
 		if width == 0 {
 			return nil, fmt.Errorf("%w: JPEG XR Sub-IFD field type", ErrInvalid)
@@ -758,7 +770,7 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 			binary.LittleEndian.PutUint16(outEntry[2:4], typ)
 			binary.LittleEndian.PutUint32(outEntry[4:8], uint32(n))
 			if !nested && fieldBytes <= 4 {
-				copy(outEntry[8:12], entry[8:12])
+				copy(outEntry[8:8+fieldBytes], entry[8:8+fieldBytes])
 				jxrSwapTIFFEndian(outEntry[8:8+fieldBytes], typ)
 			}
 		}
@@ -811,6 +823,37 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 			node.totalBytes += padded
 			node.entries = append(node.entries, jxrSubIFDEntry{index: int(i), typ: typ, srcOffset: fieldOffset, size: fieldBytes, swapEndian: swap})
 		}
+	}
+	if !ordered {
+		if err := s.reserveTemp(count*16 + tableLen); err != nil {
+			return nil, err
+		}
+		orderList := make([]jxrSubIFDOrder, int(count))
+		for i := range int(count) {
+			orderList[i] = jxrSubIFDOrder{tag: binary.LittleEndian.Uint16(outTable[2+i*12:]), index: i}
+		}
+		slices.SortFunc(orderList, func(a, b jxrSubIFDOrder) int {
+			return cmp.Compare(a.tag, b.tag)
+		})
+		for i := 1; i < len(orderList); i++ {
+			if orderList[i].tag == orderList[i-1].tag {
+				return nil, fmt.Errorf("%w: JPEG XR Sub-IFD duplicate tag", ErrInvalid)
+			}
+		}
+		newIndex := make([]int, int(count))
+		sortedTable := make([]byte, len(outTable))
+		binary.LittleEndian.PutUint16(sortedTable[0:2], uint16(count))
+		for newPos, item := range orderList {
+			newIndex[item.index] = newPos
+			copy(sortedTable[2+newPos*12:2+(newPos+1)*12], outTable[2+item.index*12:2+(item.index+1)*12])
+		}
+		for ei := range node.entries {
+			node.entries[ei].index = newIndex[node.entries[ei].index]
+		}
+		slices.SortFunc(node.entries, func(a, b jxrSubIFDEntry) int {
+			return cmp.Compare(a.index, b.index)
+		})
+		node.table = sortedTable
 	}
 	return node, nil
 }

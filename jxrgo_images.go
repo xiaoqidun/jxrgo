@@ -890,6 +890,7 @@ func snapshotJXRTileOptions(ctx context.Context, info Info, options EncodeOption
 		value := *options.Float
 		options.Float = &value
 	}
+	options.ColorHint = nil
 	if options.Window != nil {
 		value := *options.Window
 		options.Window = &value

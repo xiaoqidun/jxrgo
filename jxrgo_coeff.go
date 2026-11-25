@@ -213,6 +213,9 @@ func (s *jxrStream) coefficientsContext(ctx context.Context, data []byte, maxWor
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if s.decodeBand > BandDC {
+		return nil, fmt.Errorf("%w: JPEG XR decode band", ErrInvalid)
+	}
 	if err := checkJXRModelComponents(&s.primary); err != nil {
 		return nil, err
 	}
@@ -306,6 +309,25 @@ func (c *jxrCoefficients) lowMacro(at int) []int64 {
 func (c *jxrCoefficients) highMacro(at int) []int64 {
 	stride := c.plane.channels * 256
 	return c.high[at*stride : (at+1)*stride]
+}
+
+// storeDCComponents 按当前分块量化步长反量化并保存宏块DC系数
+// 入参: at 宏块编号, q 分块量化参数, dc 逐分量预测后DC系数
+// 返回: error 数值范围或计算容量错误
+func (c *jxrCoefficients) storeDCComponents(at int, q *jxrTileQuant, dc []int64) error {
+	low := c.lowMacro(at)
+	for ch := range c.plane.channels {
+		shift := uint8(0)
+		if ch == 0 {
+			shift = 1
+		}
+		value, err := scaleJXRWord(dc[ch], jxrQuantScale(q.dc[ch], c.plane.scaled, shift), c.longWord)
+		if err != nil {
+			return err
+		}
+		low[ch*16] = value
+	}
+	return nil
 }
 
 // storeLowComponents 保存宏块反量化系数，仅复制实际分量
@@ -549,7 +571,11 @@ func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, 
 	dc := [2]jxrDC{newJXRDC(), newJXRDC()}
 	lp := [2]jxrLP{newJXRLP(), newJXRLP()}
 	hp := [2]jxrHP{newJXRHP(), newJXRHP()}
-	count := 4 - int(s.primary.bands)
+	streamCount := 4 - int(s.primary.bands)
+	if streamCount < 1 || tile >= len(s.packets)/streamCount {
+		return fmt.Errorf("%w: JPEG XR frequency packet", ErrInvalid)
+	}
+	count := min(streamCount, 4-int(s.decodeBand))
 	for band := range count {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -557,7 +583,7 @@ func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, 
 		var b jxrBits
 		var packet jxrPacket
 		var err error
-		packetIndex := tile*count + band
+		packetIndex := tile*streamCount + band
 		if band == 3 && jxrEmptyFlexPacket(s, data, packetIndex) {
 			packet.trim = 15
 		} else {
@@ -596,6 +622,9 @@ func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, 
 					switch band {
 					case 0:
 						err = p.readDC(&b, &dc[i], &q[i], m, &current.low, scratch[i])
+						if err == nil && count == 1 && p.plane.bands != 3 {
+							err = p.storeDCComponents(m.at, &q[i], scratch[i].dc)
+						}
 					case 1:
 						if q[i].lpCount > 1 && !q[i].useDC {
 							info.lpIndex = uint8(readJXRQPIndex(&b, q[i].lpCount))
@@ -608,7 +637,7 @@ func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, 
 							info.hpIndex = uint8(readJXRQPIndex(&b, q[i].hpCount))
 						}
 						err = p.readHP(&b, &hp[i], m, false, 0, row.residual, current.pattern)
-						if err == nil && p.plane.bands == 1 {
+						if err == nil && (p.plane.bands == 1 || p.plane.bands == 0 && count == 3) {
 							err = refineJXRHigh(&b, &p.plane, info.bits, 15, p.highMacro(m.at))
 							if err == nil {
 								err = p.finishHighComponents(m.at, &q[i], scratch[i].low)

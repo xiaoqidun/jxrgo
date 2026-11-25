@@ -579,7 +579,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 		return nil, &LimitError{Resource: "max memory bytes", Limit: budgetLimit, Required: decodeWork, Detail: "JPEG XR combined decoding storage"}
 	}
 	slack := budgetLimit - decodeWork
-	state, err := decodeJXRCoefficients(ctx, &source.primary, c.image, jxrWorkerBudgetAllowance(slack, source.primary.coefficientWork()))
+	state, err := source.primary.coefficientsContext(ctx, c.image, jxrWorkerBudgetAllowance(slack, source.primary.coefficientWork()))
 	if err != nil {
 		return nil, err
 	}
@@ -589,7 +589,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 	}
 	alphaHeader, alphaPlane := &state.header, state.alpha
 	if source.alpha != nil {
-		alphaState, err := decodeJXRCoefficients(ctx, source.alpha, c.alpha, jxrWorkerBudgetAllowance(slack, source.alpha.coefficientWork()))
+		alphaState, err := source.alpha.coefficientsContext(ctx, c.alpha, jxrWorkerBudgetAllowance(slack, source.alpha.coefficientWork()))
 		if err != nil {
 			return nil, err
 		}

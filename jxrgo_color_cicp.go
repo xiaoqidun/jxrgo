@@ -146,17 +146,21 @@ func jxrHasSignedSamples(info Info) bool {
 	return format == SampleFixed || format == SampleFloat
 }
 
-// jxrNewYCCDecoder 为YCC图像构造非线性YCC到RGB的预解码器，仅在无CICP声明或矩阵未指定时回退T.832默认全范围BT.601
+// jxrNewYCCDecoder 为YCC图像构造非线性YCC到RGB的预解码器，无CICP声明时回退T.832默认全范围BT.601，矩阵未指定时仅回退BT.601并保留原范围声明
 // 入参: info 原生图像描述, encoding 可选PTM CICP编码声明
 // 返回: jxrYCCDecoder YCC到RGB预解码器, bool 矩阵与样本编码是否受支持
 func jxrNewYCCDecoder(info Info, encoding *ColorEncoding) (jxrYCCDecoder, bool) {
 	if info.ColorSpace != ColorYCC || info.Channels != 3 || len(info.Components) < 3 {
 		return jxrYCCDecoder{}, false
 	}
-	if encoding == nil || encoding.Matrix == 2 {
+	if encoding == nil {
 		return jxrBuildYCCDecoder(info, ColorEncoding{Primaries: 1, Transfer: 13, Matrix: 5, FullRange: true})
 	}
-	return jxrBuildYCCDecoder(info, *encoding)
+	spec := *encoding
+	if spec.Matrix == 2 {
+		spec.Matrix = 5
+	}
+	return jxrBuildYCCDecoder(info, spec)
 }
 
 // jxrCICPMatrixLuma 返回标准CICP非恒定或恒定亮度颜色矩阵对应的红蓝亮度权重
@@ -301,10 +305,13 @@ func jxrCICPDisplay(info Info, specification ColorEncoding, peakNits float64) (j
 	gray := info.ColorSpace == ColorGray && info.Channels == 1
 	rgb := info.ColorSpace == ColorRGB && info.Channels == 3
 	xyz := specification.Primaries == 10
-	layout := rgb && matrixCode == 0 || ycc || gray && !xyz
+	layout := rgb && (matrixCode == 0 || matrixCode == 2) || ycc || gray && !xyz
 	if !layout || len(info.Components) < info.Channels ||
 		info.Premultiplied && (!specification.FullRange || ycc) {
 		return mapping, false
+	}
+	if rgb && matrixCode == 2 {
+		matrixCode, specification.Matrix = 0, 0
 	}
 	transfer := uint16(specification.Transfer)
 	if xyz && !jxrCICPXYZEncoding(specification) || transfer == 17 && !xyz {
@@ -515,6 +522,16 @@ func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha fl
 		}
 		if display.transfer == 18 {
 			rgb = jxrHLGDisplayLight(rgb, display.hlgLuma, display.peakNits)
+			if display.peakNits <= 100 {
+				scale := display.peakNits / 100
+				for index := range rgb {
+					rgb[index] *= scale
+				}
+			}
+		} else if display.peakNits <= 100 {
+			for index := range rgb {
+				rgb[index] *= 100
+			}
 		} else if display.peakNits != 10000 {
 			scale := 10000 / display.peakNits
 			for index := range rgb {
@@ -810,7 +827,7 @@ func jxrHDRInverseTransfer(value float64, transfer uint16) float64 {
 // 返回: [3]float64 参考显示光RGB
 func jxrHLGDisplayLight(rgb, weights [3]float64, peakNits float64) [3]float64 {
 	luma := weights[0]*rgb[0] + weights[1]*rgb[1] + weights[2]*rgb[2]
-	if !(luma > 0) {
+	if !(luma > 0) || !geometryFinite(luma) {
 		return [3]float64{}
 	}
 	gamma := 1.2
@@ -818,20 +835,41 @@ func jxrHLGDisplayLight(rgb, weights [3]float64, peakNits float64) [3]float64 {
 		if peakNits >= 400 && peakNits <= 2000 {
 			gamma = 1.2 + 0.42*math.Log10(peakNits/1000)
 		} else {
-			gamma = 1.2 * math.Pow(1.111, math.Log2(peakNits/1000))
+			gamma = 1.2 * math.Pow(1.111, math.Log2(peakNits)-math.Log2(1000))
 		}
 	}
 	gain := math.Pow(luma, gamma-1)
+	lumaGamma := 0.0
+	lumaLog := 0.0
+	hasFallback := false
 	for i := range rgb {
-		if rgb[i] != 0 {
-			rgb[i] *= gain
+		if rgb[i] == 0 {
+			continue
 		}
+		if geometryFinite(gain) {
+			if value := rgb[i] * gain; geometryFinite(value) {
+				rgb[i] = value
+				continue
+			}
+		}
+		if !hasFallback {
+			lumaGamma, lumaLog, hasFallback = math.Pow(luma, gamma), math.Log(luma), true
+		}
+		if value := (rgb[i] / luma) * lumaGamma; geometryFinite(value) {
+			rgb[i] = value
+			continue
+		}
+		value := math.Copysign(math.Exp(math.Log(math.Abs(rgb[i]))+(gamma-1)*lumaLog), rgb[i])
+		if !geometryFinite(value) {
+			value = math.Copysign(math.MaxFloat64, rgb[i])
+		}
+		rgb[i] = value
 	}
 	return rgb
 }
 
-// jxrBT2446MethodA 按BT.2446方法A将指定峰值显示光映射到100 cd/m²并按BT.1886线性化输出，不高于100 cd/m²时直接裁剪恒等输出
-// 入参: rgb BT.2020线性显示RGB，相对peakNits峰值归一化, peakNits HDR标称峰值亮度
+// jxrBT2446MethodA 按BT.2446方法A将指定峰值显示光映射到100 cd/m²并按BT.1886线性化输出，不高于100 cd/m²直接裁剪恒等，100至200 cd/m²按对数权重连续平滑过渡
+// 入参: rgb BT.2020线性显示RGB，高于100 cd/m²时相对peakNits归一化、否则相对100 cd/m²归一化, peakNits HDR标称峰值亮度
 // 返回: [3]float64 BT.2020线性SDR显示RGB
 func jxrBT2446MethodA(rgb [3]float64, peakNits float64) [3]float64 {
 	if peakNits <= 100 {
@@ -844,30 +882,58 @@ func jxrBT2446MethodA(rgb [3]float64, peakNits float64) [3]float64 {
 		}
 		return rgb
 	}
+	var direct [3]float64
+	blend := peakNits < 200
+	if blend {
+		scale := peakNits / 100
+		for index, value := range rgb {
+			scaled := value * scale
+			if !(scaled > 0) {
+				direct[index] = 0
+			} else if scaled > 1 {
+				direct[index] = 1
+			} else {
+				direct[index] = scaled
+			}
+		}
+	}
 	for index, value := range rgb {
-		rgb[index] = math.Pow(colorClamp(value), 1/2.4)
+		if !(value > 0) {
+			rgb[index] = 0
+		} else if value > 1 {
+			rgb[index] = 1
+		} else {
+			rgb[index] = math.Pow(value, 1/2.4)
+		}
 	}
 	luma := jxrBT2100Red*rgb[0] + jxrBT2100Green*rgb[1] + jxrBT2100Blue*rgb[2]
 	if !(luma > 0) {
-		return [3]float64{}
+		rgb = [3]float64{}
+	} else {
+		hdrRho := 32 * math.Pow(peakNits/10000, 1/2.4)
+		perceptual := math.Log1p(hdrRho*luma) / math.Log1p(hdrRho)
+		var compressed float64
+		switch {
+		case perceptual <= 0.7399:
+			compressed = 1.0770 * perceptual
+		case perceptual < 0.9909:
+			compressed = (-1.1510*perceptual+2.7811)*perceptual - 0.6302
+		default:
+			compressed = 0.5*perceptual + 0.5
+		}
+		sdr := math.Expm1(jxrBT2446SDRLog*compressed) / jxrBT2446SDRRho
+		gain := sdr / (1.1 * luma)
+		cb, cr := gain*(rgb[2]-luma)/1.8814, gain*(rgb[0]-luma)/1.4746
+		rgb = jxrCICPYCCToRGB([3]float64{sdr - max(0.1*cr, 0), cb, cr}, jxrBT2100Red, jxrBT2100Blue)
+		for index, value := range rgb {
+			rgb[index] = math.Pow(max(0, value), 2.4)
+		}
 	}
-	hdrRho := 32 * math.Pow(peakNits/10000, 1/2.4)
-	perceptual := math.Log1p(hdrRho*luma) / math.Log1p(hdrRho)
-	var compressed float64
-	switch {
-	case perceptual <= 0.7399:
-		compressed = 1.0770 * perceptual
-	case perceptual < 0.9909:
-		compressed = (-1.1510*perceptual+2.7811)*perceptual - 0.6302
-	default:
-		compressed = 0.5*perceptual + 0.5
-	}
-	sdr := math.Expm1(jxrBT2446SDRLog*compressed) / jxrBT2446SDRRho
-	gain := sdr / (1.1 * luma)
-	cb, cr := gain*(rgb[2]-luma)/1.8814, gain*(rgb[0]-luma)/1.4746
-	rgb = jxrCICPYCCToRGB([3]float64{sdr - max(0.1*cr, 0), cb, cr}, jxrBT2100Red, jxrBT2100Blue)
-	for index, value := range rgb {
-		rgb[index] = math.Pow(max(0, value), 2.4)
+	if blend {
+		t := math.Log2(peakNits / 100)
+		for index := range rgb {
+			rgb[index] = direct[index] + t*(rgb[index]-direct[index])
+		}
 	}
 	return rgb
 }

@@ -29,7 +29,7 @@ type ColorTransform func(samples []float64, alpha float64) (red, green, blue flo
 
 // DisplayOptions 指定原生分量取样、显式颜色变换、ICC意图、HDR峰值亮度及输出限制，零值采用最近邻和内建基本显示策略
 // Transform非nil时由调用方负责色彩和预乘；ApplyICC启用内建ICC颜色解释并按Intent选择渲染意图，Transform优先
-// HDRPeakNits指定BT.2446方法A的HDR标称峰值亮度（零值对PQ默认10000、对HLG默认1000，大于零且不高于100 nit时直接裁剪输出）；Limits计入输出及库内临时存储
+// HDRPeakNits指定BT.2446方法A的HDR标称峰值亮度（零值对PQ默认10000、对HLG默认1000，不高于100 nit按相对100 nit物理裁剪，100至200 nit连续平滑过渡）；Limits计入输出及库内临时存储
 type DisplayOptions struct {
 	Filter      ResampleFilter
 	Transform   ColorTransform

@@ -39,6 +39,7 @@ type jxrNativeOutput struct {
 	format        Format
 	pixelFormat   [16]byte
 	iccProfile    []byte
+	colorHint     *ColorHint
 	colorEncoding *ColorEncoding
 	exif          []byte
 	gps           []byte
@@ -654,6 +655,9 @@ func jxrWithContainerMetadata(info Info, opts *EncodeOptions) Info {
 	if len(opts.ICCProfile) != 0 {
 		info.ICCProfile = opts.ICCProfile
 	}
+	if opts.ColorHint != nil {
+		info.ColorHint = *opts.ColorHint
+	}
 	if opts.ColorEncoding != nil {
 		info.ColorEncoding = opts.ColorEncoding
 	}
@@ -963,6 +967,10 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 	if o.Format == FormatJXR {
 		merged := jxrWithContainerMetadata(raster.info, &o)
 		output.iccProfile, output.colorEncoding = merged.ICCProfile, merged.ColorEncoding
+		if o.ColorHint != nil {
+			hint := *o.ColorHint
+			output.colorHint = &hint
+		}
 		output.exif, output.gps, output.xmp, output.iptc, output.description = merged.EXIF, merged.GPS, merged.XMP, merged.IPTC, merged.Description
 		nextRetained, _, ok := jxrContainerMetadataRetained(retained, limits.MaxMemoryBytes, raster.info, &o)
 		if !ok {
@@ -1095,6 +1103,9 @@ func checkJXREncodeOptions(o EncodeOptions) error {
 	}
 	if o.Format > FormatCodestream || o.Band > BandDC || o.Layout > LayoutFrequency || o.Overlap > OverlapTwo || o.Orientation > OrientationRotate90FlipXY || o.Subsampling > Subsampling420 || o.Subsampling != SubsamplingNone && !o.Lossy || o.Trim > 15 || o.Alpha != nil && o.Alpha.Band > BandDC {
 		return fmt.Errorf("%w: encode options", ErrInvalid)
+	}
+	if o.ColorHint != nil && *o.ColorHint != ColorHintNone && *o.ColorHint != ColorHintSRGB && *o.ColorHint != ColorHintUnspecified {
+		return fmt.Errorf("%w: encode color hint", ErrInvalid)
 	}
 	if o.Uncompressed {
 		if o.Format == FormatCodestream || o.Layout != LayoutSpatial || o.Overlap != OverlapNone || o.Subsampling != SubsamplingNone || o.TileSize != (image.Point{}) || o.HardTiles || o.Lossy || o.LegacyHighpassPrediction || o.Band != BandAll || o.Trim != 0 || o.Scaled || o.Shift != 0 || o.Float != nil || o.Quantization != nil || o.Alpha != nil || o.MirrorSeparateAlpha || len(o.Profiles) != 0 || o.Window != nil || o.ChromaCenteringX != nil || o.ChromaCenteringY != nil {
@@ -1773,6 +1784,9 @@ func encodeJXRNative(ctx context.Context, raster *Raster, layout jxrStream, opti
 	meta := raster.info
 	if len(options.iccProfile) != 0 {
 		meta.ICCProfile = options.iccProfile
+	}
+	if options.colorHint != nil {
+		meta.ColorHint = *options.colorHint
 	}
 	if options.colorEncoding != nil {
 		meta.ColorEncoding = options.colorEncoding

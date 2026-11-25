@@ -240,7 +240,7 @@ type ImageDescription struct {
 
 // EncodeOptions 指定编码格式、布局、精度、并发、元数据与资源上限，零值采用无损JXR及全部频带
 // TileSize以编码网格像素计且须为十六倍数，仅Lossy允许精度损失与Subsampling下采样，SeparateAlpha写入独立透明度码流
-// Profiles指定档次与级别声明，ICCProfile、ColorEncoding、EXIF、GPS、XMP、IPTC与Description非空时优先于源Info写入容器；Uncompressed启用0xBC03无压缩容器模式
+// Profiles指定档次与级别声明，ICCProfile、ColorHint、ColorEncoding、EXIF、GPS、XMP、IPTC与Description非空时优先于源Info写入容器；Uncompressed启用0xBC03无压缩容器模式
 // Window指定编码窗口边距，ChromaCenteringX与ChromaCenteringY指定色度采样相位（0至4或7）；Workers零值自动，MaxOutputBytes零值采用64MiB
 type EncodeOptions struct {
 	Format                   Format
@@ -264,6 +264,7 @@ type EncodeOptions struct {
 	MirrorSeparateAlpha      bool
 	Profiles                 []ProfileLevel
 	ICCProfile               []byte
+	ColorHint                *ColorHint
 	ColorEncoding            *ColorEncoding
 	EXIF                     []byte
 	GPS                      []byte
