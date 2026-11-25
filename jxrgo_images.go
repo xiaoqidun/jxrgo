@@ -106,6 +106,26 @@ func (d *Decoder) ImageInfo(ctx context.Context, index int) (Info, error) {
 	return info, nil
 }
 
+// ImageDecoder 按ImageCount的索引顺序创建指定图像的独立子解码器，共享底层随机读取源与只读输入
+// 子解码器继承KeepOrientation、Band、Workers及受控内存预算，支持Info、Decode、DecodeStrips、DecodeRegion、DecodeReduced与独立Close，与父解码器严格并发安全
+// 入参: ctx Context，nil采用Background, index 从零开始的目录序号
+// 返回: *Decoder 独立子图像解码器, error 序号、数据、资源、取消或关闭错误
+func (d *Decoder) ImageDecoder(ctx context.Context, index int) (*Decoder, error) {
+	if d == nil {
+		return nil, ErrClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	selected, err := d.imageDecoderIndependent(ctx, index)
+	if err != nil {
+		return nil, wrapJXRError("Decoder.ImageDecoder", err)
+	}
+	return selected, nil
+}
+
 // DecodeImage 校验目录链接并重建指定图像，主图及独立透明度使用该目录自己的字段及码流
 // 不把整幅输入复制为单图文件，内存预算包含仍保留的首图索引和元数据
 // 入参: ctx Context，nil采用Background, index 从零开始的目录序号
@@ -153,7 +173,7 @@ func (d *Decoder) imageDirectory(ctx context.Context, index int) (jxrDirectory, 
 	if len(d.data) < 8 || index < -1 {
 		return jxrDirectory{}, 0, fmt.Errorf("%w: JPEG XR image directory request", ErrInvalid)
 	}
-	if d.source.format == FormatCodestream {
+	if d.source.format == FormatCodestream || d.singleImage {
 		if index > 0 {
 			return jxrDirectory{}, 0, fmt.Errorf("%w: JPEG XR image index", ErrInvalid)
 		}
@@ -254,6 +274,88 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	if index == 0 {
 		return d, nil
 	}
+	return d.parseDirectoryDecoder(ctx, &directory, false)
+}
+
+// imageDecoderIndependent 在持有父解码器锁时建立与父解码器完全无可变状态共享的独立单图子解码器
+// 入参: ctx 已规范化Context, index 从零开始的目录序号
+// 返回: *Decoder 独立子图像解码器, error 目录、数据、资源、取消或关闭错误
+func (d *Decoder) imageDecoderIndependent(ctx context.Context, index int) (*Decoder, error) {
+	if d.closed {
+		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if index < 0 {
+		return nil, fmt.Errorf("%w: JPEG XR image index", ErrInvalid)
+	}
+	directory, _, err := d.imageDirectory(ctx, index)
+	if err != nil {
+		return nil, err
+	}
+	if d.source.format == FormatCodestream || d.singleImage {
+		retained, input := d.retainedHeaderWork(), d.inputWork()
+		parentExtra := retained + (input - uint64(cap(d.data)))
+		if parentExtra >= d.limits.MaxMemoryBytes {
+			return nil, &LimitError{Resource: "JPEG XR retained first image memory", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(parentExtra, 1)}
+		}
+		source := d.source
+		primaryInput := source.primary.input
+		if primaryInput == nil {
+			primaryInput = source.container.imageInput
+		}
+		var clonedPrimary *jxrReaderAt
+		if primaryInput != nil {
+			clonedPrimary = cloneJXRReaderAt(primaryInput)
+			if source.primary.input != nil {
+				source.primary.input = clonedPrimary
+			}
+			if source.container.imageInput != nil {
+				source.container.imageInput = clonedPrimary
+			}
+		}
+		if source.alpha != nil {
+			alphaCopy := *source.alpha
+			source.alpha = &alphaCopy
+		}
+		var alphaInput *jxrReaderAt
+		if source.alpha != nil {
+			alphaInput = source.alpha.input
+		}
+		if alphaInput == nil {
+			alphaInput = source.container.alphaInput
+		}
+		if alphaInput != nil {
+			clonedAlpha := clonedPrimary
+			if alphaInput != primaryInput {
+				clonedAlpha = cloneJXRReaderAt(alphaInput)
+			}
+			if source.alpha != nil && source.alpha.input != nil {
+				source.alpha.input = clonedAlpha
+			}
+			if source.container.alphaInput != nil {
+				source.container.alphaInput = clonedAlpha
+			}
+		}
+		limits := d.limits
+		limits.MaxMemoryBytes -= parentExtra
+		selected := &Decoder{data: d.data, source: source, info: cloneInfo(d.info), limits: limits, singleImage: true, inputExtra: d.inputExtra, legacyHighpassPrediction: d.legacyHighpassPrediction, keepOrientation: d.keepOrientation}
+		selected.setWorkers(d.workers)
+		selected.setDecodeBand(d.decodeBand)
+		selected.bindInputContext(nil)
+		if err := selected.checkInfoCopy(); err != nil {
+			return nil, err
+		}
+		return selected, nil
+	}
+	return d.parseDirectoryDecoder(ctx, &directory, true)
+}
+
+// parseDirectoryDecoder 按剩余内存预算解析指定容器目录并装配共享或独立的子图像解码器
+// 入参: ctx 已规范化Context, directory 目标容器目录, independent 是否构建独立单图子解码器
+// 返回: *Decoder 目标图像解码器, error 数据、能力、资源或取消错误
+func (d *Decoder) parseDirectoryDecoder(ctx context.Context, directory *jxrDirectory, independent bool) (*Decoder, error) {
 	retained, input := d.retainedHeaderWork(), d.inputWork()
 	if input > d.limits.MaxMemoryBytes || retained > d.limits.MaxMemoryBytes-input {
 		return nil, &LimitError{Resource: "JPEG XR retained first image memory", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(input, retained)}
@@ -266,7 +368,7 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	if err := parser.reserve(directory.storageWork()); err != nil {
 		return nil, err
 	}
-	container, err := parser.directoryContainer(&directory, d.limits.MaxPixels)
+	container, err := parser.directoryContainer(directory, d.limits.MaxPixels)
 	if err != nil {
 		return nil, err
 	}
@@ -281,20 +383,38 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	if err != nil {
 		return nil, err
 	}
+	parentExtra := retained + (input - uint64(cap(d.data)))
+	var fileInput *jxrReaderAt
+	if !independent && d.fileInput != nil {
+		parentExtra -= jxrReaderAtWork
+		fileInput = d.fileInput
+	}
 	limits := d.limits
-	limits.MaxMemoryBytes -= retained
+	limits.MaxMemoryBytes -= parentExtra
 	extra := uint64(cap(container.exif)) + uint64(cap(container.gps))
 	if d.fileInput != nil {
-		limits.MaxMemoryBytes -= input - uint64(cap(d.data)) - jxrReaderAtWork
 		extra += uint64(cap(container.profile)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc))
-	} else if d.inputExtra != 0 {
-		limits.MaxMemoryBytes -= d.inputExtra
 	}
-	selected := &Decoder{data: d.data, source: source, info: info, limits: limits, fileInput: d.fileInput, inputExtra: extra, legacyHighpassPrediction: d.legacyHighpassPrediction, keepOrientation: d.keepOrientation}
+	selected := &Decoder{data: d.data, source: source, info: info, limits: limits, singleImage: independent, fileInput: fileInput, inputExtra: extra, legacyHighpassPrediction: d.legacyHighpassPrediction, keepOrientation: d.keepOrientation}
 	selected.setWorkers(d.workers)
 	selected.setDecodeBand(d.decodeBand)
 	selected.bindInputContext(nil)
+	if independent {
+		if err := selected.checkInfoCopy(); err != nil {
+			return nil, err
+		}
+	}
 	return selected, nil
+}
+
+// cloneJXRReaderAt 复制随机读取视图的只读边界与底层读取源并分配独立缓冲，避免多解码器并发竞争
+// 入参: src 原随机读取视图，nil返回nil
+// 返回: *jxrReaderAt 独立缓冲的随机读取视图
+func cloneJXRReaderAt(src *jxrReaderAt) *jxrReaderAt {
+	if src == nil {
+		return nil
+	}
+	return &jxrReaderAt{source: src.source, base: src.base, size: src.size}
 }
 
 // EncodeImages 逐图流式编码并写入JXR多图容器文件，支持整图Raster或有界分块Tiles提供器，每图写完后才链接前一目录

@@ -181,6 +181,29 @@ var ErrLimit = errors.New("image resource limit exceeded")
 // ErrClosed 表示解码器已经关闭
 var ErrClosed = errors.New("decoder is closed")
 
+// jxrSRGB8Threshold 保存二十位定点线性光到八位sRGB码值的单调递增临界阈值表
+var jxrSRGB8Threshold = func() [256]uint32 {
+	var table [256]uint32
+	for k := 1; k < 256; k++ {
+		s := (float64(k) - 0.5) / 255.0
+		var lin float64
+		if s <= 0.04045 {
+			lin = s / 12.92
+		} else {
+			lin = math.Pow((s+0.055)/1.055, 2.4)
+		}
+		t := uint32(math.Ceil(lin * (1 << 20)))
+		for t > 0 && displayLinear(float64(t-1)/(1<<20))*255+0.5 >= float64(k) {
+			t--
+		}
+		for t < 1<<20 && displayLinear(float64(t)/(1<<20))*255+0.5 < float64(k) {
+			t++
+		}
+		table[k] = t
+	}
+	return table
+}()
+
 // Limits 限制输入字节、像素数量及工作内存，零值采用默认上限
 // MaxInputBytes限制压缩输入字节数，MaxPixels限制可见像素总数，MaxMemoryBytes限制受宿主地址容量约束的工作内存字节数
 type Limits struct {
@@ -554,6 +577,539 @@ func (r *Raster) Bounds() image.Rectangle {
 		return r.info.Bounds
 	}
 	return r.native.bounds
+}
+
+// ReadRowNRGBA 针对原生八位或十六位无符号RGB、灰度及RGBE图像，在整数域直接解预乘并写入紧凑八位非预乘NRGBA扫描行
+// 不执行ICC或CICP色彩变换，也不经float64绕路，RGBE按线性光经sRGB传递量化且不支持预乘，dst长度须不少于图像宽度乘以四；其余颜色空间或样本编码返回ErrUnsupported
+// 入参: y 图像行坐标, dst 目标八位RGBA字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) ReadRowNRGBA(y int, dst []byte) error {
+	if err := r.readRowNRGBA(y, dst); err != nil {
+		return wrapJXRError("Raster.ReadRowNRGBA", err)
+	}
+	return nil
+}
+
+// readRowNRGBA 执行原生八位或十六位RGB、灰度与RGBE的纯整数行读取及解预乘，由公开入口归一化错误
+// 入参: y 图像行坐标, dst 目标八位RGBA字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) readRowNRGBA(y int, dst []byte) error {
+	if r == nil || r.Bounds().Empty() {
+		return fmt.Errorf("%w: nil or empty raster", ErrInvalid)
+	}
+	bounds := r.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	row := y - bounds.Min.Y
+	if row < 0 || row >= height || len(dst) < width*4 {
+		return fmt.Errorf("%w: raster row or destination", ErrInvalid)
+	}
+	info := r.info
+	stride := info.Channels
+	if info.Alpha {
+		stride++
+	}
+	if len(info.Components) != stride {
+		return fmt.Errorf("%w: raster components", ErrInvalid)
+	}
+	isGray := info.ColorSpace == ColorGray && info.Channels == 1
+	isRGB := info.ColorSpace == ColorRGB && info.Channels == 3
+	if !isGray && !isRGB {
+		return fmt.Errorf("%w: integer NRGBA row color space", ErrUnsupported)
+	}
+	if isRGB && info.Components[0].Format == SampleRGBE {
+		return r.readRowRGBENRGBA(row, width, stride, dst)
+	}
+	precision := info.Components[0].Precision
+	if precision != 8 && precision != 16 {
+		return fmt.Errorf("%w: integer NRGBA row bit depth", ErrUnsupported)
+	}
+	for _, comp := range info.Components {
+		if comp.Format != SampleUnsigned || comp.Inverted || comp.Precision != precision || comp.XStep != 1 || comp.YStep != 1 || comp.Bounds != bounds {
+			return fmt.Errorf("%w: integer NRGBA row component layout", ErrUnsupported)
+		}
+	}
+	interleaved, err := r.checkIntegerRowStorage(bounds, info.Channels, info.Alpha, stride)
+	if err != nil {
+		return err
+	}
+	dst = dst[:width*4]
+	rowBase := row * width
+	if precision == 8 {
+		r.readRowNRGBA8(rowBase, width, isGray, info.Alpha, info.Premultiplied, interleaved, dst)
+	} else {
+		r.readRowNRGBA16(rowBase, width, isGray, info.Alpha, info.Premultiplied, interleaved, dst)
+	}
+	return nil
+}
+
+// checkIntegerRowStorage 校验纯整数行读取所需的十六位紧凑交织或分平面底层存储布局
+// 入参: bounds 图像范围, channels 颜色通道数, alpha 是否含透明度, stride 分量总数
+// 返回: bool 是否交织存储, error 底层存储不匹配时返回无效错误
+func (r *Raster) checkIntegerRowStorage(bounds image.Rectangle, channels int, alpha bool, stride int) (bool, error) {
+	pixels := bounds.Dx() * bounds.Dy()
+	if r.native != nil && len(r.planes) == 0 {
+		if r.native.words != nil || r.native.channels != channels || r.native.alpha != alpha || r.native.bounds != bounds || len(r.native.values) < pixels*stride {
+			return false, fmt.Errorf("%w: integer row backing storage", ErrInvalid)
+		}
+		return true, nil
+	}
+	if r.native == nil && len(r.planes) == stride {
+		for index := range stride {
+			p := &r.planes[index]
+			if p.words != nil || p.channels != 1 || p.alpha || p.bounds != bounds || len(p.values) < pixels {
+				return false, fmt.Errorf("%w: integer row plane storage", ErrInvalid)
+			}
+		}
+		return false, nil
+	}
+	return false, fmt.Errorf("%w: integer row storage layout", ErrInvalid)
+}
+
+// readRowRGBENRGBA 使用二十位整数阈值表将原生共享指数RGBE行直接转换为紧凑八位NRGBA
+// 入参: row 零起点行号, width 图像宽度, stride 分量总数, dst 目标八位RGBA切片
+// 返回: error 布局或存储错误
+func (r *Raster) readRowRGBENRGBA(row, width, stride int, dst []byte) error {
+	info := r.info
+	bounds := r.Bounds()
+	if info.Premultiplied {
+		return fmt.Errorf("%w: premultiplied RGBE row", ErrUnsupported)
+	}
+	for index := range 3 {
+		comp := info.Components[index]
+		if comp.Format != SampleRGBE || comp.XStep != 1 || comp.YStep != 1 || comp.Bounds != bounds {
+			return fmt.Errorf("%w: RGBE row component layout", ErrUnsupported)
+		}
+	}
+	alphaPrecision := uint8(0)
+	if info.Alpha {
+		comp := info.Components[3]
+		if comp.Format != SampleUnsigned || comp.Inverted || (comp.Precision != 8 && comp.Precision != 16) || comp.XStep != 1 || comp.YStep != 1 || comp.Bounds != bounds {
+			return fmt.Errorf("%w: RGBE row alpha layout", ErrUnsupported)
+		}
+		alphaPrecision = comp.Precision
+	}
+	interleaved, err := r.checkIntegerRowStorage(bounds, 3, info.Alpha, stride)
+	if err != nil {
+		return err
+	}
+	dst = dst[:width*4]
+	rowBase := row * width
+	if interleaved {
+		src := r.native.values[rowBase*stride : (rowBase+width)*stride]
+		for x := range width {
+			si, di := x*stride, x*4
+			a := byte(0xff)
+			if info.Alpha {
+				if alphaPrecision == 16 {
+					a = jxrScale16To8(src[si+3])
+				} else {
+					a = byte(src[si+3])
+				}
+			}
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrRGBEByte(uint32(src[si])), jxrRGBEByte(uint32(src[si+1])), jxrRGBEByte(uint32(src[si+2])), a
+		}
+		return nil
+	}
+	r0, g0, b0 := r.planes[0].values[rowBase:rowBase+width], r.planes[1].values[rowBase:rowBase+width], r.planes[2].values[rowBase:rowBase+width]
+	var a0 []uint16
+	if info.Alpha {
+		a0 = r.planes[3].values[rowBase : rowBase+width]
+	}
+	for x := range width {
+		di := x * 4
+		a := byte(0xff)
+		if info.Alpha {
+			if alphaPrecision == 16 {
+				a = jxrScale16To8(a0[x])
+			} else {
+				a = byte(a0[x])
+			}
+		}
+		dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrRGBEByte(uint32(r0[x])), jxrRGBEByte(uint32(g0[x])), jxrRGBEByte(uint32(b0[x])), a
+	}
+	return nil
+}
+
+// readRowNRGBA8 在纯整数域完成八位无符号灰度或RGB行的非预乘展开与解预乘输出
+// 入参: rowBase 行起像素偏移, width 行宽, isGray 是否灰度, alpha 是否含透明度, premul 是否预乘, interleaved 是否交织存储, dst 目标字节切片
+func (r *Raster) readRowNRGBA8(rowBase, width int, isGray, alpha, premul, interleaved bool, dst []byte) {
+	if isGray {
+		if !alpha {
+			var src []uint16
+			if interleaved {
+				src = r.native.values[rowBase : rowBase+width]
+			} else {
+				src = r.planes[0].values[rowBase : rowBase+width]
+			}
+			for x, v := range src {
+				b := byte(v)
+				di := x * 4
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, 0xff
+			}
+			return
+		}
+		if interleaved {
+			src := r.native.values[rowBase*2 : (rowBase+width)*2]
+			for x := range width {
+				si, di := x*2, x*4
+				v, a := src[si], src[si+1]
+				if premul {
+					if a == 0 {
+						dst[di], dst[di+1], dst[di+2], dst[di+3] = 0, 0, 0, 0
+						continue
+					}
+					b := jxrUnpremultiplyByte(v, a)
+					dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, byte(a)
+					continue
+				}
+				b := byte(v)
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, byte(a)
+			}
+			return
+		}
+		g0, a0 := r.planes[0].values[rowBase:rowBase+width], r.planes[1].values[rowBase:rowBase+width]
+		for x := range width {
+			di := x * 4
+			v, a := g0[x], a0[x]
+			if premul {
+				if a == 0 {
+					dst[di], dst[di+1], dst[di+2], dst[di+3] = 0, 0, 0, 0
+					continue
+				}
+				b := jxrUnpremultiplyByte(v, a)
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, byte(a)
+				continue
+			}
+			b := byte(v)
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, byte(a)
+		}
+		return
+	}
+	if interleaved {
+		if !alpha {
+			src := r.native.values[rowBase*3 : (rowBase+width)*3]
+			for x := range width {
+				si, di := x*3, x*4
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = byte(src[si]), byte(src[si+1]), byte(src[si+2]), 0xff
+			}
+			return
+		}
+		src := r.native.values[rowBase*4 : (rowBase+width)*4]
+		for x := range width {
+			si, di := x*4, x*4
+			rv, gv, bv, av := src[si], src[si+1], src[si+2], src[si+3]
+			if premul {
+				if av == 0 {
+					dst[di], dst[di+1], dst[di+2], dst[di+3] = 0, 0, 0, 0
+					continue
+				}
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrUnpremultiplyByte(rv, av), jxrUnpremultiplyByte(gv, av), jxrUnpremultiplyByte(bv, av), byte(av)
+				continue
+			}
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = byte(rv), byte(gv), byte(bv), byte(av)
+		}
+		return
+	}
+	r0, g0, b0 := r.planes[0].values[rowBase:rowBase+width], r.planes[1].values[rowBase:rowBase+width], r.planes[2].values[rowBase:rowBase+width]
+	if !alpha {
+		for x := range width {
+			di := x * 4
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = byte(r0[x]), byte(g0[x]), byte(b0[x]), 0xff
+		}
+		return
+	}
+	a0 := r.planes[3].values[rowBase : rowBase+width]
+	for x := range width {
+		di := x * 4
+		rv, gv, bv, av := r0[x], g0[x], b0[x], a0[x]
+		if premul {
+			if av == 0 {
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = 0, 0, 0, 0
+				continue
+			}
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrUnpremultiplyByte(rv, av), jxrUnpremultiplyByte(gv, av), jxrUnpremultiplyByte(bv, av), byte(av)
+			continue
+		}
+		dst[di], dst[di+1], dst[di+2], dst[di+3] = byte(rv), byte(gv), byte(bv), byte(av)
+	}
+}
+
+// readRowNRGBA16 在纯整数域完成十六位无符号灰度或RGB行的精确缩位与解预乘输出
+// 入参: rowBase 行起像素偏移, width 行宽, isGray 是否灰度, alpha 是否含透明度, premul 是否预乘, interleaved 是否交织存储, dst 目标字节切片
+func (r *Raster) readRowNRGBA16(rowBase, width int, isGray, alpha, premul, interleaved bool, dst []byte) {
+	if isGray {
+		if !alpha {
+			var src []uint16
+			if interleaved {
+				src = r.native.values[rowBase : rowBase+width]
+			} else {
+				src = r.planes[0].values[rowBase : rowBase+width]
+			}
+			for x, v := range src {
+				b := jxrScale16To8(v)
+				di := x * 4
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, 0xff
+			}
+			return
+		}
+		if interleaved {
+			src := r.native.values[rowBase*2 : (rowBase+width)*2]
+			for x := range width {
+				si, di := x*2, x*4
+				v, a := src[si], src[si+1]
+				if premul {
+					if a == 0 {
+						dst[di], dst[di+1], dst[di+2], dst[di+3] = 0, 0, 0, 0
+						continue
+					}
+					b := jxrUnpremultiplyByte(v, a)
+					dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, jxrScale16To8(a)
+					continue
+				}
+				b := jxrScale16To8(v)
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, jxrScale16To8(a)
+			}
+			return
+		}
+		g0, a0 := r.planes[0].values[rowBase:rowBase+width], r.planes[1].values[rowBase:rowBase+width]
+		for x := range width {
+			di := x * 4
+			v, a := g0[x], a0[x]
+			if premul {
+				if a == 0 {
+					dst[di], dst[di+1], dst[di+2], dst[di+3] = 0, 0, 0, 0
+					continue
+				}
+				b := jxrUnpremultiplyByte(v, a)
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, jxrScale16To8(a)
+				continue
+			}
+			b := jxrScale16To8(v)
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = b, b, b, jxrScale16To8(a)
+		}
+		return
+	}
+	if interleaved {
+		if !alpha {
+			src := r.native.values[rowBase*3 : (rowBase+width)*3]
+			for x := range width {
+				si, di := x*3, x*4
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(src[si]), jxrScale16To8(src[si+1]), jxrScale16To8(src[si+2]), 0xff
+			}
+			return
+		}
+		src := r.native.values[rowBase*4 : (rowBase+width)*4]
+		for x := range width {
+			si, di := x*4, x*4
+			rv, gv, bv, av := src[si], src[si+1], src[si+2], src[si+3]
+			if premul {
+				if av == 0 {
+					dst[di], dst[di+1], dst[di+2], dst[di+3] = 0, 0, 0, 0
+					continue
+				}
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrUnpremultiplyByte(rv, av), jxrUnpremultiplyByte(gv, av), jxrUnpremultiplyByte(bv, av), jxrScale16To8(av)
+				continue
+			}
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(rv), jxrScale16To8(gv), jxrScale16To8(bv), jxrScale16To8(av)
+		}
+		return
+	}
+	r0, g0, b0 := r.planes[0].values[rowBase:rowBase+width], r.planes[1].values[rowBase:rowBase+width], r.planes[2].values[rowBase:rowBase+width]
+	if !alpha {
+		for x := range width {
+			di := x * 4
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(r0[x]), jxrScale16To8(g0[x]), jxrScale16To8(b0[x]), 0xff
+		}
+		return
+	}
+	a0 := r.planes[3].values[rowBase : rowBase+width]
+	for x := range width {
+		di := x * 4
+		rv, gv, bv, av := r0[x], g0[x], b0[x], a0[x]
+		if premul {
+			if av == 0 {
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = 0, 0, 0, 0
+				continue
+			}
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrUnpremultiplyByte(rv, av), jxrUnpremultiplyByte(gv, av), jxrUnpremultiplyByte(bv, av), jxrScale16To8(av)
+			continue
+		}
+		dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(rv), jxrScale16To8(gv), jxrScale16To8(bv), jxrScale16To8(av)
+	}
+}
+
+// ReadRowCMYK 针对原生八位或十六位非预乘CMYK与CMYKDirect图像，在整数域直接输出紧凑交织八位CMYK扫描行
+// dst长度须不少于图像宽度乘以四；预乘CMYK、非CMYK或非八位/十六位无符号格式返回ErrUnsupported
+// 入参: y 图像行坐标, dst 目标八位CMYK字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) ReadRowCMYK(y int, dst []byte) error {
+	if err := r.readRowCMYK(y, dst, nil); err != nil {
+		return wrapJXRError("Raster.ReadRowCMYK", err)
+	}
+	return nil
+}
+
+// ReadRowCMYKAlpha 针对原生八位或十六位非预乘CMYK与CMYKDirect图像，同时输出紧凑交织八位CMYK扫描行及可选独立八位Alpha扫描行
+// cmyk长度须不少于图像宽度乘以四，alpha非nil时长度须不少于图像宽度（源无Alpha时填充0xff）；不支持预乘CMYK
+// 入参: y 图像行坐标, cmyk 目标八位CMYK字节缓冲, alpha 可选独立八位Alpha字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) ReadRowCMYKAlpha(y int, cmyk, alpha []byte) error {
+	if err := r.readRowCMYK(y, cmyk, alpha); err != nil {
+		return wrapJXRError("Raster.ReadRowCMYKAlpha", err)
+	}
+	return nil
+}
+
+// readRowCMYK 在纯整数域完成八位或十六位CMYK及可选独立Alpha扫描行读取，由公开入口归一化错误
+// 入参: y 图像行坐标, cmyk 目标八位CMYK字节缓冲, alpha 可选独立八位Alpha字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) readRowCMYK(y int, cmyk, alpha []byte) error {
+	if r == nil || r.Bounds().Empty() {
+		return fmt.Errorf("%w: nil or empty raster", ErrInvalid)
+	}
+	bounds := r.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	row := y - bounds.Min.Y
+	if row < 0 || row >= height || len(cmyk) < width*4 || alpha != nil && len(alpha) < width {
+		return fmt.Errorf("%w: CMYK row or destination", ErrInvalid)
+	}
+	info := r.info
+	if (info.ColorSpace != ColorCMYK && info.ColorSpace != ColorCMYKDirect) || info.Channels != 4 {
+		return fmt.Errorf("%w: integer CMYK row color space", ErrUnsupported)
+	}
+	if info.Premultiplied {
+		return fmt.Errorf("%w: premultiplied CMYK row", ErrUnsupported)
+	}
+	stride := 4
+	if info.Alpha {
+		stride = 5
+	}
+	if len(info.Components) != stride {
+		return fmt.Errorf("%w: CMYK row components", ErrInvalid)
+	}
+	precision := info.Components[0].Precision
+	if precision != 8 && precision != 16 {
+		return fmt.Errorf("%w: integer CMYK row bit depth", ErrUnsupported)
+	}
+	for _, comp := range info.Components {
+		if comp.Format != SampleUnsigned || comp.Inverted || comp.Precision != precision || comp.XStep != 1 || comp.YStep != 1 || comp.Bounds != bounds {
+			return fmt.Errorf("%w: integer CMYK row component layout", ErrUnsupported)
+		}
+	}
+	interleaved, err := r.checkIntegerRowStorage(bounds, 4, info.Alpha, stride)
+	if err != nil {
+		return err
+	}
+	cmyk = cmyk[:width*4]
+	if alpha != nil {
+		alpha = alpha[:width]
+	}
+	rowBase := row * width
+	if interleaved {
+		src := r.native.values[rowBase*stride : (rowBase+width)*stride]
+		if precision == 8 {
+			for x := range width {
+				si, di := x*stride, x*4
+				cmyk[di], cmyk[di+1], cmyk[di+2], cmyk[di+3] = byte(src[si]), byte(src[si+1]), byte(src[si+2]), byte(src[si+3])
+				if alpha != nil {
+					if info.Alpha {
+						alpha[x] = byte(src[si+4])
+					} else {
+						alpha[x] = 0xff
+					}
+				}
+			}
+			return nil
+		}
+		for x := range width {
+			si, di := x*stride, x*4
+			cmyk[di], cmyk[di+1], cmyk[di+2], cmyk[di+3] = jxrScale16To8(src[si]), jxrScale16To8(src[si+1]), jxrScale16To8(src[si+2]), jxrScale16To8(src[si+3])
+			if alpha != nil {
+				if info.Alpha {
+					alpha[x] = jxrScale16To8(src[si+4])
+				} else {
+					alpha[x] = 0xff
+				}
+			}
+		}
+		return nil
+	}
+	c0, m0, y0, k0 := r.planes[0].values[rowBase:rowBase+width], r.planes[1].values[rowBase:rowBase+width], r.planes[2].values[rowBase:rowBase+width], r.planes[3].values[rowBase:rowBase+width]
+	var a0 []uint16
+	if info.Alpha {
+		a0 = r.planes[4].values[rowBase : rowBase+width]
+	}
+	if precision == 8 {
+		for x := range width {
+			di := x * 4
+			cmyk[di], cmyk[di+1], cmyk[di+2], cmyk[di+3] = byte(c0[x]), byte(m0[x]), byte(y0[x]), byte(k0[x])
+			if alpha != nil {
+				if info.Alpha {
+					alpha[x] = byte(a0[x])
+				} else {
+					alpha[x] = 0xff
+				}
+			}
+		}
+		return nil
+	}
+	for x := range width {
+		di := x * 4
+		cmyk[di], cmyk[di+1], cmyk[di+2], cmyk[di+3] = jxrScale16To8(c0[x]), jxrScale16To8(m0[x]), jxrScale16To8(y0[x]), jxrScale16To8(k0[x])
+		if alpha != nil {
+			if info.Alpha {
+				alpha[x] = jxrScale16To8(a0[x])
+			} else {
+				alpha[x] = 0xff
+			}
+		}
+	}
+	return nil
+}
+
+// jxrScale16To8 将十六位无符号样本在整数域精确舍入到八位无符号字节
+// 入参: v 十六位无符号样本
+// 返回: byte 八位无符号字节
+func jxrScale16To8(v uint16) byte {
+	return byte((uint32(v) + 128) / 257)
+}
+
+// jxrUnpremultiplyByte 在纯整数域按非零透明度解除八位或十六位预乘并舍入为八位无符号字节
+// 入参: c 预乘颜色样本, a 非零透明度样本
+// 返回: byte 非预乘八位无符号字节
+func jxrUnpremultiplyByte(c, a uint16) byte {
+	if c >= a {
+		return 255
+	}
+	return byte((uint32(c)*255 + uint32(a)/2) / uint32(a))
+}
+
+// jxrRGBEByte 使用二十位定点阈值表将原生RGBE位模式在纯整数域转换为八位sRGB字节
+// 入参: bits 低八位尾数与高八位共享指数
+// 返回: byte 八位sRGB字节
+func jxrRGBEByte(bits uint32) byte {
+	e := bits >> 8
+	m := bits & 255
+	if m == 0 || e < 116 {
+		return 0
+	}
+	if e >= 136 {
+		return 255
+	}
+	lin := m << (e - 116)
+	if lin >= 1<<20 {
+		return 255
+	}
+	lo, hi := uint32(0), uint32(255)
+	for lo < hi {
+		mid := (lo + hi + 1) >> 1
+		if lin >= jxrSRGB8Threshold[mid] {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return byte(lo)
 }
 
 // Component 返回指定通道的共享视图，透明度通道位于颜色通道之后

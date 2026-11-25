@@ -838,7 +838,7 @@ func encodeJXRRowsUncompressed(ctx context.Context, w io.WriteSeeker, info Info,
 	}
 	c := jxrContainer{width: codedW, height: codedH, format: format, pixelFormat: identifier, transform: uint32(transform), uncompressed: true}
 	c.setInfoMetadata(info)
-	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(&c, limits.MaxPixels, settings.SeparateAlpha)
+	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(ctx, &c, limits.MaxPixels, limits.MaxMemoryBytes-retained, settings.SeparateAlpha)
 	if err != nil {
 		return err
 	}

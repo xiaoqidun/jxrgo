@@ -34,6 +34,7 @@ type Decoder struct {
 	limits                   Limits
 	info                     Info
 	closed                   bool
+	singleImage              bool
 	legacyHighpassPrediction bool
 	keepOrientation          bool
 	decodeBand               Band

@@ -67,6 +67,9 @@ type jxrICCTag struct {
 type jxrICCTransform struct {
 	curves       [3]jxrICCCurve
 	matrix       [3][3]float64
+	xyzMatrix    [3][3]float64
+	pcsScale     [3]float64
+	grayXYZ      [3]float64
 	grayScale    [3]float64
 	channels     int
 	grayLab      bool
@@ -239,9 +242,10 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 	available := maximum - uint64(len(tags))*16
 	baseMatrix := jxrICCXYZToSRGB()
 	outMatrix := baseMatrix
+	pcsScale := [3]float64{1, 1, 1}
 	if intent == IntentAbsolute && class != "link" && class != "abst" && !(profile[8] == 2 && class == "mntr") {
-		scale := [3]float64{white[0] / jxrICCD50White[0], white[1] / jxrICCD50White[1], white[2] / jxrICCD50White[2]}
-		outMatrix = jxrICCScaleMatrix(baseMatrix, scale)
+		pcsScale = [3]float64{white[0] / jxrICCD50White[0], white[1] / jxrICCD50White[1], white[2] / jxrICCD50White[2]}
+		outMatrix = jxrICCScaleMatrix(baseMatrix, pcsScale)
 	}
 	d2bTag, a2bPrimary, a2bFallback := jxrICCIntentTags(intent)
 	if class == "link" || class == "abst" {
@@ -253,6 +257,7 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 				result.floating, err = jxrReadICCFloatTransformTarget(ctx, data, result.channels, outputs, target, available)
 				if err == nil {
 					result.matrix = baseMatrix
+					result.pcsScale = [3]float64{1, 1, 1}
 					return result, ctx.Err()
 				}
 				if !errors.Is(err, ErrUnsupported) {
@@ -264,6 +269,7 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 			result.floating, err = jxrReadICCFloatTransformTarget(ctx, data, result.channels, outputs, target, available)
 			if err == nil {
 				result.matrix = outMatrix
+				result.pcsScale = pcsScale
 				return result, ctx.Err()
 			}
 			if !errors.Is(err, ErrUnsupported) {
@@ -281,6 +287,7 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 				return jxrICCTransform{}, err
 			}
 			result.matrix = outMatrix
+			result.pcsScale = pcsScale
 			return result, ctx.Err()
 		}
 	}
@@ -298,6 +305,7 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 		if err != nil {
 			return jxrICCTransform{}, err
 		}
+		result.grayXYZ = [3]float64{jxrICCD50White[0] * pcsScale[0], jxrICCD50White[1] * pcsScale[1], jxrICCD50White[2] * pcsScale[2]}
 		if intent == IntentAbsolute {
 			result.grayScale = jxrApplyColorMatrix(outMatrix, jxrICCD50White)
 			result.useGrayScale = true
@@ -322,6 +330,11 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 		return jxrICCTransform{}, err
 	}
 	result.matrix = jxrICCMulMatrix(outMatrix, colorants)
+	for row := range 3 {
+		for col := range 3 {
+			result.xyzMatrix[row][col] = colorants[col][row] * pcsScale[row]
+		}
+	}
 	return result, ctx.Err()
 }
 
@@ -606,6 +619,44 @@ func (transform *jxrICCTransform) linearColor(ctx context.Context, values []floa
 		rgb[i] = row[0]*out[0] + row[1]*out[1] + row[2]*out[2]
 	}
 	return rgb[0], rgb[1], rgb[2], nil
+}
+
+// xyzColor 应用ICC转换直接输出D50 PCS XYZ，省略末端XYZ到sRGB矩阵以避免sRGB色域裁切
+// 入参: ctx Context, values 已解除预乘的源通道
+// 返回: float64 D50 PCS三刺激值X、Y、Z, error 数值或取消错误
+func (transform *jxrICCTransform) xyzColor(ctx context.Context, values []float64) (float64, float64, float64, error) {
+	if transform.directOutput {
+		red, green, blue, err := transform.linearColor(ctx, values)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		xyz := jxrApplyColorMatrix(jxrSRGBToXYZD50, [3]float64{red, green, blue})
+		return xyz[0], xyz[1], xyz[2], nil
+	}
+	if transform.lut == nil && transform.floating == nil {
+		if transform.yccPre != nil {
+			rgb := transform.yccPre.rgb(values)
+			values = rgb[:]
+		}
+		if transform.channels == 1 {
+			gray := transform.curves[0].eval(values[0], transform.extended)
+			if transform.grayLab {
+				gray = jxrICCLabInverse((100*gray + 16) / 116)
+			}
+			return gray * transform.grayXYZ[0], gray * transform.grayXYZ[1], gray * transform.grayXYZ[2], nil
+		}
+		var trc [3]float64
+		for index := range trc {
+			trc[index] = transform.curves[index].eval(values[index], transform.extended)
+		}
+		xyz := jxrApplyColorMatrix(transform.xyzMatrix, trc)
+		return xyz[0], xyz[1], xyz[2], nil
+	}
+	pcs, err := transform.evalOutput(ctx, values)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return pcs[0] * transform.pcsScale[0], pcs[1] * transform.pcsScale[1], pcs[2] * transform.pcsScale[2], nil
 }
 
 // color 应用ICC转换及目标sRGB传递函数

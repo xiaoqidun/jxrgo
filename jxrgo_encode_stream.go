@@ -952,7 +952,7 @@ func makeJXRFilePrefixParts(ctx context.Context, info Info, source, alpha *jxrSt
 		}
 		c.alphaBands = uint32(alpha.alpha.bands)
 	}
-	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(&c, maxPixels, alpha != nil)
+	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(ctx, &c, maxPixels, maxMemory, alpha != nil)
 	if err != nil {
 		return nil, jxrContainerOffsets{}, err
 	}

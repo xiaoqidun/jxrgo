@@ -90,6 +90,15 @@ type RGBReader struct {
 	useNearest    bool
 }
 
+// ColorConverter 持有预解析的只读无锁ICC、CICP与HDR显示转换管线，供跨行带低内存逐行复用
+// 构造后完全不可变，当源Raster保持只读时支持多Goroutine安全并发调用各逐行与跨行带转换方法
+type ColorConverter struct {
+	info      Info
+	mapping   jxrDisplayMapping
+	filter    ResampleFilter
+	transform ColorTransform
+}
+
 // Display 按分量相位将原生图像绘制为十六位非预乘sRGB图像，不修改原图也不构造整幅重采样中间图
 // 未知色度相位按ITU-T T.832默认居中相位处理；色彩按Transform优先、ApplyICC内建ICC或默认CICP与BT.2446方法A策略转换
 // 入参: ctx Context，nil采用Background, opts 显示策略及限制，nil采用默认值
@@ -355,7 +364,11 @@ func (lr *LinearReader) readRow(ctx context.Context, y int, dst []float64) error
 		if lr.info.Alpha {
 			alpha = values[lr.info.Channels]
 		}
-		red, green, blue, err := lr.linearPixel(ctx, values, alpha)
+		srcLinear := lr.mapping.linear
+		if lr.defaultLinear {
+			srcLinear = lr.info.Linear
+		}
+		red, green, blue, err := lr.mapping.linearColor(ctx, lr.info, values, alpha, srcLinear, lr.unpremultiply)
 		if err != nil {
 			return err
 		}
@@ -365,12 +378,11 @@ func (lr *LinearReader) readRow(ctx context.Context, y int, dst []float64) error
 	return ctx.Err()
 }
 
-// linearPixel 将单个已采样原生像素转换为未裁剪的D65线性scRGB三通道
-// 入参: ctx 已规范化Context, values 可复用原生样本工作区, alpha 当前像素透明度
+// linearColor 将单个已采样原生像素转换为未裁剪的D65线性scRGB三通道，供LinearReader与ColorConverter复用
+// 入参: ctx 已规范化Context, info 原生描述, values 可复用原生样本工作区, alpha 当前像素透明度, srcLinear 默认分支源是否线性光, unpremultiply 是否解除预乘
 // 返回: float64 线性红、绿、蓝scRGB值, error ICC数值或取消错误
-func (lr *LinearReader) linearPixel(ctx context.Context, values []float64, alpha float64) (float64, float64, float64, error) {
-	info := lr.info
-	if lr.mapping.icc.channels != 0 {
+func (mapping *jxrDisplayMapping) linearColor(ctx context.Context, info Info, values []float64, alpha float64, srcLinear, unpremultiply bool) (float64, float64, float64, error) {
+	if mapping.icc.channels != 0 {
 		repremultiply := false
 		if info.Premultiplied {
 			if !(alpha > 0) || !geometryFinite(alpha) {
@@ -379,9 +391,9 @@ func (lr *LinearReader) linearPixel(ctx context.Context, values []float64, alpha
 			for index := range info.Channels {
 				values[index] /= alpha
 			}
-			repremultiply = !lr.unpremultiply
+			repremultiply = !unpremultiply
 		}
-		red, green, blue, err := lr.mapping.icc.linearColor(ctx, values)
+		red, green, blue, err := mapping.icc.linearColor(ctx, values)
 		if err != nil {
 			return 0, 0, 0, err
 		}
@@ -392,13 +404,9 @@ func (lr *LinearReader) linearPixel(ctx context.Context, values []float64, alpha
 		}
 		return red, green, blue, nil
 	}
-	if lr.mapping.cicp.transfer != 0 {
-		red, green, blue := lr.mapping.cicp.linearColor(info, values, alpha, lr.unpremultiply)
+	if mapping.cicp.transfer != 0 {
+		red, green, blue := mapping.cicp.linearColor(info, values, alpha, unpremultiply)
 		return red, green, blue, nil
-	}
-	srcLinear := lr.mapping.linear
-	if lr.defaultLinear {
-		srcLinear = info.Linear
 	}
 	if srcLinear && (info.ColorSpace == ColorGray || info.ColorSpace == ColorRGB) {
 		var red, green, blue float64
@@ -407,7 +415,7 @@ func (lr *LinearReader) linearPixel(ctx context.Context, values []float64, alpha
 		} else {
 			red, green, blue = values[0], values[1], values[2]
 		}
-		if info.Premultiplied && lr.unpremultiply {
+		if info.Premultiplied && unpremultiply {
 			if !(alpha > 0) || !geometryFinite(alpha) {
 				return 0, 0, 0, nil
 			}
@@ -425,7 +433,7 @@ func (lr *LinearReader) linearPixel(ctx context.Context, values []float64, alpha
 		for index := range info.Channels {
 			values[index] /= alpha
 		}
-		repremultiply = !lr.unpremultiply
+		repremultiply = !unpremultiply
 	}
 	var red, green, blue float64
 	switch info.ColorSpace {
@@ -1492,6 +1500,798 @@ func displayJXRDirectCMYK8(ctx context.Context, raster *Raster, alpha, interleav
 		}
 	}
 	return ctx.Err()
+}
+
+// NewColorConverter 预解析并构造可跨多个DecodeStrips回调复用的只读无锁行级色彩转换器
+// 独立持有颜色元数据及ICC配置副本，不重复解析ICC查表或浮点管线；构造后支持多Goroutine安全并发调用
+// 入参: ctx Context，nil采用Background, info 原生图像元数据, opts 显示选项，nil采用默认最近邻与基本显示策略
+// 返回: *ColorConverter 可复用行级色彩转换器, error 参数、颜色、资源或取消错误
+func NewColorConverter(ctx context.Context, info Info, opts *DisplayOptions) (*ColorConverter, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conv, err := newColorConverter(ctx, info, opts)
+	if err != nil {
+		return nil, wrapJXRError("NewColorConverter", err)
+	}
+	return conv, nil
+}
+
+// newColorConverter 执行ColorConverter的参数校验、预算检查与色彩管线预解析，由公开入口归一化错误
+// 入参: ctx 已规范化Context, info 原生图像元数据, opts 显示选项
+// 返回: *ColorConverter 行级色彩转换器, error 参数、颜色、资源或取消错误
+func newColorConverter(ctx context.Context, info Info, opts *DisplayOptions) (*ColorConverter, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if info.Channels < 1 || info.Channels > rasterMaxComponents {
+		return nil, fmt.Errorf("%w: color converter channels", ErrInvalid)
+	}
+	count := info.Channels
+	if info.Alpha {
+		count++
+	}
+	if count != len(info.Components) {
+		return nil, fmt.Errorf("%w: color converter components", ErrInvalid)
+	}
+	for _, comp := range info.Components {
+		if comp.XStep == 0 || comp.YStep == 0 || comp.Precision == 0 {
+			return nil, fmt.Errorf("%w: color converter component layout", ErrInvalid)
+		}
+	}
+	filter, limits, intent, peakNits := ResampleNearest, DefaultLimits(), IntentRelative, 0.0
+	var transform ColorTransform
+	if opts != nil {
+		filter, limits, transform, intent, peakNits = opts.Filter, opts.Limits.normalized(), opts.Transform, opts.Intent, opts.HDRPeakNits
+	}
+	if filter > ResampleBilinear {
+		return nil, fmt.Errorf("%w: color converter filter", ErrInvalid)
+	}
+	if intent > IntentAbsolute {
+		return nil, fmt.Errorf("%w: color converter rendering intent", ErrInvalid)
+	}
+	if !geometryFinite(peakNits) || peakNits < 0 {
+		return nil, fmt.Errorf("%w: color converter HDR peak luminance", ErrInvalid)
+	}
+	managed := transform == nil && opts != nil && opts.ApplyICC
+	scratch := uint64(512) + uint64(count)*136
+	if managed && len(info.ICCProfile) != 0 {
+		scratch = jxrSaturatedAdd(scratch, uint64(len(info.ICCProfile)))
+	}
+	if scratch > limits.MaxMemoryBytes {
+		return nil, &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: scratch, Detail: "color converter working memory"}
+	}
+	convInfo := Info{
+		Bounds:        info.Bounds,
+		Channels:      info.Channels,
+		ColorSpace:    info.ColorSpace,
+		ColorHint:     info.ColorHint,
+		ColorEncoding: cloneColorEncoding(info.ColorEncoding),
+		Alpha:         info.Alpha,
+		Premultiplied: info.Premultiplied,
+		Linear:        info.Linear,
+		Components:    cloneComponentInfo(info.Components),
+	}
+	if len(info.ICCProfile) != 0 {
+		if managed {
+			convInfo.ICCProfile = cloneBytes(info.ICCProfile)
+		} else if transform == nil {
+			convInfo.ICCProfile = []byte{0}
+		}
+	}
+	var mapping jxrDisplayMapping
+	if transform == nil {
+		var err error
+		if managed {
+			mapping, err = jxrManagedRasterDisplay(ctx, convInfo, limits.MaxMemoryBytes-scratch, peakNits, intent)
+		} else {
+			mapping, err = jxrBasicRasterDisplay(convInfo, peakNits)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &ColorConverter{info: convInfo, mapping: mapping, filter: filter, transform: transform}, ctx.Err()
+}
+
+// ConvertRowNRGBA 将源图像指定行直接转换为紧凑八位非预乘sRGB RGBA字节扫描行，不分配整幅中间图像
+// dst长度须不少于源图像宽度乘以四，包含BT.2446 HDR映射与无色彩变换原生整数快路径
+// 入参: ctx Context，nil采用Background, src 源原生图像或单条行带, y 目标行坐标, dst 目标八位RGBA字节切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertRowNRGBA(ctx context.Context, src *Raster, y int, dst []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.convertStripRowNRGBA(ctx, nil, src, nil, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertRowNRGBA", err)
+	}
+	return nil
+}
+
+// ConvertRowNRGBA64 将源图像指定行直接转换为大端十六位非预乘sRGB RGBA字节扫描行，字节序与image.NRGBA64.Pix完全一致
+// dst长度须不少于源图像宽度乘以八，不分配整幅中间图像
+// 入参: ctx Context，nil采用Background, src 源原生图像或单条行带, y 目标行坐标, dst 目标十六位大端RGBA字节切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertRowNRGBA64(ctx context.Context, src *Raster, y int, dst []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.convertStripRowNRGBA64(ctx, nil, src, nil, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertRowNRGBA64", err)
+	}
+	return nil
+}
+
+// ConvertRowLinear 将源图像指定行直接转换为未裁剪的D65线性scRGB浮点RGBA扫描行
+// 每像素按顺序写入非预乘红、绿、蓝与原透明度四个float64值，dst长度须不少于源图像宽度乘以四
+// 入参: ctx Context，nil采用Background, src 源原生图像或单条行带, y 目标行坐标, dst 目标线性scRGB浮点切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertRowLinear(ctx context.Context, src *Raster, y int, dst []float64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.convertStripRowLinear(ctx, nil, src, nil, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertRowLinear", err)
+	}
+	return nil
+}
+
+// ConvertRowXYZ 将源图像指定行直接转换为D50 PCS XYZ与原透明度四个float64值，供外部CMM直连避免sRGB裁切
+// 当源为ICC时省略末端XYZ到sRGB矩阵直接返回D50 PCS XYZ；当源为CICP或默认sRGB时经Bradford D65到D50适配输出D50 XYZ
+// 入参: ctx Context，nil采用Background, src 源原生图像或单条行带, y 目标行坐标, dst 目标D50 XYZ与Alpha浮点切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertRowXYZ(ctx context.Context, src *Raster, y int, dst []float64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.convertStripRowXYZ(ctx, nil, src, nil, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertRowXYZ", err)
+	}
+	return nil
+}
+
+// ConvertStripRowNRGBA 结合相邻上下行带将当前行带局部行号y转换为八位非预乘sRGB RGBA扫描行
+// 在ResampleBilinear下跨带边界读取相邻带色度样本以彻底消除YCC420/422的跨带接缝，prev或next为nil表示图像顶底边界
+// 适用于等宽水平相邻行带；含转置方向时应配合KeepOrientation: true解码
+// 入参: ctx Context，nil采用Background, prev 上方相邻行带（可nil）, curr 当前行带, next 下方相邻行带（可nil）, y 当前带行坐标, dst 目标八位RGBA字节切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertStripRowNRGBA(ctx context.Context, prev, curr, next *Raster, y int, dst []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.convertStripRowNRGBA(ctx, prev, curr, next, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRowNRGBA", err)
+	}
+	return nil
+}
+
+// ConvertStripRowNRGBA64 结合相邻上下行带将当前行带局部行号y转换为大端十六位非预乘sRGB RGBA扫描行
+// 在ResampleBilinear下跨带边界读取相邻带色度样本以彻底消除YCC420/422的跨带接缝，prev或next为nil表示图像顶底边界
+// 适用于等宽水平相邻行带；含转置方向时应配合KeepOrientation: true解码
+// 入参: ctx Context，nil采用Background, prev 上方相邻行带（可nil）, curr 当前行带, next 下方相邻行带（可nil）, y 当前带行坐标, dst 目标十六位大端RGBA字节切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertStripRowNRGBA64(ctx context.Context, prev, curr, next *Raster, y int, dst []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.convertStripRowNRGBA64(ctx, prev, curr, next, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRowNRGBA64", err)
+	}
+	return nil
+}
+
+// ConvertStripRowLinear 结合相邻上下行带将当前行带局部行号y转换为未裁剪的D65线性scRGB浮点RGBA扫描行
+// 在ResampleBilinear下跨带边界读取相邻带色度样本以消除YCC420/422的跨带接缝，prev或next为nil表示图像顶底边界
+// 适用于等宽水平相邻行带；含转置方向时应配合KeepOrientation: true解码
+// 入参: ctx Context，nil采用Background, prev 上方相邻行带（可nil）, curr 当前行带, next 下方相邻行带（可nil）, y 当前带行坐标, dst 目标线性scRGB浮点切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertStripRowLinear(ctx context.Context, prev, curr, next *Raster, y int, dst []float64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.convertStripRowLinear(ctx, prev, curr, next, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRowLinear", err)
+	}
+	return nil
+}
+
+// ConvertStripRowXYZ 结合相邻上下行带将当前行带局部行号y转换为D50 PCS XYZ与原透明度四个float64值
+// 在ResampleBilinear下跨带边界读取相邻带色度样本以消除YCC420/422的跨带接缝，prev或next为nil表示图像顶底边界
+// 适用于等宽水平相邻行带；含转置方向时应配合KeepOrientation: true解码
+// 入参: ctx Context，nil采用Background, prev 上方相邻行带（可nil）, curr 当前行带, next 下方相邻行带（可nil）, y 当前带行坐标, dst 目标D50 XYZ与Alpha浮点切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertStripRowXYZ(ctx context.Context, prev, curr, next *Raster, y int, dst []float64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.convertStripRowXYZ(ctx, prev, curr, next, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRowXYZ", err)
+	}
+	return nil
+}
+
+// checkSource 校验源图像或单条行带与转换器元数据在颜色空间、通道及分量编码上严格一致
+// 入参: src 待转换图像或行带
+// 返回: error 不兼容或无效参数错误
+func (c *ColorConverter) checkSource(src *Raster) error {
+	if c == nil {
+		return fmt.Errorf("%w: nil color converter", ErrInvalid)
+	}
+	if src == nil || src.Bounds().Empty() {
+		return fmt.Errorf("%w: color converter raster", ErrInvalid)
+	}
+	info := src.info
+	if info.ColorSpace != c.info.ColorSpace || info.Channels != c.info.Channels || info.Alpha != c.info.Alpha || info.Premultiplied != c.info.Premultiplied || info.Linear != c.info.Linear || len(info.Components) != len(c.info.Components) {
+		return fmt.Errorf("%w: color converter source mismatch", ErrInvalid)
+	}
+	for index, comp := range info.Components {
+		want := c.info.Components[index]
+		if !jxrSameSampleEncoding(comp, want) || comp.XStep != want.XStep || comp.YStep != want.YStep {
+			return fmt.Errorf("%w: color converter component mismatch", ErrInvalid)
+		}
+	}
+	return nil
+}
+
+// checkStripNeighbors 校验当前行带与可选相邻上下行带的兼容性、统一行宽及一致色度相位
+// 入参: prev 上方行带, curr 当前行带, next 下方行带
+// 返回: error 不兼容或无效参数错误
+func (c *ColorConverter) checkStripNeighbors(prev, curr, next *Raster) error {
+	if err := c.checkSource(curr); err != nil {
+		return err
+	}
+	width := curr.Bounds().Dx()
+	for _, neighbor := range [2]*Raster{prev, next} {
+		if neighbor == nil {
+			continue
+		}
+		if err := c.checkSource(neighbor); err != nil {
+			return err
+		}
+		if neighbor.Bounds().Dx() != width {
+			return fmt.Errorf("%w: color converter strip width mismatch", ErrInvalid)
+		}
+		for index, comp := range neighbor.info.Components {
+			if !jxrSharedChromaPhase(comp, curr.info.Components[index]) {
+				return fmt.Errorf("%w: color converter strip chroma phase mismatch", ErrInvalid)
+			}
+		}
+	}
+	return nil
+}
+
+// prepareStripRow 校验取消状态、相邻行带兼容性、行号范围与目标切片长度
+// 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dstLen 目标缓冲元素长度, elemPerPixel 每像素目标元素数
+// 返回: int 零起点局部行号, int 图像宽度, int 图像高度, error 参数、坐标或取消错误
+func (c *ColorConverter) prepareStripRow(ctx context.Context, prev, curr, next *Raster, y, dstLen, elemPerPixel int) (int, int, int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	if err := c.checkStripNeighbors(prev, curr, next); err != nil {
+		return 0, 0, 0, err
+	}
+	bounds := curr.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	row := y - bounds.Min.Y
+	if row < 0 || row >= height || dstLen < width*elemPerPixel {
+		return 0, 0, 0, fmt.Errorf("%w: color converter row or destination", ErrInvalid)
+	}
+	return row, width, height, nil
+}
+
+// convertStripRowNRGBA 执行八位非预乘sRGB RGBA逐行及跨带转换，含原生整数快路径
+// 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dst 目标八位RGBA缓冲
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) convertStripRowNRGBA(ctx context.Context, prev, curr, next *Raster, y int, dst []byte) error {
+	row, width, height, err := c.prepareStripRow(ctx, prev, curr, next, y, len(dst), 4)
+	if err != nil {
+		return err
+	}
+	if c.filter == ResampleNearest && c.transform == nil && c.mapping.cicp.transfer == 0 && c.mapping.icc.channels == 0 {
+		isRGBE := curr.info.ColorSpace == ColorRGB && curr.info.Components[0].Format == SampleRGBE
+		if (!c.mapping.linear && !isRGBE && (curr.info.ColorSpace == ColorGray || curr.info.ColorSpace == ColorRGB)) ||
+			(c.mapping.linear && isRGBE) {
+			if err := curr.readRowNRGBA(y, dst); err == nil {
+				return ctx.Err()
+			}
+		} else if !c.mapping.linear {
+			if precision, interleaved, ok := canDisplayJXRDirect(curr, curr.info, c.mapping); ok && precision == 8 {
+				displayJXRDirectCMYK8Row8(curr, curr.info.Alpha, interleaved, row, width, dst[:width*4])
+				return ctx.Err()
+			}
+		}
+	}
+	return c.walkStripRow(ctx, prev, curr, next, row, width, height, func(x int, values []float64, alpha float64) error {
+		red, green, blue, err := c.displayPixel(ctx, curr.info, values, alpha)
+		if err != nil {
+			return err
+		}
+		base := x * 4
+		dst[base], dst[base+1], dst[base+2], dst[base+3] = displayByte(red), displayByte(green), displayByte(blue), displayByte(alpha)
+		return nil
+	})
+}
+
+// convertStripRowNRGBA64 执行大端十六位非预乘sRGB RGBA逐行及跨带转换，含原生整数快路径
+// 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dst 目标十六位大端RGBA缓冲
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) convertStripRowNRGBA64(ctx context.Context, prev, curr, next *Raster, y int, dst []byte) error {
+	row, width, height, err := c.prepareStripRow(ctx, prev, curr, next, y, len(dst), 8)
+	if err != nil {
+		return err
+	}
+	if c.filter == ResampleNearest && c.transform == nil {
+		if precision, interleaved, ok := canDisplayJXRDirect(curr, curr.info, c.mapping); ok {
+			displayJXRDirectRow64(curr, curr.info, precision, interleaved, row, width, dst[:width*8])
+			return ctx.Err()
+		}
+	}
+	return c.walkStripRow(ctx, prev, curr, next, row, width, height, func(x int, values []float64, alpha float64) error {
+		red, green, blue, err := c.displayPixel(ctx, curr.info, values, alpha)
+		if err != nil {
+			return err
+		}
+		r16, g16, b16, a16 := displayWord(red), displayWord(green), displayWord(blue), displayWord(alpha)
+		base := x * 8
+		dst[base], dst[base+1], dst[base+2], dst[base+3], dst[base+4], dst[base+5], dst[base+6], dst[base+7] = byte(r16>>8), byte(r16), byte(g16>>8), byte(g16), byte(b16>>8), byte(b16), byte(a16>>8), byte(a16)
+		return nil
+	})
+}
+
+// convertStripRowLinear 执行未裁剪D65线性scRGB RGBA逐行及跨带转换
+// 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dst 目标线性scRGB浮点切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) convertStripRowLinear(ctx context.Context, prev, curr, next *Raster, y int, dst []float64) error {
+	row, width, height, err := c.prepareStripRow(ctx, prev, curr, next, y, len(dst), 4)
+	if err != nil {
+		return err
+	}
+	return c.walkStripRow(ctx, prev, curr, next, row, width, height, func(x int, values []float64, alpha float64) error {
+		red, green, blue, err := c.linearPixel(ctx, curr.info, values, alpha)
+		if err != nil {
+			return err
+		}
+		base := x * 4
+		dst[base], dst[base+1], dst[base+2], dst[base+3] = red, green, blue, alpha
+		return nil
+	})
+}
+
+// convertStripRowXYZ 执行D50 PCS XYZ与原透明度逐行及跨带转换
+// 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dst 目标D50 XYZ与Alpha浮点切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) convertStripRowXYZ(ctx context.Context, prev, curr, next *Raster, y int, dst []float64) error {
+	row, width, height, err := c.prepareStripRow(ctx, prev, curr, next, y, len(dst), 4)
+	if err != nil {
+		return err
+	}
+	return c.walkStripRow(ctx, prev, curr, next, row, width, height, func(x int, values []float64, alpha float64) error {
+		vx, vy, vz, err := c.xyzPixel(ctx, curr.info, values, alpha)
+		if err != nil {
+			return err
+		}
+		base := x * 4
+		dst[base], dst[base+1], dst[base+2], dst[base+3] = vx, vy, vz, alpha
+		return nil
+	})
+}
+
+// walkStripRow 在单行内为各分量执行零分配栈上采样并驱动逐像素输出回调，支持跨带边界读取上下邻带色度
+// 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, row 零起点行号, width,height 当前带尺寸, emit 单像素输出回调
+// 返回: error 采样、色彩或取消错误
+func (c *ColorConverter) walkStripRow(ctx context.Context, prev, curr, next *Raster, row, width, height int, emit func(int, []float64, float64) error) error {
+	count := len(curr.info.Components)
+	var valueStorage [9]float64
+	values := valueStorage[:]
+	if count > len(valueStorage) {
+		values = make([]float64, count)
+	} else {
+		values = values[:count]
+	}
+	hasPrev, hasNext := prev != nil, next != nil
+	useNearestFast := c.filter == ResampleNearest && !hasPrev && !hasNext && curr.Bounds().Min == (image.Point{})
+	var currStorage, prevStorage, nextStorage [9]Component
+	var currComps, prevComps, nextComps []Component
+	if !useNearestFast {
+		if count > len(currStorage) {
+			currComps = make([]Component, count)
+			if hasPrev {
+				prevComps = make([]Component, count)
+			}
+			if hasNext {
+				nextComps = make([]Component, count)
+			}
+		} else {
+			currComps = currStorage[:count]
+			if hasPrev {
+				prevComps = prevStorage[:count]
+			}
+			if hasNext {
+				nextComps = nextStorage[:count]
+			}
+		}
+		for index := range count {
+			var err error
+			currComps[index], err = curr.component(index)
+			if err != nil {
+				return err
+			}
+			if hasPrev {
+				prevComps[index], err = prev.component(index)
+				if err != nil {
+					return err
+				}
+			}
+			if hasNext {
+				nextComps[index], err = next.component(index)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for x := range width {
+		if x&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if useNearestFast {
+			if err := jxrDisplayNearestPixel(curr, x, row, values); err != nil {
+				return err
+			}
+		} else {
+			for index := range count {
+				var prevComp, nextComp Component
+				if hasPrev {
+					prevComp = prevComps[index]
+				}
+				if hasNext {
+					nextComp = nextComps[index]
+				}
+				var err error
+				values[index], err = displayJXRStripSample(prevComp, currComps[index], nextComp, hasPrev, hasNext, x, row, width, height, c.filter)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		alpha := 1.0
+		if curr.info.Alpha {
+			alpha = values[curr.info.Channels]
+		}
+		if err := emit(x, values, alpha); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+// displayPixel 计算单个已采样像素的非预乘sRGB显示三通道值
+// 入参: ctx 已规范化Context, info 源元数据, values 可复用样本切片, alpha 当前透明度
+// 返回: float64 红、绿、蓝sRGB值, error 颜色、变换或取消错误
+func (c *ColorConverter) displayPixel(ctx context.Context, info Info, values []float64, alpha float64) (float64, float64, float64, error) {
+	if c.transform != nil {
+		red, green, blue, err := c.transform(values[:info.Channels:info.Channels], alpha)
+		if err != nil {
+			return 0, 0, 0, jxrCallbackError{err: err}
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, 0, 0, err
+		}
+		return red, green, blue, nil
+	}
+	return c.mapping.color(ctx, info, values, alpha)
+}
+
+// linearPixel 计算单个已采样像素的未裁剪非预乘D65线性scRGB三通道值
+// 入参: ctx 已规范化Context, info 源元数据, values 可复用样本切片, alpha 当前透明度
+// 返回: float64 线性红、绿、蓝scRGB值, error 颜色、变换或取消错误
+func (c *ColorConverter) linearPixel(ctx context.Context, info Info, values []float64, alpha float64) (float64, float64, float64, error) {
+	if c.transform != nil {
+		red, green, blue, err := c.transform(values[:info.Channels:info.Channels], alpha)
+		if err != nil {
+			return 0, 0, 0, jxrCallbackError{err: err}
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, 0, 0, err
+		}
+		return jxrCICPInverseTransfer(red, 13, true), jxrCICPInverseTransfer(green, 13, true), jxrCICPInverseTransfer(blue, 13, true), nil
+	}
+	return c.mapping.linearColor(ctx, info, values, alpha, c.mapping.linear, true)
+}
+
+// xyzPixel 计算单个已采样像素的D50 PCS XYZ三刺激值，ICC源省略末端XYZ到sRGB矩阵直出PCS XYZ
+// 入参: ctx 已规范化Context, info 源元数据, values 可复用样本切片, alpha 当前透明度
+// 返回: float64 D50三刺激值X、Y、Z, error 颜色、变换或取消错误
+func (c *ColorConverter) xyzPixel(ctx context.Context, info Info, values []float64, alpha float64) (float64, float64, float64, error) {
+	if c.transform == nil && c.mapping.icc.channels != 0 {
+		if info.Premultiplied {
+			if !(alpha > 0) || !geometryFinite(alpha) {
+				return 0, 0, 0, nil
+			}
+			for index := range info.Channels {
+				values[index] /= alpha
+			}
+		}
+		return c.mapping.icc.xyzColor(ctx, values)
+	}
+	red, green, blue, err := c.linearPixel(ctx, info, values, alpha)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	xyz := jxrApplyColorMatrix(jxrSRGBToXYZD50, [3]float64{red, green, blue})
+	return xyz[0], xyz[1], xyz[2], nil
+}
+
+// displayJXRStripSample 在当前行带及可选上下邻带内按分量相位采样，双线性模式下无缝跨带读取相邻色度行
+// 入参: prevComp,currComp,nextComp 三带同一分量视图, hasPrev,hasNext 是否存在上下邻带, x,row 零起点显示坐标, width,height 当前带尺寸, filter 采样滤波
+// 返回: float64 采样数值, error 样本或非有限插值错误
+func displayJXRStripSample(prevComp, currComp, nextComp Component, hasPrev, hasNext bool, x, row, width, height int, filter ResampleFilter) (float64, error) {
+	info := currComp.info
+	if info.XStep == 1 && info.YStep == 1 && info.Bounds.Dx() == width && info.Bounds.Dy() == height {
+		return currComp.sampleAt(info.Bounds.Min.X+x, info.Bounds.Min.Y+row)
+	}
+	offsetX := jxrEffectiveOffset(info.XOffset, info.XStep, info.XPositionKnown)
+	offsetY := jxrEffectiveOffset(info.YOffset, info.YStep, info.YPositionKnown)
+	x0, x1, fx := resampleJXRAxis(x, width, width, info.Bounds.Dx(), offsetX, info.XStep)
+	currH := info.Bounds.Dy()
+	minY, maxY := 0, currH-1
+	if hasPrev && prevComp.info.Bounds.Dy() > 0 {
+		minY = -1
+	}
+	if hasNext && nextComp.info.Bounds.Dy() > 0 {
+		maxY = currH
+	}
+	posY := (float64(row) - offsetY) / float64(info.YStep)
+	if posY < float64(minY) {
+		posY = float64(minY)
+	} else if posY > float64(maxY) {
+		posY = float64(maxY)
+	}
+	y0 := int(math.Floor(posY))
+	y1 := min(y0+1, maxY)
+	fy := posY - float64(y0)
+	if filter == ResampleNearest {
+		if fx >= 0.5 {
+			x0 = x1
+		}
+		if fy >= 0.5 {
+			y0 = y1
+		}
+		return jxrStripComponentSample(prevComp, currComp, nextComp, currH, x0, y0)
+	}
+	if fx == 0 && fy == 0 {
+		return jxrStripComponentSample(prevComp, currComp, nextComp, currH, x0, y0)
+	}
+	var values [4]float64
+	for index, point := range [4]image.Point{{X: x0, Y: y0}, {X: x1, Y: y0}, {X: x0, Y: y1}, {X: x1, Y: y1}} {
+		if index&1 != 0 && fx == 0 || index&2 != 0 && fy == 0 {
+			continue
+		}
+		value, err := jxrStripComponentSample(prevComp, currComp, nextComp, currH, point.X, point.Y)
+		if err != nil {
+			return 0, err
+		}
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, fmt.Errorf("%w: nonfinite display interpolation", ErrInvalid)
+		}
+		values[index] = value
+	}
+	return (values[0]*(1-fx)+values[1]*fx)*(1-fy) + (values[2]*(1-fx)+values[3]*fx)*fy, nil
+}
+
+// jxrStripComponentSample 按跨带局部纵坐标从当前带或上下邻带边界行读取单个分量样本
+// 入参: prevComp,currComp,nextComp 三带分量视图, currH 当前带分量高度, cx,cy 分量局部坐标
+// 返回: float64 分量数值, error 坐标或视图错误
+func jxrStripComponentSample(prevComp, currComp, nextComp Component, currH, cx, cy int) (float64, error) {
+	if cy < 0 {
+		return prevComp.sampleAt(prevComp.info.Bounds.Min.X+cx, prevComp.info.Bounds.Max.Y-1)
+	}
+	if cy >= currH {
+		return nextComp.sampleAt(nextComp.info.Bounds.Min.X+cx, nextComp.info.Bounds.Min.Y)
+	}
+	return currComp.sampleAt(currComp.info.Bounds.Min.X+cx, currComp.info.Bounds.Min.Y+cy)
+}
+
+// displayByte 将显示分量转换为八位无符号字节，非数值采用零并在单位区间裁剪
+// 入参: value 显示分量
+// 返回: byte 八位无符号值
+func displayByte(value float64) byte {
+	if math.IsNaN(value) {
+		return 0
+	}
+	return byte(math.Floor(colorClamp(value)*255 + 0.5))
+}
+
+// displayJXRDirectCMYK8Row8 在整数域将单行八位无符号CMYK转换为紧凑八位NRGBA字节，与通用浮点路径逐位一致
+// 入参: raster 源图像, alpha 是否含透明度, interleaved 是否交织存储, row 零起点行号, width 行宽, dst 目标字节切片
+func displayJXRDirectCMYK8Row8(raster *Raster, alpha, interleaved bool, row, width int, dst []byte) {
+	rowBase := row * width
+	if interleaved {
+		stride := 4
+		if alpha {
+			stride = 5
+		}
+		src := raster.native.values[rowBase*stride : (rowBase+width)*stride]
+		for x := range width {
+			si, di := x*stride, x*4
+			c, m, yv, k := uint32(uint8(src[si])), uint32(uint8(src[si+1])), uint32(uint8(src[si+2])), uint32(uint8(src[si+3]))
+			w := (255 - k) * 257
+			r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
+			av := byte(0xff)
+			if alpha {
+				av = byte(src[si+4])
+			}
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(uint16(r)), jxrScale16To8(uint16(g)), jxrScale16To8(uint16(b)), av
+		}
+		return
+	}
+	c0, m0, y0, k0 := raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width], raster.planes[3].values[rowBase:rowBase+width]
+	var a0 []uint16
+	if alpha {
+		a0 = raster.planes[4].values[rowBase : rowBase+width]
+	}
+	for x := range width {
+		c, m, yv, k := uint32(uint8(c0[x])), uint32(uint8(m0[x])), uint32(uint8(y0[x])), uint32(uint8(k0[x]))
+		w := (255 - k) * 257
+		r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
+		av := byte(0xff)
+		if alpha {
+			av = byte(a0[x])
+		}
+		di := x * 4
+		dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(uint16(r)), jxrScale16To8(uint16(g)), jxrScale16To8(uint16(b)), av
+	}
+}
+
+// displayJXRDirectRow64 用纯整数算术直接填充单行大端十六位非预乘RGBA字节缓冲
+// 入参: raster 源图像, info 图像元数据, precision 分量位深, interleaved 是否交织存储, row 零起点行号, width 行宽, dst 目标字节切片
+func displayJXRDirectRow64(raster *Raster, info Info, precision uint8, interleaved bool, row, width int, dst []byte) {
+	rowBase := row * width
+	switch info.ColorSpace {
+	case ColorGray:
+		if !info.Alpha {
+			var src []uint16
+			if interleaved {
+				src = raster.native.values[rowBase : rowBase+width]
+			} else {
+				src = raster.planes[0].values[rowBase : rowBase+width]
+			}
+			if precision == 8 {
+				for x, v := range src {
+					b, di := byte(v), x*8
+					dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = b, b, b, b, b, b, 0xff, 0xff
+				}
+				return
+			}
+			for x, v := range src {
+				hi, lo, di := byte(v>>8), byte(v), x*8
+				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = hi, lo, hi, lo, hi, lo, 0xff, 0xff
+			}
+			return
+		}
+		if interleaved {
+			src := raster.native.values[rowBase*2 : (rowBase+width)*2]
+			if precision == 8 {
+				for x := range width {
+					si, di := x*2, x*8
+					b, a := byte(src[si]), byte(src[si+1])
+					dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = b, b, b, b, b, b, a, a
+				}
+				return
+			}
+			for x := range width {
+				si, di := x*2, x*8
+				v, a := src[si], src[si+1]
+				hi, lo, ah, al := byte(v>>8), byte(v), byte(a>>8), byte(a)
+				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = hi, lo, hi, lo, hi, lo, ah, al
+			}
+			return
+		}
+		g0, a0 := raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width]
+		if precision == 8 {
+			for x := range width {
+				b, a, di := byte(g0[x]), byte(a0[x]), x*8
+				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = b, b, b, b, b, b, a, a
+			}
+			return
+		}
+		for x := range width {
+			v, a, di := g0[x], a0[x], x*8
+			hi, lo, ah, al := byte(v>>8), byte(v), byte(a>>8), byte(a)
+			dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = hi, lo, hi, lo, hi, lo, ah, al
+		}
+	case ColorRGB:
+		if interleaved {
+			stride := 3
+			if info.Alpha {
+				stride = 4
+			}
+			src := raster.native.values[rowBase*stride : (rowBase+width)*stride]
+			if precision == 8 {
+				for x := range width {
+					si, di := x*stride, x*8
+					rv, gv, bv := byte(src[si]), byte(src[si+1]), byte(src[si+2])
+					av := byte(0xff)
+					if info.Alpha {
+						av = byte(src[si+3])
+					}
+					dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = rv, rv, gv, gv, bv, bv, av, av
+				}
+				return
+			}
+			for x := range width {
+				si, di := x*stride, x*8
+				rv, gv, bv := src[si], src[si+1], src[si+2]
+				av := uint16(0xffff)
+				if info.Alpha {
+					av = src[si+3]
+				}
+				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(rv>>8), byte(rv), byte(gv>>8), byte(gv), byte(bv>>8), byte(bv), byte(av>>8), byte(av)
+			}
+			return
+		}
+		r0, g0, b0 := raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width]
+		var a0 []uint16
+		if info.Alpha {
+			a0 = raster.planes[3].values[rowBase : rowBase+width]
+		}
+		if precision == 8 {
+			for x := range width {
+				rv, gv, bv, di := byte(r0[x]), byte(g0[x]), byte(b0[x]), x*8
+				av := byte(0xff)
+				if info.Alpha {
+					av = byte(a0[x])
+				}
+				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = rv, rv, gv, gv, bv, bv, av, av
+			}
+			return
+		}
+		for x := range width {
+			rv, gv, bv, di := r0[x], g0[x], b0[x], x*8
+			av := uint16(0xffff)
+			if info.Alpha {
+				av = a0[x]
+			}
+			dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(rv>>8), byte(rv), byte(gv>>8), byte(gv), byte(bv>>8), byte(bv), byte(av>>8), byte(av)
+		}
+	default:
+		if interleaved {
+			stride := 4
+			if info.Alpha {
+				stride = 5
+			}
+			src := raster.native.values[rowBase*stride : (rowBase+width)*stride]
+			for x := range width {
+				si, di := x*stride, x*8
+				c, m, yv, k := uint32(uint8(src[si])), uint32(uint8(src[si+1])), uint32(uint8(src[si+2])), uint32(uint8(src[si+3]))
+				w := (255 - k) * 257
+				r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
+				av := byte(0xff)
+				if info.Alpha {
+					av = byte(src[si+4])
+				}
+				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(r>>8), byte(r), byte(g>>8), byte(g), byte(b>>8), byte(b), av, av
+			}
+			return
+		}
+		c0, m0, y0, k0 := raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width], raster.planes[3].values[rowBase:rowBase+width]
+		var a0 []uint16
+		if info.Alpha {
+			a0 = raster.planes[4].values[rowBase : rowBase+width]
+		}
+		for x := range width {
+			c, m, yv, k, di := uint32(uint8(c0[x])), uint32(uint8(m0[x])), uint32(uint8(y0[x])), uint32(uint8(k0[x])), x*8
+			w := (255 - k) * 257
+			r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
+			av := byte(0xff)
+			if info.Alpha {
+				av = byte(a0[x])
+			}
+			dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(r>>8), byte(r), byte(g>>8), byte(g), byte(b>>8), byte(b), av, av
+		}
+	}
 }
 
 // colorClamp 将显示或透明度分量裁剪到单位区间
