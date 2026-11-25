@@ -54,14 +54,16 @@ type jxrUncompressedLayout struct {
 	separateAlpha bool
 	planar        bool
 	bitPacked     bool
+	invertBits    bool
 	bgrOrder      bool
 	rgbe          bool
 	packedBits    uint8
 	tenBit        bool
 	sampleBytes   uint64
 	slots         int
+	uvXStep       int
+	uvYStep       int
 	rowBytes      uint64
-	uvHeight      uint64
 	uvRowBytes    uint64
 	ySize         uint64
 	uvSize        uint64
@@ -1381,23 +1383,25 @@ func makeJXRPixelFormats() [0x57]jxrPixelFormat {
 // 返回: jxrUncompressedLayout 无压缩字节布局, error 格式、尺寸对齐或容量溢出错误
 func jxrMakeUncompressedLayout(id byte, format jxrPixelFormat, width, height uint64, separateAlpha bool) (jxrUncompressedLayout, error) {
 	l := jxrUncompressedLayout{width: width, height: height, channels: format.channels, hasAlpha: format.alpha, separateAlpha: separateAlpha}
-	var uvWidth uint64
+	var uvWidth, uvHeight uint64
 	var padChannel bool
 	switch format.color {
 	case 1:
 		if width%2 != 0 || height%2 != 0 {
 			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed YCC420 dimensions", ErrInvalid)
 		}
-		l.planar, uvWidth, l.uvHeight = true, width/2, height/2
+		l.planar, l.uvXStep, l.uvYStep, uvWidth, uvHeight = true, 2, 2, width/2, height/2
 	case 2:
 		if width%2 != 0 {
 			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed YCC422 dimensions", ErrInvalid)
 		}
-		l.planar, uvWidth, l.uvHeight = true, width/2, height
+		l.planar, l.uvXStep, l.uvYStep, uvWidth, uvHeight = true, 2, 1, width/2, height
+	case 3:
+		l.planar, l.uvXStep, l.uvYStep, uvWidth, uvHeight = true, 1, 1, width, height
 	}
 	switch id {
 	case 0x05:
-		l.bitPacked = true
+		l.bitPacked, l.invertBits = true, format.depth == 15
 		l.rowBytes = (width + 7) / 8
 	case 0x09:
 		l.packedBits = 15
@@ -1451,11 +1455,11 @@ func jxrMakeUncompressedLayout(id byte, format jxrPixelFormat, width, height uin
 		}
 		l.rowBytes = width * l.sampleBytes
 		l.uvRowBytes = uvWidth * l.sampleBytes
-		if height > math.MaxUint32/l.rowBytes || l.uvHeight > math.MaxUint32/l.uvRowBytes {
+		if height > math.MaxUint32/l.rowBytes || uvHeight > math.MaxUint32/l.uvRowBytes {
 			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed planar size", ErrLimit)
 		}
 		l.ySize = l.rowBytes * height
-		l.uvSize = l.uvRowBytes * l.uvHeight
+		l.uvSize = l.uvRowBytes * uvHeight
 		if l.uvSize > math.MaxUint32/2 || l.ySize > math.MaxUint32-l.uvSize*2 {
 			return jxrUncompressedLayout{}, fmt.Errorf("%w: JPEG XR uncompressed planar total", ErrLimit)
 		}
@@ -1523,17 +1527,9 @@ func (l *jxrUncompressedLayout) planeSpec(ci int) (int, int, uint64, uint64, boo
 	case 0:
 		return 1, 1, 0, l.rowBytes, false
 	case 1:
-		sy := 1
-		if l.uvHeight != l.height {
-			sy = 2
-		}
-		return 2, sy, l.ySize, l.uvRowBytes, false
+		return l.uvXStep, l.uvYStep, l.ySize, l.uvRowBytes, false
 	case 2:
-		sy := 1
-		if l.uvHeight != l.height {
-			sy = 2
-		}
-		return 2, sy, l.ySize + l.uvSize, l.uvRowBytes, false
+		return l.uvXStep, l.uvYStep, l.ySize + l.uvSize, l.uvRowBytes, false
 	default:
 		if l.separateAlpha {
 			return 1, 1, 0, l.alphaRowBytes, true
@@ -1669,7 +1665,11 @@ func jxrPackUncompressedPixel(l *jxrUncompressedLayout, rowBuf, alphaBuf []byte,
 		if samples[0] > 1 {
 			return fmt.Errorf("%w: JPEG XR uncompressed 1-bit sample range", ErrInvalid)
 		}
-		if samples[0] != 0 {
+		bit := samples[0]
+		if l.invertBits {
+			bit ^= 1
+		}
+		if bit != 0 {
 			rowBuf[x>>3] |= 1 << uint(7-(x&7))
 		}
 		return nil

@@ -57,18 +57,19 @@ type jxrStripPlan struct {
 
 // jxrSpatialRows 持有单个空间包的连续熵状态和预测行，系数目标可在每行后复用
 type jxrSpatialRows struct {
-	bits     jxrBits
-	quant    [2]jxrTileQuant
-	rows     [2]*jxrTileRow
-	scratch  [2]*jxrDecodedMacro
-	dc       [2]jxrDC
-	lp       [2]jxrLP
-	hp       [2]jxrHP
-	channels [2]int
-	width    int
-	height   int
-	next     int
-	trim     uint8
+	bits       jxrBits
+	quant      [2]jxrTileQuant
+	rows       [2]*jxrTileRow
+	scratch    [2]*jxrDecodedMacro
+	dc         [2]jxrDC
+	lp         [2]jxrLP
+	hp         [2]jxrHP
+	channels   [2]int
+	width      int
+	height     int
+	next       int
+	trim       uint8
+	decodeBand Band
 }
 
 // jxrFrequencyRows 持有各频带连续位位置、独立预测行及共享的当前行系数工作，不保留整块系数
@@ -340,7 +341,7 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 		coeffWork += alphaWork
 	}
 	slack := available - coeffWork
-	state, err := d.source.primary.coefficientsContext(ctx, c.image, jxrWorkerBudgetAllowance(slack, d.source.primary.coefficientWork()))
+	state, err := decodeJXRCoefficients(ctx, &d.source.primary, c.image, jxrWorkerBudgetAllowance(slack, d.source.primary.coefficientWork()))
 	if err != nil {
 		return true, err
 	}
@@ -350,7 +351,7 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 	}
 	alphaHeader, alphaPlane := &state.header, state.alpha
 	if d.source.alpha != nil {
-		alphaState, err := d.source.alpha.coefficientsContext(ctx, c.alpha, jxrWorkerBudgetAllowance(slack, d.source.alpha.coefficientWork()))
+		alphaState, err := decodeJXRCoefficients(ctx, d.source.alpha, c.alpha, jxrWorkerBudgetAllowance(slack, d.source.alpha.coefficientWork()))
 		if err != nil {
 			return true, err
 		}
@@ -536,9 +537,6 @@ func (d *Decoder) planStrips(ctx context.Context, retained uint64) (jxrStripPlan
 		if stream != nil {
 			if len(stream.header.columns) < 2 || len(stream.header.rows) < 2 {
 				return plan, fmt.Errorf("%w: JPEG XR strip geometry", ErrUnsupported)
-			}
-			if (len(stream.header.columns) != 2 || len(stream.header.rows) != 2) && !stream.header.index {
-				return plan, fmt.Errorf("%w: JPEG XR strip packet index", ErrUnsupported)
 			}
 			for _, plane := range [2]*jxrPlane{&stream.primary, stream.alpha} {
 				if plane != nil {
@@ -810,7 +808,7 @@ func newJXRSpatialRows(ctx context.Context, data []byte, s *jxrStream, tile int,
 	}
 	columns := len(s.header.columns) - 1
 	x, y := tile%columns, tile/columns
-	r := &jxrSpatialRows{bits: jxrPacketReader(data, s, tile), width: int(s.header.columns[x+1] - s.header.columns[x]), height: int(s.header.rows[y+1] - s.header.rows[y])}
+	r := &jxrSpatialRows{bits: jxrPacketReader(data, s, tile), width: int(s.header.columns[x+1] - s.header.columns[x]), height: int(s.header.rows[y+1] - s.header.rows[y]), decodeBand: s.decodeBand}
 	r.quant[0] = newJXRTileQuant(&s.primary)
 	if s.alpha != nil {
 		r.quant[1] = newJXRTileQuant(s.alpha)
@@ -896,12 +894,26 @@ func (r *jxrSpatialRows) readRow(ctx context.Context, target *jxrCoefficientImag
 					return err
 				}
 			}
+			effective := max(p.plane.bands, uint8(r.decodeBand))
 			if p.plane.bands < 2 {
 				if err := p.readHP(&r.bits, &r.hp[i], m, true, r.trim, row.residual, current.pattern); err != nil {
 					return err
 				}
-				if err := p.finishHighComponents(m.at, q, r.scratch[i].low); err != nil {
-					return err
+				if effective <= 1 {
+					if effective == 1 && p.plane.bands == 0 {
+						stripJXRFlexbits(&p.plane, info.bits, p.highMacro(m.at))
+					}
+					if err := p.finishHighComponents(m.at, q, r.scratch[i].low); err != nil {
+						return err
+					}
+				} else {
+					clear(p.highMacro(m.at))
+				}
+			}
+			if effective == 3 && p.plane.bands != 3 {
+				low := p.lowMacro(m.at)
+				for ch := range p.plane.channels {
+					clear(low[ch*16+1 : (ch+1)*16])
 				}
 			}
 			if err := row.advance(x, current); err != nil {
@@ -966,10 +978,11 @@ func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile in
 	if jxrFrequencyRowWork(s, tile) > min(maximum, uint64(^uint(0)>>1)) {
 		return nil, fmt.Errorf("%w: JPEG XR frequency row working budget", ErrLimit)
 	}
-	count := 4 - int(s.primary.bands)
-	if tile >= len(s.packets)/count {
+	streamCount := 4 - int(s.primary.bands)
+	if tile >= len(s.packets)/streamCount {
 		return nil, fmt.Errorf("%w: JPEG XR frequency row packet", ErrInvalid)
 	}
+	count := min(streamCount, 4-int(s.decodeBand))
 	for _, p := range [2]*jxrPlane{&s.primary, s.alpha} {
 		if p != nil {
 			if err := checkJXRModelComponents(p); err != nil {
@@ -988,7 +1001,7 @@ func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile in
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		packetIndex := tile*count + band
+		packetIndex := tile*streamCount + band
 		if band == 3 && jxrEmptyFlexPacket(s, data, packetIndex) {
 			r.trim = 15
 			continue
@@ -1014,7 +1027,7 @@ func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile in
 		}
 		r.channels[i] = p.channels
 		r.bands[i] = p.bands
-		for band := range min(3, 4-int(p.bands)) {
+		for band := range min(3, min(count, 4-int(p.bands))) {
 			var err error
 			r.rows[band][i], err = newJXRTileRow(ctx, r.width, p.channels, maximum)
 			if err != nil {
@@ -1091,6 +1104,21 @@ func (r *jxrFrequencyRows) readRow(ctx context.Context, target *jxrCoefficientIm
 				switch band {
 				case 0:
 					err = p.readDC(b, &r.dc[i], q, m, &current.low, r.scratch[i])
+					if err == nil && r.count == 1 && p.plane.bands != 3 {
+						low := p.lowMacro(at)
+						for ch := range p.plane.channels {
+							shift := uint8(0)
+							if ch == 0 {
+								shift = 1
+							}
+							var value int64
+							value, err = scaleJXRWord(r.scratch[i].dc[ch], jxrQuantScale(q.dc[ch], p.plane.scaled, shift), p.longWord)
+							if err != nil {
+								break
+							}
+							low[ch*16] = value
+						}
+					}
 				case 1:
 					if q.lpCount > 1 && !q.useDC {
 						info.lpIndex = uint8(readJXRQPIndex(b, q.lpCount))
@@ -1103,7 +1131,7 @@ func (r *jxrFrequencyRows) readRow(ctx context.Context, target *jxrCoefficientIm
 						info.hpIndex = uint8(readJXRQPIndex(b, q.hpCount))
 					}
 					err = p.readHP(b, &r.hp[i], m, false, 0, row.residual, current.pattern)
-					if err == nil && p.plane.bands == 1 {
+					if err == nil && (p.plane.bands == 1 || p.plane.bands == 0 && r.count == 3) {
 						err = refineJXRHigh(b, &p.plane, info.bits, 15, p.highMacro(at))
 						if err == nil {
 							err = p.finishHighComponents(at, q, r.scratch[i].low)
@@ -1836,4 +1864,94 @@ func (d *Decoder) decodeUncompressedStripsLocked(ctx context.Context, write Rast
 		}
 	}
 	return ctx.Err()
+}
+
+// stripJXRFlexbits 从空间模式反量化前的高通系数中精确剥离精细位，结果等价于全零精细位包
+// 入参: p 平面信息, bits 当前宏块亮度及色度精细位数, values 宏块高通系数切片
+func stripJXRFlexbits(p *jxrPlane, bits [2]uint8, values []int64) {
+	for ch := range p.channels {
+		group := 0
+		if ch != 0 {
+			group = 1
+		}
+		width := bits[group]
+		if width == 0 {
+			continue
+		}
+		blocks := 16
+		if ch != 0 && p.color == 1 {
+			blocks = 4
+		} else if ch != 0 && p.color == 2 {
+			blocks = 8
+		}
+		base := ch * 256
+		for i := range blocks * 16 {
+			v := values[base+i]
+			if v > 0 {
+				values[base+i] = (v >> width) << width
+			} else if v < 0 {
+				values[base+i] = -((-v >> width) << width)
+			}
+		}
+	}
+}
+
+// decodeJXRCoefficients 按频带截断选择整图多核路径或逐块频带截断路径解码系数
+// 入参: ctx Context, s 已校验码流头, data 独立码流字节, maxWork 系数及临时状态字节预算
+// 返回: *jxrCoefficientImage 双平面系数, error 数据、能力、资源或取消错误
+func decodeJXRCoefficients(ctx context.Context, s *jxrStream, data []byte, maxWork uint64) (*jxrCoefficientImage, error) {
+	if s.decodeBand == BandAll {
+		return s.coefficientsContext(ctx, data, maxWork)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := checkJXRModelComponents(&s.primary); err != nil {
+		return nil, err
+	}
+	if s.alpha != nil {
+		if err := checkJXRModelComponents(s.alpha); err != nil {
+			return nil, err
+		}
+	}
+	limit := min(maxWork, uint64(^uint(0)>>1))
+	baseWork := s.coefficientWork()
+	if baseWork > limit {
+		return nil, &LimitError{Resource: "JPEG XR coefficient working budget", Limit: limit, Required: baseWork}
+	}
+	fullCols := int(s.header.columns[len(s.header.columns)-1])
+	fullRows := int(s.header.rows[len(s.header.rows)-1])
+	count := uint64(fullCols) * uint64(fullRows)
+	img := &jxrCoefficientImage{header: s.header, primary: newJXRCoefficients(&s.primary, int(count), s.header.longWord)}
+	img.primary.workers = s.workers
+	if s.alpha != nil {
+		alpha := newJXRCoefficients(s.alpha, int(count), s.header.longWord)
+		alpha.workers = s.workers
+		img.alpha = &alpha
+	}
+	columns, rows := len(s.header.columns)-1, len(s.header.rows)-1
+	for tile := range columns * rows {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		tx, ty := tile%columns, tile/columns
+		tileLeft, tileTop := int(s.header.columns[tx]), int(s.header.rows[ty])
+		tileHeight := int(s.header.rows[ty+1]) - tileTop
+		var reader jxrCoefficientRows
+		var err error
+		if s.header.frequency {
+			reader, err = newJXRFrequencyRows(ctx, data, s, tile, limit)
+		} else {
+			reader, err = newJXRSpatialRows(ctx, data, s, tile, limit)
+		}
+		if err != nil {
+			return nil, err
+		}
+		for row := range tileHeight {
+			if err := reader.readRow(ctx, img, (tileTop+row)*fullCols+tileLeft); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return img, ctx.Err()
 }

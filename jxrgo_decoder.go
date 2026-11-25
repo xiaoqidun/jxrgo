@@ -36,6 +36,7 @@ type Decoder struct {
 	closed                   bool
 	legacyHighpassPrediction bool
 	keepOrientation          bool
+	decodeBand               Band
 	workers                  int
 	fileInput                *jxrReaderAt
 	inputExtra               uint64
@@ -82,14 +83,19 @@ func newDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder
 	}
 	limits := DefaultLimits()
 	workers := 0
+	band := BandAll
 	legacyHighpass := false
 	keepOrientation := false
 	if opts != nil {
 		if opts.Workers < 0 {
 			return nil, fmt.Errorf("%w: negative decode workers", ErrInvalid)
 		}
+		if opts.Band > BandDC {
+			return nil, fmt.Errorf("%w: decode band", ErrInvalid)
+		}
 		limits = opts.Limits.normalized()
 		workers = opts.Workers
+		band = opts.Band
 		legacyHighpass = opts.LegacyHighpassPrediction
 		keepOrientation = opts.KeepOrientation
 	}
@@ -118,8 +124,10 @@ func newDecoder(ctx context.Context, r io.Reader, opts *DecodeOptions) (*Decoder
 	if err != nil {
 		return nil, err
 	}
-	decoder := &Decoder{data: data, source: source, limits: limits, info: info, legacyHighpassPrediction: legacyHighpass, keepOrientation: keepOrientation}
+	extra := uint64(cap(source.container.exif)) + uint64(cap(source.container.gps))
+	decoder := &Decoder{data: data, source: source, limits: limits, info: info, inputExtra: extra, legacyHighpassPrediction: legacyHighpass, keepOrientation: keepOrientation}
 	decoder.setWorkers(workers)
+	decoder.setDecodeBand(band)
 	if err := decoder.checkInfoCopy(); err != nil {
 		return nil, err
 	}
@@ -132,6 +140,16 @@ func (d *Decoder) setWorkers(requested int) {
 	workers := normalizeJXRWorkers(requested)
 	d.workers = workers
 	d.source.setWorkers(workers)
+}
+
+// setDecodeBand 将频带截断上限同步至解码器及其主图与独立透明度码流
+// 入参: band 目标频带截断上限
+func (d *Decoder) setDecodeBand(band Band) {
+	d.decodeBand = band
+	d.source.primary.decodeBand = band
+	if d.source.alpha != nil {
+		d.source.alpha.decodeBand = band
+	}
 }
 
 // Info 返回方向变换后的图像信息副本，关闭后或接收者为nil时返回零值
@@ -217,7 +235,7 @@ func (d *Decoder) decodeLocked(ctx context.Context, extra uint64) (*Raster, erro
 	}
 	width := d.source.sampleBytes()
 	pixels := uint64(d.info.Bounds.Dx()) * uint64(d.info.Bounds.Dy())
-	retained := d.inputWork() + uint64(len(d.info.ICCProfile)) + uint64(cap(d.source.container.profiles))*4
+	retained := d.inputWork() + uint64(len(d.info.ICCProfile)) + uint64(len(d.info.EXIF)) + uint64(len(d.info.GPS)) + uint64(len(d.info.XMP)) + uint64(len(d.info.IPTC)) + jxrDescriptionWork(d.source.container.description) + jxrDescriptionWork(d.info.Description)*2 + uint64(cap(d.source.container.profiles))*4
 	if d.info.ColorEncoding != nil {
 		retained += 4
 	}
@@ -561,7 +579,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 		return nil, &LimitError{Resource: "max memory bytes", Limit: budgetLimit, Required: decodeWork, Detail: "JPEG XR combined decoding storage"}
 	}
 	slack := budgetLimit - decodeWork
-	state, err := source.primary.coefficientsContext(ctx, c.image, jxrWorkerBudgetAllowance(slack, source.primary.coefficientWork()))
+	state, err := decodeJXRCoefficients(ctx, &source.primary, c.image, jxrWorkerBudgetAllowance(slack, source.primary.coefficientWork()))
 	if err != nil {
 		return nil, err
 	}
@@ -571,7 +589,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 	}
 	alphaHeader, alphaPlane := &state.header, state.alpha
 	if source.alpha != nil {
-		alphaState, err := source.alpha.coefficientsContext(ctx, c.alpha, jxrWorkerBudgetAllowance(slack, source.alpha.coefficientWork()))
+		alphaState, err := decodeJXRCoefficients(ctx, source.alpha, c.alpha, jxrWorkerBudgetAllowance(slack, source.alpha.coefficientWork()))
 		if err != nil {
 			return nil, err
 		}

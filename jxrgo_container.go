@@ -112,17 +112,20 @@ type jxrSubIFDNode struct {
 
 // jxrSubIFDEntry 保存单条Sub-IFD外部负载或嵌套子目录的来源与布局信息
 type jxrSubIFDEntry struct {
-	index     int
-	srcOffset uint64
-	size      uint64
-	subIFD    bool
-	children  []*jxrSubIFDNode
+	index      int
+	typ        uint16
+	srcOffset  uint64
+	size       uint64
+	subIFD     bool
+	swapEndian bool
+	children   []*jxrSubIFDNode
 }
 
 // jxrSubIFDScan 保存递归扫描Sub-IFD时的边界、深度、节点计数与防环路状态
 type jxrSubIFDScan struct {
 	d            *jxrDirectory
 	raw          []byte
+	order        binary.ByteOrder
 	parser       *jxrParser
 	size         uint64
 	minOffset    uint64
@@ -493,22 +496,20 @@ func (parser *jxrParser) directoryFields(d *jxrDirectory, maxPixels uint64) (jxr
 	}
 	if entry := d.entryFor(0x8769); entry != nil {
 		typ, count := d.order.Uint16(entry[2:]), d.order.Uint32(entry[4:])
-		if typ != 4 || count != 1 {
-			return c, fmt.Errorf("%w: JPEG XR EXIF IFD pointer", ErrInvalid)
-		}
-		c.exif, err = jxrReadSubIFD(d, parser, uint64(d.order.Uint32(entry[8:])), true)
-		if err != nil {
-			return c, err
+		if typ == 4 && count == 1 {
+			c.exif, err = jxrReadSubIFD(d, parser, uint64(d.order.Uint32(entry[8:])), true)
+			if err != nil {
+				return c, err
+			}
 		}
 	}
 	if entry := d.entryFor(0x8825); entry != nil {
 		typ, count := d.order.Uint16(entry[2:]), d.order.Uint32(entry[4:])
-		if typ != 4 || count != 1 {
-			return c, fmt.Errorf("%w: JPEG XR GPS IFD pointer", ErrInvalid)
-		}
-		c.gps, err = jxrReadSubIFD(d, parser, uint64(d.order.Uint32(entry[8:])), false)
-		if err != nil {
-			return c, err
+		if typ == 4 && count == 1 {
+			c.gps, err = jxrReadSubIFD(d, parser, uint64(d.order.Uint32(entry[8:])), false)
+			if err != nil {
+				return c, err
+			}
 		}
 	}
 	c.profile, err = jxrReadContainerBlob(d, parser, 0x8773, 7)
@@ -607,11 +608,30 @@ func jxrIsNestedSubIFD(tag, typ uint16, count uint64, allowInterop bool) bool {
 	return allowInterop && tag == 0xa005 && typ == 4 && count == 1
 }
 
+// jxrSwapTIFFEndian 按TIFF字段类型原地翻转多字节元素字节序，单字节类型保持不变
+// 入参: data 待转换元素字节切片, typ TIFF字段类型编号
+func jxrSwapTIFFEndian(data []byte, typ uint16) {
+	switch typ {
+	case 3, 8:
+		for i := 0; i+2 <= len(data); i += 2 {
+			data[i], data[i+1] = data[i+1], data[i]
+		}
+	case 4, 5, 9, 10, 11, 13:
+		for i := 0; i+4 <= len(data); i += 4 {
+			data[i], data[i+1], data[i+2], data[i+3] = data[i+3], data[i+2], data[i+1], data[i]
+		}
+	case 12:
+		for i := 0; i+8 <= len(data); i += 8 {
+			data[i], data[i+1], data[i+2], data[i+3], data[i+4], data[i+5], data[i+6], data[i+7] = data[i+7], data[i+6], data[i+5], data[i+4], data[i+3], data[i+2], data[i+1], data[i]
+		}
+	}
+}
+
 // jxrReadSubIFD 将容器内由0x8769或0x8825偏移指向的Sub-IFD及其嵌套子目录重定位为自包含小端TIFF字节块
 // 入参: d 所属目录, parser 共享解析预算, offset 子目录在文件中的绝对偏移, allowInterop 是否识别EXIF互操作子目录
 // 返回: []byte 自包含小端TIFF字节块, error 偏移、格式、嵌套、读取或资源错误
 func jxrReadSubIFD(d *jxrDirectory, parser *jxrParser, offset uint64, allowInterop bool) ([]byte, error) {
-	state := jxrSubIFDScan{d: d, parser: parser, size: d.dataSize(), minOffset: 8, allowInterop: allowInterop}
+	state := jxrSubIFDScan{d: d, order: binary.LittleEndian, parser: parser, size: d.dataSize(), minOffset: 8, allowInterop: allowInterop}
 	defer func() {
 		if state.tempWork != 0 {
 			parser.used -= state.tempWork
@@ -647,21 +667,21 @@ func jxrReadSubIFD(d *jxrDirectory, parser *jxrParser, offset uint64, allowInter
 	return out, nil
 }
 
-// jxrParseSubIFDBytes 校验待写入的EXIF或GPS字节块并解析其递归子目录树，支持自包含小端TIFF和纯小端Sub-IFD
+// jxrParseSubIFDBytes 校验待写入的EXIF或GPS字节块并解析其递归子目录树，支持小端与大端TIFF及纯小端Sub-IFD
 // 入参: raw 原始EXIF或GPS字节, allowInterop 是否识别EXIF互操作子目录
 // 返回: *jxrSubIFDNode 已校验的子目录树, error 格式、偏移、嵌套或容量错误
 func jxrParseSubIFDBytes(raw []byte, allowInterop bool) (*jxrSubIFDNode, error) {
 	if len(raw) < 8 {
 		return nil, fmt.Errorf("%w: JPEG XR Sub-IFD bytes", ErrInvalid)
 	}
-	if string(raw[:4]) == "MM\x00\x2a" {
-		return nil, fmt.Errorf("%w: JPEG XR big-endian Sub-IFD", ErrInvalid)
-	}
+	order := binary.ByteOrder(binary.LittleEndian)
 	rootOffset, minOffset := uint64(0), uint64(0)
-	if string(raw[:4]) == "II\x2a\x00" {
+	if string(raw[:4]) == "MM\x00\x2a" {
+		order, rootOffset, minOffset = binary.BigEndian, uint64(binary.BigEndian.Uint32(raw[4:8])), 8
+	} else if string(raw[:4]) == "II\x2a\x00" {
 		rootOffset, minOffset = uint64(binary.LittleEndian.Uint32(raw[4:8])), 8
 	}
-	state := jxrSubIFDScan{raw: raw, size: uint64(len(raw)), minOffset: minOffset, allowInterop: allowInterop, strictNext: true}
+	state := jxrSubIFDScan{raw: raw, order: order, size: uint64(len(raw)), minOffset: minOffset, allowInterop: allowInterop, strictNext: true}
 	return state.scan(rootOffset, 0)
 }
 
@@ -686,6 +706,7 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 	if slices.Contains(s.ancestors, offset) {
 		return nil, fmt.Errorf("%w: JPEG XR Sub-IFD cycle", ErrInvalid)
 	}
+	swap := s.order == binary.BigEndian
 	s.nodes++
 	s.ancestors = append(s.ancestors, offset)
 	defer func() { s.ancestors = s.ancestors[:len(s.ancestors)-1] }()
@@ -693,7 +714,7 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 	if err := s.readBytes(offset, countBytes[:]); err != nil {
 		return nil, err
 	}
-	count := uint64(binary.LittleEndian.Uint16(countBytes[:]))
+	count := uint64(s.order.Uint16(countBytes[:]))
 	tableLen := count*12 + 6
 	if count == 0 || tableLen > s.size-offset {
 		return nil, fmt.Errorf("%w: JPEG XR Sub-IFD size", ErrInvalid)
@@ -702,13 +723,18 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.strictNext && binary.LittleEndian.Uint32(table[2+count*12:]) != 0 {
+	if s.strictNext && s.order.Uint32(table[2+count*12:]) != 0 {
 		return nil, fmt.Errorf("%w: JPEG XR Sub-IFD next offset", ErrInvalid)
 	}
 	if err := s.addTotal(tableLen); err != nil {
 		return nil, err
 	}
-	node := &jxrSubIFDNode{table: table, count: count, totalBytes: tableLen}
+	outTable := table
+	if swap {
+		outTable = make([]byte, len(table))
+		binary.LittleEndian.PutUint16(outTable[0:2], uint16(count))
+	}
+	node := &jxrSubIFDNode{table: outTable, count: count, totalBytes: tableLen}
 	for i := range count {
 		if s.parser != nil {
 			if err := s.parser.check(); err != nil {
@@ -716,7 +742,7 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 			}
 		}
 		entry := table[2+i*12 : 2+(i+1)*12]
-		tag, typ, n := binary.LittleEndian.Uint16(entry), binary.LittleEndian.Uint16(entry[2:]), uint64(binary.LittleEndian.Uint32(entry[4:]))
+		tag, typ, n := s.order.Uint16(entry), s.order.Uint16(entry[2:]), uint64(s.order.Uint32(entry[4:]))
 		width := jxrExifTypeWidth(typ)
 		if width == 0 {
 			return nil, fmt.Errorf("%w: JPEG XR Sub-IFD field type", ErrInvalid)
@@ -725,9 +751,20 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 			return nil, fmt.Errorf("%w: JPEG XR Sub-IFD field length", ErrInvalid)
 		}
 		fieldBytes := n * width
-		if jxrIsNestedSubIFD(tag, typ, n, s.allowInterop) {
+		nested := jxrIsNestedSubIFD(tag, typ, n, s.allowInterop)
+		if swap {
+			outEntry := outTable[2+i*12 : 2+(i+1)*12]
+			binary.LittleEndian.PutUint16(outEntry[0:2], tag)
+			binary.LittleEndian.PutUint16(outEntry[2:4], typ)
+			binary.LittleEndian.PutUint32(outEntry[4:8], uint32(n))
+			if !nested && fieldBytes <= 4 {
+				copy(outEntry[8:12], entry[8:12])
+				jxrSwapTIFFEndian(outEntry[8:8+fieldBytes], typ)
+			}
+		}
+		if nested {
 			if n == 1 {
-				childOffset := uint64(binary.LittleEndian.Uint32(entry[8:]))
+				childOffset := uint64(s.order.Uint32(entry[8:]))
 				child, err := s.scan(childOffset, depth+1)
 				if err != nil {
 					return nil, err
@@ -735,8 +772,11 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 				node.totalBytes += child.totalBytes
 				node.entries = append(node.entries, jxrSubIFDEntry{index: int(i), subIFD: true, children: []*jxrSubIFDNode{child}})
 			} else {
-				arrayOffset := uint64(binary.LittleEndian.Uint32(entry[8:]))
-				if arrayOffset > s.size || fieldBytes > s.size-arrayOffset {
+				if n > uint64(jxrMaxSubIFDNodes-s.nodes) {
+					return nil, fmt.Errorf("%w: JPEG XR Sub-IFD node count", ErrLimit)
+				}
+				arrayOffset := uint64(s.order.Uint32(entry[8:]))
+				if arrayOffset < s.minOffset || arrayOffset > s.size || fieldBytes > s.size-arrayOffset {
 					return nil, fmt.Errorf("%w: JPEG XR Sub-IFD pointer array offset", ErrInvalid)
 				}
 				if err := s.addTotal(fieldBytes); err != nil {
@@ -749,7 +789,7 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 				}
 				children := make([]*jxrSubIFDNode, int(n))
 				for ci := range int(n) {
-					childOffset := uint64(binary.LittleEndian.Uint32(rawOffsets[ci*4:]))
+					childOffset := uint64(s.order.Uint32(rawOffsets[ci*4:]))
 					child, err := s.scan(childOffset, depth+1)
 					if err != nil {
 						return nil, err
@@ -760,8 +800,8 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 				node.entries = append(node.entries, jxrSubIFDEntry{index: int(i), subIFD: true, children: children})
 			}
 		} else if fieldBytes > 4 {
-			fieldOffset := uint64(binary.LittleEndian.Uint32(entry[8:]))
-			if fieldOffset > s.size || fieldBytes > s.size-fieldOffset {
+			fieldOffset := uint64(s.order.Uint32(entry[8:]))
+			if fieldOffset < s.minOffset || fieldOffset > s.size || fieldBytes > s.size-fieldOffset {
 				return nil, fmt.Errorf("%w: JPEG XR Sub-IFD field offset", ErrInvalid)
 			}
 			padded := (fieldBytes + 1) &^ 1
@@ -769,7 +809,7 @@ func (s *jxrSubIFDScan) scan(offset uint64, depth int) (*jxrSubIFDNode, error) {
 				return nil, err
 			}
 			node.totalBytes += padded
-			node.entries = append(node.entries, jxrSubIFDEntry{index: int(i), srcOffset: fieldOffset, size: fieldBytes})
+			node.entries = append(node.entries, jxrSubIFDEntry{index: int(i), typ: typ, srcOffset: fieldOffset, size: fieldBytes, swapEndian: swap})
 		}
 	}
 	return node, nil
@@ -850,6 +890,9 @@ func jxrEmitSubIFD(dst []byte, start uint64, node *jxrSubIFDNode, copySrc func(u
 			binary.LittleEndian.PutUint32(entry[8:], uint32(cursor))
 			if err := copySrc(item.srcOffset, dst[cursor:cursor+item.size]); err != nil {
 				return 0, err
+			}
+			if item.swapEndian {
+				jxrSwapTIFFEndian(dst[cursor:cursor+item.size], item.typ)
 			}
 			cursor += (item.size + 1) &^ 1
 		} else if len(item.children) == 1 {
@@ -941,6 +984,29 @@ func relocateJXRSubIFD(data []byte, offset, delta uint64, allowInterop bool, dep
 	return nil
 }
 
+// jxrValidDateTime 校验ITU-T T.832 Clause A.7.13要求的DATE_TIME格式（YYYY:MM:DD HH:MM:SS）
+// 入参: value 不含末尾NUL的日期时间文本
+// 返回: bool 是否完全符合规范格式与日期时间分量范围
+func jxrValidDateTime(value string) bool {
+	if len(value) != 19 || value[4] != ':' || value[7] != ':' || value[10] != ' ' || value[13] != ':' || value[16] != ':' {
+		return false
+	}
+	for i := range 19 {
+		if i == 4 || i == 7 || i == 10 || i == 13 || i == 16 {
+			continue
+		}
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	month := int(value[5]-'0')*10 + int(value[6]-'0')
+	day := int(value[8]-'0')*10 + int(value[9]-'0')
+	hour := int(value[11]-'0')*10 + int(value[12]-'0')
+	minute := int(value[14]-'0')*10 + int(value[15]-'0')
+	second := int(value[17]-'0')*10 + int(value[18]-'0')
+	return month >= 1 && month <= 12 && day >= 1 && day <= 31 && hour <= 23 && minute <= 59 && second <= 59
+}
+
 // jxrReadDescription 解析ITU-T T.832 Annex A.5定义的图像描述标签，缺省全部标签时返回nil
 // 入参: d 已校验目录, parser 共享解析预算
 // 返回: *ImageDescription 图像描述副本，无任何描述标签时为nil, error 编码、格式或资源错误
@@ -968,13 +1034,24 @@ func jxrReadDescription(d *jxrDirectory, parser *jxrParser) (*ImageDescription, 
 		{0x0110, &desc.EquipmentModel},
 		{0x011d, &desc.PageName},
 		{0x0131, &desc.SoftwareNameVersion},
-		{0x0132, &desc.DateTime},
 		{0x013b, &desc.ArtistName},
 		{0x013c, &desc.HostComputer},
 		{0x8298, &desc.CopyrightNotice},
 	} {
 		if err := readText(item.tag, item.target); err != nil {
 			return nil, err
+		}
+	}
+	if raw, err := d.jxrField(0x0132, 20, 20, 2); err != nil {
+		return nil, err
+	} else if raw != nil && raw[19] == 0 {
+		text := string(raw[:19])
+		if jxrValidDateTime(text) {
+			if err := parser.reserve(19); err != nil {
+				return nil, err
+			}
+			desc.DateTime = text
+			present = true
 		}
 	}
 	if raw, err := d.jxrField(0x0129, 2, 4, 3); err != nil {
@@ -1020,12 +1097,15 @@ func jxrReadUTF8Field(d *jxrDirectory, parser *jxrParser, tag uint16) (string, b
 	return string(body), true, nil
 }
 
-// checkJXRDescription 校验待写入容器的Annex A.5描述结构体中全部文本字段
+// checkJXRDescription 校验待写入容器的Annex A.5描述结构体中全部文本与日期时间字段
 // 入参: desc 图像描述指针
-// 返回: error 文本非合法UTF-8、含非法NUL或超长时返回错误
+// 返回: error DateTime（0x0132）不符合YYYY:MM:DD HH:MM:SS格式，或文本非合法UTF-8、含非法NUL或超长时返回错误
 func checkJXRDescription(desc *ImageDescription) error {
 	if desc == nil {
 		return nil
+	}
+	if desc.DateTime != "" && !jxrValidDateTime(desc.DateTime) {
+		return fmt.Errorf("%w: JPEG XR description date time", ErrInvalid)
 	}
 	for _, value := range []string{
 		desc.DocumentName,
@@ -1034,7 +1114,6 @@ func checkJXRDescription(desc *ImageDescription) error {
 		desc.EquipmentModel,
 		desc.PageName,
 		desc.SoftwareNameVersion,
-		desc.DateTime,
 		desc.ArtistName,
 		desc.HostComputer,
 		desc.CopyrightNotice,
@@ -1560,14 +1639,19 @@ func newDecoderAt(ctx context.Context, r io.ReaderAt, size int64, opts *DecodeOp
 	}
 	limits := DefaultLimits()
 	workers := 0
+	band := BandAll
 	legacyHighpass := false
 	keepOrientation := false
 	if opts != nil {
 		if opts.Workers < 0 {
 			return nil, fmt.Errorf("%w: negative decode workers", ErrInvalid)
 		}
+		if opts.Band > BandDC {
+			return nil, fmt.Errorf("%w: decode band", ErrInvalid)
+		}
 		limits = opts.Limits.normalized()
 		workers = opts.Workers
+		band = opts.Band
 		legacyHighpass = opts.LegacyHighpassPrediction
 		keepOrientation = opts.KeepOrientation
 	}
@@ -1600,6 +1684,7 @@ func newDecoderAt(ctx context.Context, r io.ReaderAt, size int64, opts *DecodeOp
 			return nil, err
 		}
 		decoder.setWorkers(workers)
+		decoder.setDecodeBand(band)
 		return decoder, nil
 	}
 	if err := input.copy(4, signature[4:]); err != nil {
@@ -1630,6 +1715,7 @@ func newDecoderAt(ctx context.Context, r io.ReaderAt, size int64, opts *DecodeOp
 	}
 	decoder := &Decoder{data: []byte("WMPHOTO\x00"), source: source, info: info, limits: limits, legacyHighpassPrediction: legacyHighpass, keepOrientation: keepOrientation}
 	decoder.setWorkers(workers)
+	decoder.setDecodeBand(band)
 	if err := decoder.checkInfoCopy(); err != nil {
 		return nil, err
 	}
@@ -1856,7 +1942,7 @@ func fileDecoderAt(ctx context.Context, input *jxrReaderAt, parser *jxrParser, l
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	extra := uint64(cap(container.profile)) + uint64(cap(container.exif)) + uint64(cap(container.gps)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc)) + jxrDescriptionWork(container.description)
+	extra := uint64(cap(container.profile)) + uint64(cap(container.exif)) + uint64(cap(container.gps)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc))
 	decoder := &Decoder{data: header[:], source: source, info: info, limits: limits, fileInput: input, inputExtra: extra, legacyHighpassPrediction: parser.legacyHighpassPrediction, keepOrientation: keepOrientation}
 	decoder.bindInputContext(nil)
 	if err := decoder.checkInfoCopy(); err != nil {

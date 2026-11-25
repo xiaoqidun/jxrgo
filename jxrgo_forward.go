@@ -20,10 +20,20 @@ import (
 	"image"
 )
 
-// jxrForwardWindow 指定局部网格的目标宏块和真实图像四边，人工邻域边缘不执行图像边缘滤波
+// jxrSampleWindow 指定局部样本网格的真实源尺寸与坐标偏移，用于纯填充边距块或局部边距超限时的边缘复制
+type jxrSampleWindow struct {
+	enabled bool
+	width   int
+	height  int
+	offsetX int
+	offsetY int
+}
+
+// jxrForwardWindow 指定局部网格的目标宏块、真实图像四边及显式样本窗sample，core为空时执行完整变换，人工邻域边缘不执行图像边缘滤波
 type jxrForwardWindow struct {
-	core  image.Rectangle
-	edges [4]bool
+	core   image.Rectangle
+	edges  [4]bool
+	sample jxrSampleWindow
 }
 
 // newJXRTransformPlane 校验宏块布局并在预算内分配编码侧低通、高通及状态缓冲
@@ -252,17 +262,24 @@ func (c *jxrCoefficients) forwardSecondRange(ctx context.Context, h *jxrHeader, 
 	return ctx.Err()
 }
 
-// loadSamples 将显示方向的原生图像反映射到编码网格并以边缘样本填充窗口外区域，不隐式抽样
-// 入参: ctx 已规范化Context, raster 原生图像, h 图像头, alpha 是否加载独立透明度, exact 是否要求输入精确恢复
+// loadSamplesWindow 按图像头或显式样本窗将原生图像反映射到编码网格并以边缘样本填充窗口外区域
+// 入参: ctx 已规范化Context, raster 原生图像, h 图像头, alpha 是否加载独立透明度, exact 是否要求输入精确恢复, sample 可选显式样本窗
 // 返回: error 格式、采样、数值或取消错误
-func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jxrHeader, alpha, exact bool) error {
+func (c *jxrCoefficients) loadSamplesWindow(ctx context.Context, raster *Raster, h *jxrHeader, alpha, exact bool, sample jxrSampleWindow) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if raster == nil || h == nil || c == nil || len(raster.info.Components) == 0 || h.transform > 7 {
 		return fmt.Errorf("%w: JPEG XR source image", ErrInvalid)
 	}
-	width, height := int(h.width), int(h.height)
+	cw, ch, offX, offY := int(h.width), int(h.height), int(h.left), int(h.top)
+	if sample.enabled {
+		cw, ch, offX, offY = sample.width, sample.height, sample.offsetX, sample.offsetY
+	}
+	if cw <= 0 || ch <= 0 {
+		return fmt.Errorf("%w: JPEG XR source dimensions", ErrInvalid)
+	}
+	width, height := cw, ch
 	if h.transform&4 != 0 {
 		width, height = height, width
 	}
@@ -299,7 +316,7 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 	if downsample {
 		sourcePlane.color, sourcePlane.chromaX, sourcePlane.chromaY = format.color, 0, 0
 	}
-	source := jxrRasterSource{container: jxrContainer{width: h.width, height: h.height, transform: uint32(h.transform), format: format}, primary: jxrStream{primary: sourcePlane}}
+	source := jxrRasterSource{container: jxrContainer{width: uint64(cw), height: uint64(ch), transform: uint32(h.transform), format: format}, primary: jxrStream{primary: sourcePlane}}
 	for index := range components {
 		components[index], err = raster.component(base + index)
 		if err != nil {
@@ -319,7 +336,7 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 	var viewStorage [4]jxrComponentView
 	views := c.componentViewsStorage(h, true, viewStorage[:])
 	if downsample {
-		return c.loadDownsampledSamples(ctx, h, components, views)
+		return c.loadDownsampledSamples(ctx, h, components, views, cw, ch, offX, offY)
 	}
 	if !alpha && (c.plane.color == 1 || c.plane.color == 2) {
 		color, _, bias, precision, shift, scale, err := jxrIntegerInputConfig(h, &c.plane, false)
@@ -335,20 +352,23 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 					sy = 2
 				}
 			}
-			cw, ch := int(h.width)/sx, int(h.height)/sy
+			if offX%sx != 0 || offY%sy != 0 {
+				return fmt.Errorf("%w: JPEG XR source chroma offset alignment", ErrInvalid)
+			}
+			compW, compH, compOffX, compOffY := cw/sx, ch/sy, offX/sx, offY/sy
 			for y := range view.height {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				py := min(max(y-int(h.top)/sy, 0), ch-1)
+				py := min(max(y-compOffY, 0), compH-1)
 				for x := range view.width {
 					if x&1023 == 0 {
 						if err := ctx.Err(); err != nil {
 							return err
 						}
 					}
-					px := min(max(x-int(h.left)/sx, 0), cw-1)
-					dx, dy := jxrRasterPosition(px, py, cw, ch, h.transform)
+					px := min(max(x-compOffX, 0), compW-1)
+					dx, dy := jxrRasterPosition(px, py, compW, compH, h.transform)
 					sampleBits, err := component.sampleBitsAt(dx, dy)
 					if err != nil {
 						return err
@@ -371,7 +391,7 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 			copy(sharedComponents, components)
 			sharedViews := make([]jxrComponentView, len(views))
 			copy(sharedViews, views)
-			return c.loadFullSamplesParallel(ctx, h, sharedComponents, sharedViews, alpha, exact, workers, chunkRows, tasks)
+			return c.loadFullSamplesParallel(ctx, h, sharedComponents, sharedViews, alpha, exact, cw, ch, offX, offY, workers, chunkRows, tasks)
 		}
 	}
 	var bitStorage [4]uint32
@@ -382,21 +402,43 @@ func (c *jxrCoefficients) loadSamples(ctx context.Context, raster *Raster, h *jx
 	} else {
 		bits, values = bits[:count], values[:count]
 	}
-	return c.loadFullSamplesRange(ctx, h, components, views, alpha, exact, 0, views[0].height, bits, values)
+	return c.loadFullSamplesRange(ctx, h, components, views, alpha, exact, cw, ch, offX, offY, 0, views[0].height, bits, values)
 }
 
-// loadDownsampledSamples 对全采样RGB或YCC444源执行正向色彩变换并以居中盒式均值下采样到YUV422或YUV420视图
-// 入参: ctx 已规范化Context, h 图像头, components 全采样源分量, views 目标编码视图
+// jxrChromaWeights 返回指定色度采样相位对应的双点线性加权系数，权重之和恒为四
+// 入参: phase 标准色度采样相位编码（0至4或7）
+// 返回: [2]int64 偶位置与奇位置权重
+func jxrChromaWeights(phase uint8) [2]int64 {
+	switch phase {
+	case 0:
+		return [2]int64{4, 0}
+	case 1:
+		return [2]int64{3, 1}
+	case 3:
+		return [2]int64{1, 3}
+	case 4:
+		return [2]int64{0, 4}
+	default:
+		return [2]int64{2, 2}
+	}
+}
+
+// loadDownsampledSamples 对全采样RGB或YCC444源执行正向色彩变换并按声明相位加权下采样到YUV422或YUV420视图
+// 入参: ctx 已规范化Context, h 图像头, components 全采样源分量, views 目标编码视图, cw 源编码宽, ch 源编码高, offX 水平偏移, offY 垂直偏移
 // 返回: error 采样、数值或取消错误
-func (c *jxrCoefficients) loadDownsampledSamples(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView) error {
+func (c *jxrCoefficients) loadDownsampledSamples(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView, cw, ch, offX, offY int) error {
 	color, _, bias, precision, shift, scale, err := jxrIntegerInputConfig(h, &c.plane, false)
 	if err != nil {
 		return err
 	}
-	cw, ch := int(h.width), int(h.height)
 	sy := 1
 	if c.plane.color == 1 {
 		sy = 2
+	}
+	wx := jxrChromaWeights(c.plane.chromaX)
+	wy := [2]int64{1, 0}
+	if sy == 2 {
+		wy = jxrChromaWeights(c.plane.chromaY)
 	}
 	var rowValues [3]int64
 	for cy := range views[1].height {
@@ -414,10 +456,10 @@ func (c *jxrCoefficients) loadDownsampledSamples(ctx context.Context, h *jxrHead
 			var sumU, sumV int64
 			for dy := range sy {
 				y := yBase + dy
-				py := min(max(y-int(h.top), 0), ch-1)
+				py := min(max(y-offY, 0), ch-1)
 				for dx := range 2 {
 					x := xBase + dx
-					px := min(max(x-int(h.left), 0), cw-1)
+					px := min(max(x-offX, 0), cw-1)
 					rx, ry := jxrRasterPosition(px, py, cw, ch, h.transform)
 					for index := range 3 {
 						bits, err := components[index].sampleBitsAt(rx, ry)
@@ -437,16 +479,17 @@ func (c *jxrCoefficients) loadDownsampledSamples(ctx context.Context, h *jxrHead
 						return fmt.Errorf("%w: JPEG XR downsampled component count", ErrInvalid)
 					}
 					views[0].set(x, y, rowValues[0])
-					sumU += rowValues[1]
-					sumV += rowValues[2]
+					w := wy[dy] * wx[dx]
+					sumU += w * rowValues[1]
+					sumV += w * rowValues[2]
 				}
 			}
 			if sy == 2 {
+				views[1].set(cx, cy, (sumU+8)>>4)
+				views[2].set(cx, cy, (sumV+8)>>4)
+			} else {
 				views[1].set(cx, cy, (sumU+2)>>2)
 				views[2].set(cx, cy, (sumV+2)>>2)
-			} else {
-				views[1].set(cx, cy, (sumU+1)>>1)
-				views[2].set(cx, cy, (sumV+1)>>1)
 			}
 		}
 	}
@@ -454,9 +497,9 @@ func (c *jxrCoefficients) loadDownsampledSamples(ctx context.Context, h *jxrHead
 }
 
 // loadFullSamplesParallel 将大尺寸全采样图像按宏块行分片并行装载到编码视图
-// 入参: ctx Context, h 图像头, components 源分量视图, views 目标编码视图, alpha 是否加载透明度, exact 是否精确恢复, workers 并发槽位数, chunkRows 单片宏块行数, tasks 分片数
+// 入参: ctx Context, h 图像头, components 源分量视图, views 目标编码视图, alpha 是否加载透明度, exact 是否精确恢复, cw 源编码宽, ch 源编码高, offX 水平偏移, offY 垂直偏移, workers 并发槽位数, chunkRows 单片宏块行数, tasks 分片数
 // 返回: error 格式、采样、数值或取消错误
-func (c *jxrCoefficients) loadFullSamplesParallel(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView, alpha, exact bool, workers, chunkRows, tasks int) error {
+func (c *jxrCoefficients) loadFullSamplesParallel(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView, alpha, exact bool, cw, ch, offX, offY, workers, chunkRows, tasks int) error {
 	count := len(components)
 	return runJXRWorkers(ctx, workers, tasks, func(runCtx context.Context, task int) error {
 		var bStorage [4]uint32
@@ -469,15 +512,14 @@ func (c *jxrCoefficients) loadFullSamplesParallel(ctx context.Context, h *jxrHea
 		}
 		startY := task * chunkRows * 16
 		endY := min((task+1)*chunkRows*16, views[0].height)
-		return c.loadFullSamplesRange(runCtx, h, components, views, alpha, exact, startY, endY, rowBits, rowValues)
+		return c.loadFullSamplesRange(runCtx, h, components, views, alpha, exact, cw, ch, offX, offY, startY, endY, rowBits, rowValues)
 	})
 }
 
 // loadFullSamplesRange 将指定行范围的全采样原始分量反映射并执行正向色彩变换写入视图
-// 入参: ctx Context, h 图像头, components 源分量视图, views 目标编码视图, alpha 是否加载透明度, exact 是否精确恢复, startY 起始行, endY 结束行, rowBits 临时位模式缓冲, rowValues 临时样本缓冲
+// 入参: ctx Context, h 图像头, components 源分量视图, views 目标编码视图, alpha 是否加载透明度, exact 是否精确恢复, cw 源编码宽, ch 源编码高, offX 水平偏移, offY 垂直偏移, startY 起始行, endY 结束行, rowBits 临时位模式缓冲, rowValues 临时样本缓冲
 // 返回: error 格式、采样、数值或取消错误
-func (c *jxrCoefficients) loadFullSamplesRange(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView, alpha, exact bool, startY, endY int, rowBits []uint32, rowValues []int64) error {
-	cw, ch := int(h.width), int(h.height)
+func (c *jxrCoefficients) loadFullSamplesRange(ctx context.Context, h *jxrHeader, components []Component, views []jxrComponentView, alpha, exact bool, cw, ch, offX, offY, startY, endY int, rowBits []uint32, rowValues []int64) error {
 	integerMode := h.depth != 4 && h.depth != 7 && (h.color != 8 || alpha)
 	var color, precision, shift, scale uint8
 	var count int
@@ -496,14 +538,14 @@ func (c *jxrCoefficients) loadFullSamplesRange(ctx context.Context, h *jxrHeader
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		py := min(max(y-int(h.top), 0), ch-1)
+		py := min(max(y-offY, 0), ch-1)
 		for x := range views[0].width {
 			if x&1023 == 0 {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
 			}
-			px := min(max(x-int(h.left), 0), cw-1)
+			px := min(max(x-offX, 0), cw-1)
 			dx, dy := jxrRasterPosition(px, py, cw, ch, h.transform)
 			for index, component := range components {
 				v, err := component.sampleBitsAt(dx, dy)

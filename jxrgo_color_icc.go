@@ -120,12 +120,12 @@ type jxrICCGridAxis struct {
 	stride   int
 }
 
-// jxrICCFloatTransform 保存DToB浮点管线与单次显示操作重用的通道工作区
+// jxrICCFloatTransform 保存DToB浮点管线各阶段定义与最大中间通道宽度，构造后不可变
 type jxrICCFloatTransform struct {
-	stages  []jxrICCFloatStage
-	scratch []float64
-	outputs int
-	target  uint8
+	stages   []jxrICCFloatStage
+	maxWidth int
+	outputs  int
+	target   uint8
 }
 
 // jxrICCFloatStage 保存已校验的浮点处理元素及其输出通道数
@@ -240,12 +240,12 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 	baseMatrix := jxrICCXYZToSRGB()
 	outMatrix := baseMatrix
 	if intent == IntentAbsolute && class != "link" {
-		scale := [3]float64{white[0] / jxrICCD50White[0], white[1] / jxrICCD50White[1], white[2] / jxrICCD50White[2]}
+		reference := jxrICCD50White
 		if profile[8] == 2 && class == "mntr" && !jxrICCHasValidChad(profile, tags) {
-			outMatrix = jxrICCScaleMatrix(jxrXYZToSRGBD65, scale)
-		} else {
-			outMatrix = jxrICCScaleMatrix(baseMatrix, scale)
+			reference = jxrD65White
 		}
+		scale := [3]float64{white[0] / reference[0], white[1] / reference[1], white[2] / reference[2]}
+		outMatrix = jxrICCScaleMatrix(baseMatrix, scale)
 	}
 	d2bTag, a2bPrimary, a2bFallback := jxrICCIntentTags(intent)
 	if class == "link" || class == "abst" {
@@ -1231,7 +1231,7 @@ func jxrReadICCFloatTransformTarget(ctx context.Context, data []byte, channels, 
 	if err := p.reserve(uint64(width) * 16); err != nil {
 		return nil, err
 	}
-	return &jxrICCFloatTransform{stages: stages, scratch: make([]float64, width*2), outputs: outputs, target: target}, nil
+	return &jxrICCFloatTransform{stages: stages, maxWidth: width, outputs: outputs, target: target}, nil
 }
 
 // jxrReadICCPositions 读取位置表，按物理位置验证重叠后恢复逻辑顺序
@@ -1371,8 +1371,12 @@ func (transform *jxrICCFloatTransform) xyz(ctx context.Context, input []float64)
 			return xyz, fmt.Errorf("%w: ICC floating-point input", ErrInvalid)
 		}
 	}
-	width := len(transform.scratch) / 2
-	output, spare := transform.scratch[:width], transform.scratch[width:]
+	var bufA, bufB [jxrICCMaxChannels]float64
+	output, spare := bufA[:], bufB[:]
+	if transform.maxWidth > jxrICCMaxChannels {
+		buf := make([]float64, transform.maxWidth*2)
+		output, spare = buf[:transform.maxWidth], buf[transform.maxWidth:]
+	}
 	for _, stage := range transform.stages {
 		if err := ctx.Err(); err != nil {
 			return xyz, err

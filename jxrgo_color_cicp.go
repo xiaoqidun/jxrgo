@@ -146,19 +146,17 @@ func jxrHasSignedSamples(info Info) bool {
 	return format == SampleFixed || format == SampleFloat
 }
 
-// jxrNewYCCDecoder 为YCC图像构造非线性YCC到RGB的预解码器，可选优先使用合法CICP矩阵与范围，否则回退T.832默认全范围BT.601
+// jxrNewYCCDecoder 为YCC图像构造非线性YCC到RGB的预解码器，仅在无CICP声明或矩阵未指定时回退T.832默认全范围BT.601
 // 入参: info 原生图像描述, encoding 可选PTM CICP编码声明
-// 返回: jxrYCCDecoder YCC到RGB预解码器, bool 样本编码是否有效
+// 返回: jxrYCCDecoder YCC到RGB预解码器, bool 矩阵与样本编码是否受支持
 func jxrNewYCCDecoder(info Info, encoding *ColorEncoding) (jxrYCCDecoder, bool) {
 	if info.ColorSpace != ColorYCC || info.Channels != 3 || len(info.Components) < 3 {
 		return jxrYCCDecoder{}, false
 	}
-	if encoding != nil {
-		if dec, ok := jxrBuildYCCDecoder(info, *encoding); ok {
-			return dec, true
-		}
+	if encoding == nil || encoding.Matrix == 2 {
+		return jxrBuildYCCDecoder(info, ColorEncoding{Primaries: 1, Transfer: 13, Matrix: 5, FullRange: true})
 	}
-	return jxrBuildYCCDecoder(info, ColorEncoding{Primaries: 1, Transfer: 13, Matrix: 5, FullRange: true})
+	return jxrBuildYCCDecoder(info, *encoding)
 }
 
 // jxrCICPMatrixLuma 返回标准CICP非恒定或恒定亮度颜色矩阵对应的红蓝亮度权重
@@ -243,9 +241,6 @@ func jxrCICPComponentRanges(components []ComponentInfo, fullRange, ycc, ycgco bo
 func jxrBuildYCCDecoder(info Info, specification ColorEncoding) (jxrYCCDecoder, bool) {
 	var dec jxrYCCDecoder
 	matrixCode := uint16(specification.Matrix)
-	if matrixCode == 2 {
-		matrixCode = 5
-	}
 	var red, blue float64
 	switch matrixCode {
 	case 0, 8, 16, 17:
@@ -810,26 +805,45 @@ func jxrHDRInverseTransfer(value float64, transfer uint16) float64 {
 	return (math.Exp((value-jxrHLGC)/jxrHLGA) + jxrHLGB) / 12
 }
 
-// jxrHLGDisplayLight 按BT.2100参考峰值亮度将HLG场景光转换为归一化显示光
+// jxrHLGDisplayLight 按BT.2100-2参考峰值亮度及表5注5f系统伽马公式将HLG场景光转换为归一化显示光
 // 入参: rgb 线性场景RGB, weights 场景亮度权重, peakNits 参考显示峰值亮度
 // 返回: [3]float64 参考显示光RGB
 func jxrHLGDisplayLight(rgb, weights [3]float64, peakNits float64) [3]float64 {
 	luma := weights[0]*rgb[0] + weights[1]*rgb[1] + weights[2]*rgb[2]
+	if !(luma > 0) {
+		return [3]float64{}
+	}
 	gamma := 1.2
 	if peakNits != 1000 {
-		gamma = 1.2 + 0.42*math.Log10(peakNits/1000)
+		if peakNits >= 400 && peakNits <= 2000 {
+			gamma = 1.2 + 0.42*math.Log10(peakNits/1000)
+		} else {
+			gamma = 1.2 * math.Pow(1.111, math.Log2(peakNits/1000))
+		}
 	}
-	gain := math.Pow(max(0, luma), gamma-1)
+	gain := math.Pow(luma, gamma-1)
 	for i := range rgb {
-		rgb[i] *= gain
+		if rgb[i] != 0 {
+			rgb[i] *= gain
+		}
 	}
 	return rgb
 }
 
-// jxrBT2446MethodA 按BT.2446方法A将指定峰值显示光映射到100 cd/m²并按BT.1886线性化输出
+// jxrBT2446MethodA 按BT.2446方法A将指定峰值显示光映射到100 cd/m²并按BT.1886线性化输出，不高于100 cd/m²时直接裁剪恒等输出
 // 入参: rgb BT.2020线性显示RGB，相对peakNits峰值归一化, peakNits HDR标称峰值亮度
 // 返回: [3]float64 BT.2020线性SDR显示RGB
 func jxrBT2446MethodA(rgb [3]float64, peakNits float64) [3]float64 {
+	if peakNits <= 100 {
+		for index, value := range rgb {
+			if !(value > 0) {
+				rgb[index] = 0
+			} else if value > 1 {
+				rgb[index] = 1
+			}
+		}
+		return rgb
+	}
 	for index, value := range rgb {
 		rgb[index] = math.Pow(colorClamp(value), 1/2.4)
 	}

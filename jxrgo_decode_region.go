@@ -99,10 +99,7 @@ func (d *Decoder) decodeRegionLocked(ctx context.Context, region image.Rectangle
 		sources[1].container.transform = 0
 		sources[1].setWorkers(d.workers)
 	}
-	retained := d.inputWork() + d.source.primary.headerWork() + uint64(cap(d.source.container.profiles))*4 + uint64(len(d.info.Components))*256 + uint64(len(d.info.ICCProfile)) + 4096
-	if d.source.alpha != nil {
-		retained += d.source.alpha.headerWork()
-	}
+	retained := d.inputWork() + d.retainedHeaderWork() + uint64(len(d.info.Components))*128 + 3584
 	if retained > d.limits.MaxMemoryBytes || outputWork > d.limits.MaxMemoryBytes-retained {
 		return nil, &LimitError{Resource: "max memory bytes", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, outputWork), Detail: "JPEG XR region output memory"}
 	}
@@ -113,10 +110,6 @@ func (d *Decoder) decodeRegionLocked(ctx context.Context, region image.Rectangle
 			return nil, err
 		}
 		h := &source.primary.header
-		count := (len(h.columns) - 1) * (len(h.rows) - 1)
-		if count > 1 && !h.index {
-			return nil, fmt.Errorf("%w: JPEG XR region packet index", ErrUnsupported)
-		}
 		bounds := source.regionTileRange(region, uint8(d.source.container.transform))
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 			for x := bounds.Min.X; x < bounds.Max.X; x++ {

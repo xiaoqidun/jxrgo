@@ -225,8 +225,7 @@ func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster
 		}
 	}
 	remaining := min(d.limits.MaxMemoryBytes, uint64(^uint(0)>>1))
-	metadataExtra := uint64(cap(d.info.ICCProfile)) + uint64(cap(d.info.EXIF)) + uint64(cap(d.info.GPS)) + uint64(cap(d.info.XMP)) + uint64(cap(d.info.IPTC)) + jxrDescriptionWork(d.info.Description)
-	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), metadataExtra, 4096 + uint64(len(d.info.Components))*128} {
+	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), 4096 + uint64(len(d.info.Components))*128} {
 		if amount > remaining {
 			return nil, fmt.Errorf("%w: reduced retained storage", ErrLimit)
 		}
@@ -572,7 +571,7 @@ func newJXRLowFrequencyPlan(ctx context.Context, source *jxrStream, bands int, m
 		return nil, fmt.Errorf("%w: low frequency original packet count", ErrInvalid)
 	}
 	if len(source.packets) > 1 && !source.header.index {
-		return nil, fmt.Errorf("%w: low frequency indexed access", ErrUnsupported)
+		return nil, fmt.Errorf("%w: low frequency packet index", ErrInvalid)
 	}
 	work := source.headerWork()
 	if work > maximum || uint64(len(source.packets)) > (maximum-work)/8 || 256 > maximum-work-uint64(len(source.packets))*8 {
@@ -1119,7 +1118,11 @@ func (r *jxrReducedRows) readHalf(ctx context.Context) error {
 // 入参: source 完整原始流, bands 一或二
 // 返回: uint64 活动工作额度，非法几何或溢出返回最大值
 func jxrLowInverseRowWork(source *jxrStream, bands int) uint64 {
-	work := jxrLowTileRowsWork(source, bands)
+	tileBands := bands
+	if source.decodeBand == BandDC {
+		tileBands = 1
+	}
+	work := jxrLowTileRowsWork(source, tileBands)
 	if work == ^uint64(0) || bands == 1 {
 		return work
 	}
@@ -1146,7 +1149,11 @@ func newJXRLowInverseRows(ctx context.Context, data []byte, source *jxrStream, b
 	if jxrLowInverseRowWork(source, bands) > min(maximum, uint64(^uint(0)>>1)) {
 		return nil, fmt.Errorf("%w: reduced low inverse row budget", ErrLimit)
 	}
-	rows, err := newJXRLowTileRows(ctx, data, source, bands, maximum)
+	tileBands := bands
+	if source.decodeBand == BandDC {
+		tileBands = 1
+	}
+	rows, err := newJXRLowTileRows(ctx, data, source, tileBands, maximum)
 	if err != nil {
 		return nil, err
 	}
@@ -1471,14 +1478,12 @@ func newJXRLowTileRows(ctx context.Context, data []byte, source *jxrStream, band
 	}
 	columns := len(source.header.columns) - 1
 	r := &jxrLowTileRows{source: *source, data: data, maximum: maximum, bands: bands, activeRow: -1, readers: make([]jxrLowTileReader, columns)}
-	if source.header.frequency {
+	if r.source.header.frequency {
 		var err error
 		r.plan, err = newJXRLowFrequencyPlan(ctx, &r.source, bands, maximum)
 		if err != nil {
 			return nil, err
 		}
-	} else if len(source.packets) > 1 && !source.header.index {
-		return nil, fmt.Errorf("%w: reduced tile indexed access", ErrUnsupported)
 	}
 	width := int(source.header.columns[columns])
 	r.image.header = jxrRowReconstructionStream(source).header
@@ -1565,8 +1570,7 @@ func (d *Decoder) decodeUncompressedReducedLocked(ctx context.Context, divisor i
 	}
 	rowWork := layout.rowBufferWork()
 	remaining := min(d.limits.MaxMemoryBytes, uint64(^uint(0)>>1))
-	metadataExtra := uint64(cap(d.info.ICCProfile)) + uint64(cap(d.info.EXIF)) + uint64(cap(d.info.GPS)) + uint64(cap(d.info.XMP)) + uint64(cap(d.info.IPTC)) + jxrDescriptionWork(d.info.Description)
-	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), metadataExtra, rowWork} {
+	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), rowWork} {
 		if amount > remaining {
 			return nil, fmt.Errorf("%w: reduced uncompressed budget", ErrLimit)
 		}

@@ -189,12 +189,14 @@ type Limits struct {
 	MaxMemoryBytes uint64
 }
 
-// DecodeOptions 指定解码并发上限、方向策略、资源上限及兼容选项
+// DecodeOptions 指定解码并发上限、频带截断、方向策略、资源上限及兼容选项
 // Workers限制并发Goroutine上限，零值按CPU核数和分块规模自动选择；KeepOrientation为真时保留原始编码方向不旋转翻转
+// Band指定全分辨率及降采样解码的频带上限，零值BandAll保留全部频带，其余值跳过或置零更高频带以支持渐进预览
 // 默认按反量化前低通系数确定高通预测方向，LegacyHighpassPrediction启用按反量化后低通系数预测的旧版模式
 type DecodeOptions struct {
 	Workers                  int
 	Limits                   Limits
+	Band                     Band
 	LegacyHighpassPrediction bool
 	KeepOrientation          bool
 }
@@ -221,7 +223,7 @@ type WindowMargins struct {
 }
 
 // ImageDescription 保存ITU-T T.832 Annex A.5图像描述元数据标签
-// 文本字段采用UTF-8字符串，PageNumber为可选的页号与总页数对（非nil时写入0x0129标签）
+// 文本字段采用UTF-8字符串，DateTime非空时须符合YYYY:MM:DD HH:MM:SS格式（写入0x0132标签），PageNumber为可选的页号与总页数对（非nil时写入0x0129标签）
 type ImageDescription struct {
 	DocumentName        string
 	ImageDescription    string
@@ -238,7 +240,7 @@ type ImageDescription struct {
 
 // EncodeOptions 指定编码格式、布局、精度、并发、元数据与资源上限，零值采用无损JXR及全部频带
 // TileSize以编码网格像素计且须为十六倍数，仅Lossy允许精度损失与Subsampling下采样，SeparateAlpha写入独立透明度码流
-// Profiles指定档次与级别声明，EXIF、GPS、XMP、IPTC与Description为容器可选元数据；Uncompressed启用0xBC03无压缩容器模式
+// Profiles指定档次与级别声明，ICCProfile、ColorEncoding、EXIF、GPS、XMP、IPTC与Description非空时优先于源Info写入容器；Uncompressed启用0xBC03无压缩容器模式
 // Window指定编码窗口边距，ChromaCenteringX与ChromaCenteringY指定色度采样相位（0至4或7）；Workers零值自动，MaxOutputBytes零值采用64MiB
 type EncodeOptions struct {
 	Format                   Format
@@ -261,6 +263,8 @@ type EncodeOptions struct {
 	SeparateAlpha            bool
 	MirrorSeparateAlpha      bool
 	Profiles                 []ProfileLevel
+	ICCProfile               []byte
+	ColorEncoding            *ColorEncoding
 	EXIF                     []byte
 	GPS                      []byte
 	XMP                      []byte
@@ -315,7 +319,7 @@ type TileQuantization struct {
 	HighpassIndex []uint8
 }
 
-// Band 表示写入的频带，删减频带在精确模式下仅允许被省略系数全零
+// Band 表示编码写入的频带或解码截断上限，编码精确模式下删减频带仅允许被省略系数全零
 type Band uint8
 
 // Layout 表示空间分包或按频带分包

@@ -283,13 +283,16 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	}
 	limits := d.limits
 	limits.MaxMemoryBytes -= retained
-	extra := uint64(0)
+	extra := uint64(cap(container.exif)) + uint64(cap(container.gps))
 	if d.fileInput != nil {
 		limits.MaxMemoryBytes -= input - uint64(cap(d.data)) - jxrReaderAtWork
-		extra = uint64(cap(container.profile)) + uint64(cap(container.exif)) + uint64(cap(container.gps)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc)) + jxrDescriptionWork(container.description)
+		extra += uint64(cap(container.profile)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc))
+	} else if d.inputExtra != 0 {
+		limits.MaxMemoryBytes -= d.inputExtra
 	}
 	selected := &Decoder{data: d.data, source: source, info: info, limits: limits, fileInput: d.fileInput, inputExtra: extra, legacyHighpassPrediction: d.legacyHighpassPrediction, keepOrientation: d.keepOrientation}
 	selected.setWorkers(d.workers)
+	selected.setDecodeBand(d.decodeBand)
 	selected.bindInputContext(nil)
 	return selected, nil
 }

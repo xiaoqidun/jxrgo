@@ -29,7 +29,7 @@ type ColorTransform func(samples []float64, alpha float64) (red, green, blue flo
 
 // DisplayOptions 指定原生分量取样、显式颜色变换、ICC意图、HDR峰值亮度及输出限制，零值采用最近邻和内建基本显示策略
 // Transform非nil时由调用方负责色彩和预乘；ApplyICC启用内建ICC颜色解释并按Intent选择渲染意图，Transform优先
-// HDRPeakNits指定BT.2446方法A的HDR标称峰值亮度（零值对PQ默认10000、对HLG默认1000）；Limits计入输出及库内临时存储
+// HDRPeakNits指定BT.2446方法A的HDR标称峰值亮度（零值对PQ默认10000、对HLG默认1000，大于零且不高于100 nit时直接裁剪输出）；Limits计入输出及库内临时存储
 type DisplayOptions struct {
 	Filter      ResampleFilter
 	Transform   ColorTransform
@@ -54,6 +54,7 @@ type LinearOptions struct {
 
 // LinearReader 提供面向文档与HDR渲染引擎的按行线性scRGB浮点读取视图
 // 每像素按顺序写入红、绿、蓝与透明度四个未裁剪float64值，保留负色域与大于一的高动态范围亮度
+// 构造后完全不可变，当源Raster保持只读时支持多Goroutine安全并发调用ReadRow
 type LinearReader struct {
 	raster        *Raster
 	info          Info
@@ -66,7 +67,7 @@ type LinearReader struct {
 }
 
 // RGBOptions 指定设备域非线性RGB行读取的采样滤波、CICP矩阵解码、解预乘及资源限制
-// opts为nil时默认采用双线性滤波；ApplyCICPMatrix为真时对YCC优先按PTM CICP矩阵与范围解码而不执行逆传递线性化或基色转换
+// opts为nil时默认采用双线性滤波；ApplyCICPMatrix为真时对YCC按PTM CICP矩阵与范围解码（无声明或矩阵未指定时回退默认BT.601）而不执行逆传递线性化或基色转换
 // 忽略内嵌ICC与ColorHintUnspecified，保留负色域与大于一扩展范围供外部色彩管理管线使用
 type RGBOptions struct {
 	Filter          ResampleFilter
@@ -77,6 +78,7 @@ type RGBOptions struct {
 
 // RGBReader 提供面向外部色彩管理管线的按行设备域RGB浮点读取视图
 // 每像素按顺序写入红、绿、蓝与透明度四个未裁剪float64值，对YCC完成相位上采样与矩阵解码而不执行逆传递线性化
+// 构造后完全不可变，当源Raster保持只读时支持多Goroutine安全并发调用ReadRow
 type RGBReader struct {
 	raster        *Raster
 	info          Info
@@ -124,7 +126,7 @@ func (r *Raster) display(ctx context.Context, opts *DisplayOptions) (*image.NRGB
 	if intent > IntentAbsolute {
 		return nil, fmt.Errorf("%w: display rendering intent", ErrInvalid)
 	}
-	if peakNits != 0 && (!geometryFinite(peakNits) || peakNits < 100) {
+	if !geometryFinite(peakNits) || peakNits < 0 {
 		return nil, fmt.Errorf("%w: display HDR peak luminance", ErrInvalid)
 	}
 	info := r.info
@@ -207,7 +209,7 @@ func (r *Raster) newLinearReader(ctx context.Context, opts *LinearOptions) (*Lin
 	if intent > IntentAbsolute {
 		return nil, fmt.Errorf("%w: linear reader rendering intent", ErrInvalid)
 	}
-	if peakNits != 0 && (!geometryFinite(peakNits) || peakNits < 100) {
+	if !geometryFinite(peakNits) || peakNits < 0 {
 		return nil, fmt.Errorf("%w: linear reader HDR peak luminance", ErrInvalid)
 	}
 	info := r.info
@@ -293,7 +295,7 @@ func (r *Raster) newLinearReader(ctx context.Context, opts *LinearOptions) (*Lin
 }
 
 // ReadRow 读取指定显示行并按每像素红、绿、蓝、透明度四个float64写入dst，输出未裁剪的D65线性scRGB
-// dst长度须不少于图像宽度乘以四，并发读取须由调用方保证源Raster保持只读且不共享ICCFloat管线状态
+// dst长度须不少于图像宽度乘以四，当源Raster保持只读时支持多Goroutine安全并发调用
 // 入参: ctx Context，nil采用Background, y 目标行坐标, dst 输出浮点切片
 // 返回: error 参数、坐标、数值或取消错误
 func (lr *LinearReader) ReadRow(ctx context.Context, y int, dst []float64) error {
@@ -543,7 +545,7 @@ func (r *Raster) newRGBReader(ctx context.Context, opts *RGBOptions) (*RGBReader
 }
 
 // ReadRow 读取指定显示行并按每像素红、绿、蓝、透明度四个float64写入dst，保持设备非线性编码且不裁剪
-// dst长度须不少于图像宽度乘以四，并发读取须由调用方保证源Raster保持只读
+// dst长度须不少于图像宽度乘以四，当源Raster保持只读时支持多Goroutine安全并发调用
 // 入参: ctx Context，nil采用Background, y 目标行坐标, dst 输出浮点切片
 // 返回: error 参数、坐标、数值或取消错误
 func (rr *RGBReader) ReadRow(ctx context.Context, y int, dst []float64) error {

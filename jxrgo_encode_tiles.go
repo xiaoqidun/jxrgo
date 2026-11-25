@@ -85,21 +85,42 @@ func planJXRHardTile(info Info, source *jxrStream, tile int) (jxrHardTileInput, 
 		window.core = core.Sub(image.Pt(left, top))
 		window.edges = [4]bool{left == 0, top == 0, right == int(h.columns[columns]), bottom == int(h.rows[rows])}
 	}
+	if (source.primary.color == 1 || source.primary.color == 2) && h.overlap == 2 && right-left < 2 {
+		return jxrHardTileInput{}, fmt.Errorf("%w: local hard tile dimensions", ErrInvalid)
+	}
+	alignX, alignY := 1, 1
+	if h.color == 1 {
+		alignX, alignY = 2, 2
+	} else if h.color == 2 {
+		alignX, alignY = 2, 1
+	}
 	cx0 := max(0, left*16-int(h.left))
 	cy0 := max(0, top*16-int(h.top))
 	cx1 := min(int(h.width), right*16-int(h.left))
 	cy1 := min(int(h.height), bottom*16-int(h.top))
+	empty := cx0 >= cx1 || cy0 >= cy1
+	if cx0 >= cx1 {
+		if right*16 <= int(h.left) {
+			cx0, cx1 = 0, alignX
+		} else {
+			cx0, cx1 = int(h.width)-alignX, int(h.width)
+		}
+	}
+	if cy0 >= cy1 {
+		if bottom*16 <= int(h.top) {
+			cy0, cy1 = 0, alignY
+		} else {
+			cy0, cy1 = int(h.height)-alignY, int(h.height)
+		}
+	}
 	coded := image.Rect(cx0, cy0, cx1, cy1)
-	if coded.Empty() || (source.primary.color == 1 || source.primary.color == 2) && h.overlap == 2 && right-left < 2 {
+	if coded.Empty() {
 		return jxrHardTileInput{}, fmt.Errorf("%w: local hard tile dimensions", ErrInvalid)
 	}
-	localLeft := uint32(cx0 + int(h.left) - left*16)
-	localTop := uint32(cy0 + int(h.top) - top*16)
-	localRight := uint32((right-left)*16) - localLeft - uint32(coded.Dx())
-	localBottom := uint32((bottom-top)*16) - localTop - uint32(coded.Dy())
-	if localLeft > 63 || localTop > 63 || localRight > 63 || localBottom > 63 {
-		return jxrHardTileInput{}, fmt.Errorf("%w: local hard tile window margins", ErrInvalid)
-	}
+	localLeft := cx0 + int(h.left) - left*16
+	localTop := cy0 + int(h.top) - top*16
+	localRight := (right-left)*16 - localLeft - coded.Dx()
+	localBottom := (bottom-top)*16 - localTop - coded.Dy()
 	region := jxrRegionPosition(coded, int(h.width), int(h.height), h.transform)
 	work := uint64(1024) + uint64(len(info.Components))*384
 	if info.ColorEncoding != nil {
@@ -120,7 +141,11 @@ func planJXRHardTile(info Info, source *jxrStream, tile int) (jxrHardTileInput, 
 		}
 		work += count * width
 	}
-	return jxrHardTileInput{region: region, rawWork: work, width: uint64(coded.Dx()), height: uint64(coded.Dy()), left: localLeft, top: localTop, right: localRight, bottom: localBottom, columns: uint32(right - left), rows: uint32(bottom - top), window: window}, nil
+	if empty || localLeft < 0 || localLeft > 63 || localTop < 0 || localTop > 63 || localRight < 0 || localRight > 63 || localBottom < 0 || localBottom > 63 {
+		window.sample = jxrSampleWindow{enabled: true, width: coded.Dx(), height: coded.Dy(), offsetX: localLeft, offsetY: localTop}
+		return jxrHardTileInput{region: region, rawWork: work, width: uint64((right - left) * 16), height: uint64((bottom - top) * 16), columns: uint32(right - left), rows: uint32(bottom - top), window: window}, nil
+	}
+	return jxrHardTileInput{region: region, rawWork: work, width: uint64(coded.Dx()), height: uint64(coded.Dy()), left: uint32(localLeft), top: uint32(localTop), right: uint32(localRight), bottom: uint32(localBottom), columns: uint32(right - left), rows: uint32(bottom - top), window: window}, nil
 }
 
 // copyJXRHardTile 在预留容量中复制局部原始分量，可复用内部样本存储，不复制ICC或保留其他分块样本引用
@@ -309,6 +334,9 @@ func encodeJXRHardTileSourceTo(ctx context.Context, w io.WriteSeeker, info Info,
 		if plan.window.core.Empty() {
 			horizontal[1], vertical[1] = plan.columns, plan.rows
 			frame.header.columns, frame.header.rows = horizontal[:2:2], vertical[:2:2]
+			if plan.window.sample.enabled {
+				window = &plan.window
+			}
 		} else {
 			var x, y int
 			window = &plan.window
@@ -675,9 +703,6 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 		return Info{}, 0, &LimitError{Resource: "tiled source pixels", Limit: limits.MaxPixels, Required: jxrSaturatedMul(uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy()))}
 	}
 	retained := uint64(512) + uint64(count)*128
-	if info.ColorEncoding != nil {
-		retained += 4
-	}
 	if settings.Format == FormatJXR {
 		info = jxrWithContainerMetadata(info, &settings)
 		for _, blob := range [][]byte{info.ICCProfile, info.EXIF, info.GPS, info.XMP, info.IPTC} {
@@ -697,6 +722,9 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 			}
 			retained += amount
 		}
+	}
+	if info.ColorEncoding != nil {
+		retained += 4
 	}
 	if retained > limits.MaxMemoryBytes || jxrInputHeaderReserve > limits.MaxMemoryBytes-retained {
 		return Info{}, 0, &LimitError{Resource: "tiled source header memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, jxrInputHeaderReserve)}

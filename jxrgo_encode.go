@@ -36,14 +36,16 @@ var errJXREncodingPlanMemory = fmt.Errorf("%w: encoding plan retained source mem
 
 // jxrNativeOutput 保存原生编码的文件类型、可选格式标识、容器元数据及完整码流输出参数
 type jxrNativeOutput struct {
-	format      Format
-	pixelFormat [16]byte
-	exif        []byte
-	gps         []byte
-	xmp         []byte
-	iptc        []byte
-	description *ImageDescription
-	stream      jxrStreamOutput
+	format        Format
+	pixelFormat   [16]byte
+	iccProfile    []byte
+	colorEncoding *ColorEncoding
+	exif          []byte
+	gps           []byte
+	xmp           []byte
+	iptc          []byte
+	description   *ImageDescription
+	stream        jxrStreamOutput
 }
 
 // jxrForwardPacket 保存首遍得到的包偏移、长度及内容校验摘要
@@ -614,7 +616,7 @@ func copyStandardPaletted(ctx context.Context, pix []byte, stride, offset0, widt
 // 入参: retained 当前已计入的常驻内存, limit 总内存上限, base 原始图像信息, opts 编码选项
 // 返回: uint64 累加后的常驻内存, uint64 超限时的需求总量, bool 是否处于上限内
 func jxrContainerMetadataRetained(retained, limit uint64, base Info, opts *EncodeOptions) (uint64, uint64, bool) {
-	for _, pair := range [4][2][]byte{{opts.EXIF, base.EXIF}, {opts.GPS, base.GPS}, {opts.XMP, base.XMP}, {opts.IPTC, base.IPTC}} {
+	for _, pair := range [5][2][]byte{{opts.ICCProfile, base.ICCProfile}, {opts.EXIF, base.EXIF}, {opts.GPS, base.GPS}, {opts.XMP, base.XMP}, {opts.IPTC, base.IPTC}} {
 		if len(pair[0]) != 0 && uint64(cap(pair[0])) > uint64(cap(pair[1])) {
 			delta := uint64(cap(pair[0])) - uint64(cap(pair[1]))
 			if retained > limit || delta > limit-retained {
@@ -622,6 +624,12 @@ func jxrContainerMetadataRetained(retained, limit uint64, base Info, opts *Encod
 			}
 			retained += delta
 		}
+	}
+	if opts.ColorEncoding != nil && base.ColorEncoding == nil {
+		if retained > limit || 4 > limit-retained {
+			return retained, jxrSaturatedAdd(retained, 4), false
+		}
+		retained += 4
 	}
 	if !jxrDescriptionEmpty(opts.Description) {
 		nextWork, prevWork := jxrDescriptionWork(opts.Description), jxrDescriptionWork(base.Description)
@@ -636,12 +644,18 @@ func jxrContainerMetadataRetained(retained, limit uint64, base Info, opts *Encod
 	return retained, retained, true
 }
 
-// jxrWithContainerMetadata 合并编码选项覆盖的EXIF、GPS、XMP、IPTC及描述标签，不修改原Info
+// jxrWithContainerMetadata 合并编码选项覆盖的色彩、EXIF、GPS、XMP、IPTC及描述标签，不修改原Info
 // 入参: info 原生图像元数据, opts 可选编码选项
 // 返回: Info 合并后的图像元数据
 func jxrWithContainerMetadata(info Info, opts *EncodeOptions) Info {
 	if opts == nil {
 		return info
+	}
+	if len(opts.ICCProfile) != 0 {
+		info.ICCProfile = opts.ICCProfile
+	}
+	if opts.ColorEncoding != nil {
+		info.ColorEncoding = opts.ColorEncoding
 	}
 	if len(opts.EXIF) != 0 {
 		info.EXIF = opts.EXIF
@@ -948,6 +962,7 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 	output := jxrNativeOutput{format: o.Format, stream: jxrStreamOutput{exact: !o.Lossy, workers: normalizeJXRWorkers(o.Workers), maxPixels: limits.MaxPixels, maxBytes: o.MaxOutputBytes, maxMemory: limits.MaxMemoryBytes}}
 	if o.Format == FormatJXR {
 		merged := jxrWithContainerMetadata(raster.info, &o)
+		output.iccProfile, output.colorEncoding = merged.ICCProfile, merged.ColorEncoding
 		output.exif, output.gps, output.xmp, output.iptc, output.description = merged.EXIF, merged.GPS, merged.XMP, merged.IPTC, merged.Description
 		nextRetained, _, ok := jxrContainerMetadataRetained(retained, limits.MaxMemoryBytes, raster.info, &o)
 		if !ok {
@@ -1756,6 +1771,12 @@ func encodeJXRNative(ctx context.Context, raster *Raster, layout jxrStream, opti
 		return data, nil
 	}
 	meta := raster.info
+	if len(options.iccProfile) != 0 {
+		meta.ICCProfile = options.iccProfile
+	}
+	if options.colorEncoding != nil {
+		meta.ColorEncoding = options.colorEncoding
+	}
 	meta.EXIF, meta.GPS, meta.XMP, meta.IPTC, meta.Description = options.exif, options.gps, options.xmp, options.iptc, options.description
 	c := jxrContainer{width: s.header.width, height: s.header.height, transform: uint32(s.header.transform), format: pixelFormat, pixelFormat: identifier, image: data, imageBands: uint32(s.primary.bands), profiles: s.profiles}
 	c.setInfoMetadata(meta)
@@ -1779,8 +1800,8 @@ func forwardJXRNative(ctx context.Context, raster *Raster, s *jxrStream, options
 	return forwardJXRNativeWindowStorage(ctx, raster, s, options, available, &planes, nil)
 }
 
-// forwardJXRNativeWindowStorage 共用样本容量及参数预检，可选择完整变换或仅软重叠核心
-// 入参: ctx Context, raster 原生输入, s 已校验布局, options 编码精度, available 活跃容量, planes 独占缓冲, window 为空时完整变换
+// forwardJXRNativeWindowStorage 共用样本容量及参数预检，支持显式样本窗装载并按窗口核心执行完整变换或局部软重叠变换
+// 入参: ctx Context, raster 原生输入, s 已校验布局, options 编码精度, available 活跃容量, planes 独占缓冲, window 非nil时启用window.sample显式样本窗，为nil或window.core.Empty()时执行完整变换
 // 返回: jxrCoefficientImage 当前系数视图, error 参数、容量、数值或取消错误
 func forwardJXRNativeWindowStorage(ctx context.Context, raster *Raster, s *jxrStream, options *jxrStreamOutput, available uint64, planes *[2]*jxrCoefficients, window *jxrForwardWindow) (jxrCoefficientImage, error) {
 	if s == nil || options == nil || planes == nil || s.alpha == nil && planes[1] != nil {
@@ -1877,11 +1898,15 @@ func forwardJXRNativeWindowStorage(ctx context.Context, raster *Raster, s *jxrSt
 			return jxrCoefficientImage{}, &LimitError{Resource: "retained JPEG XR transform capacity", Limit: available, Required: jxrSaturatedAdd(allocated, amount)}
 		}
 		allocated += amount
-		if err := c.loadSamples(ctx, raster, &s.header, n != 0, options.exact); err != nil {
+		var sample jxrSampleWindow
+		if window != nil {
+			sample = window.sample
+		}
+		if err := c.loadSamplesWindow(ctx, raster, &s.header, n != 0, options.exact, sample); err != nil {
 			return jxrCoefficientImage{}, err
 		}
 		var err error
-		if window == nil {
+		if window == nil || window.core.Empty() {
 			err = c.forward(ctx, &s.header)
 		} else {
 			err = c.forwardWindow(ctx, &s.header, *window)
@@ -2233,7 +2258,7 @@ func jxrSyncRasterChroma(raster *Raster, s *jxrStream) *Raster {
 	return &view
 }
 
-// encodeUncompressedJXR 按ITU-T T.832 Annex A.7.15将原生图像打包写入0xBC03=1无压缩JXR容器
+// encodeUncompressedJXR 按HD Photo / JPEG XR无压缩容器扩展标签0xBC03=1将原生图像打包写入无压缩JXR容器
 // 入参: ctx 已规范化Context, raster 原生图像, options 已请求无压缩模式的编码选项
 // 返回: []byte 完整无压缩JXR容器字节, error 选项、格式、样本、资源或取消错误
 func encodeUncompressedJXR(ctx context.Context, raster *Raster, options EncodeOptions) ([]byte, error) {
@@ -2272,6 +2297,9 @@ func encodeUncompressedJXR(ctx context.Context, raster *Raster, options EncodeOp
 	layout, err := jxrMakeUncompressedLayout(identifier[15], format, codedW, codedH, options.SeparateAlpha)
 	if err != nil {
 		return nil, err
+	}
+	if format.name == "BlackWhite" && format.depth == 15 {
+		format.depth = 0
 	}
 	rawTotal := layout.mainBytes + layout.alphaBytes
 	if rawTotal > maxBytes {

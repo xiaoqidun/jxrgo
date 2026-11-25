@@ -131,7 +131,7 @@ func encodeJXRSeparateAlpha(ctx context.Context, raster *Raster, options EncodeO
 		}
 		retained += amount
 	}
-	alphaOptions.Orientation = Orientation(main.header.transform)
+	alphaOptions.Orientation, alphaOptions.Window = Orientation(main.header.transform), jxrHeaderWindow(&main.header)
 	alphaOptions.Limits = limits
 	alphaOptions.Limits.MaxMemoryBytes -= retained
 	secondary, alphaOutput, err := makeJXREncodingPlan(ctx, alpha, &alphaOptions)
@@ -157,6 +157,11 @@ func encodeJXRSeparateAlpha(ctx context.Context, raster *Raster, options EncodeO
 		}
 		retained += amount
 	}
+	nextRetained, required, ok := jxrContainerMetadataRetained(retained, limits.MaxMemoryBytes, raster.info, &options)
+	if !ok || nextRetained >= limits.MaxMemoryBytes {
+		return nil, &LimitError{Resource: "separate alpha container metadata memory", Limit: limits.MaxMemoryBytes, Required: max(required, jxrSaturatedAdd(nextRetained, 1))}
+	}
+	retained = nextRetained
 	c := jxrContainer{width: main.header.width, height: main.header.height, format: format, pixelFormat: identifier, transform: uint32(main.header.transform), image: codedPrimary, alpha: codedAlpha, profiles: main.profiles, imageBands: uint32(main.primary.bands), alphaBands: uint32(secondary.alpha.bands)}
 	c.setInfoMetadata(jxrWithContainerMetadata(raster.info, &options))
 	w := newJXRBitWriter(ctx, mainOutput.stream.maxBytes, limits.MaxMemoryBytes-retained)
@@ -216,6 +221,13 @@ func jxrAlphaRasterInfo(bounds image.Rectangle, component ComponentInfo) Info {
 		info.Components = []ComponentInfo{component, component, component, component}
 	}
 	return info
+}
+
+// jxrHeaderWindow 从已规划图像头提取当前有效窗口边距，用于同步独立透明度与主图的宏块网格
+// 入参: h 已规划的图像头
+// 返回: *WindowMargins 有效窗口边距副本
+func jxrHeaderWindow(h *jxrHeader) *WindowMargins {
+	return &WindowMargins{Top: uint8(h.top), Left: uint8(h.left), Bottom: uint8(h.bottom), Right: uint8(h.right)}
 }
 
 // jxrSeparateAlphaOptions 在预算内快照独立透明度，默认逐组继承主平面首分量及完整宏块索引
@@ -474,7 +486,11 @@ func makeJXRSeparateInput(ctx context.Context, raster *Raster, options EncodeOpt
 	if inputWork >= limits.MaxMemoryBytes || 32768 >= limits.MaxMemoryBytes-inputWork {
 		return result, &LimitError{Resource: "separate alpha input memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(inputWork, 32769)}
 	}
-	result.working = inputWork + 32768
+	working, required, ok := jxrContainerMetadataRetained(inputWork+32768, limits.MaxMemoryBytes, raster.info, &options)
+	if !ok || working >= limits.MaxMemoryBytes {
+		return result, &LimitError{Resource: "separate alpha metadata memory", Limit: limits.MaxMemoryBytes, Required: max(required, jxrSaturatedAdd(working, 1))}
+	}
+	result.working = working
 	result.primary = *raster
 	result.primary.info.Alpha, result.primary.info.Premultiplied, result.primary.info.PixelFormat = false, false, ""
 	result.primary.info.Components = result.primary.info.Components[:raster.info.Channels:raster.info.Channels]
@@ -504,7 +520,7 @@ func makeJXRSeparateInput(ctx context.Context, raster *Raster, options EncodeOpt
 		selected := mainOptions
 		if index == 1 {
 			selected = alphaOptions
-			selected.Orientation = Orientation(result.layout[0].header.transform)
+			selected.Orientation, selected.Window = Orientation(result.layout[0].header.transform), jxrHeaderWindow(&result.layout[0].header)
 		}
 		sourceWork, err := jxrRasterWork(source, limits.MaxMemoryBytes)
 		if err != nil {
@@ -683,7 +699,7 @@ func makeJXRSeparateTileInput(ctx context.Context, info Info, options EncodeOpti
 		selected := mainOptions
 		if index == 1 {
 			selected = alphaOptions
-			selected.Orientation = Orientation(result.file.layout[0].header.transform)
+			selected.Orientation, selected.Window = Orientation(result.file.layout[0].header.transform), jxrHeaderWindow(&result.file.layout[0].header)
 		}
 		selected.Limits = limits
 		selected.Limits.MaxMemoryBytes -= working

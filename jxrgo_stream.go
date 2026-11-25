@@ -60,14 +60,15 @@ type jxrProfileLevel struct {
 
 // jxrStream 保存完整头部和平面的解析结果，包偏移仍相对于当前独立码流
 type jxrStream struct {
-	header    jxrHeader
-	primary   jxrPlane
-	alpha     *jxrPlane
-	profiles  []jxrProfileLevel
-	packets   []uint64
-	dataStart uint64
-	input     *jxrReaderAt
-	workers   int
+	header     jxrHeader
+	primary    jxrPlane
+	alpha      *jxrPlane
+	profiles   []jxrProfileLevel
+	packets    []uint64
+	dataStart  uint64
+	input      *jxrReaderAt
+	workers    int
+	decodeBand Band
 }
 
 // jxrParser 在解析分配发生前共用容量与取消状态，不把输入缓冲区容量误作可用空间
