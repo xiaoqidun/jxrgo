@@ -676,26 +676,33 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 		}
 	}
 	if s.header.index && (options.forward == nil || !options.forward.ready) {
-		if err := seekJXRImageOutput(ctx, w, uint64(position)+indexAt); err != nil {
-			return err
-		}
-		var patch [9 * 256]byte
-		for at := 0; at < len(s.packets); {
-			count := min(len(s.packets)-at, 256)
-			for index := range count {
-				patch[index*9] = 0xfc
-				binary.BigEndian.PutUint64(patch[index*9+1:], s.packets[at+index])
-			}
-			if err := writeEncoderOutput(ctx, w, patch[:count*9]); err != nil {
-				return err
-			}
-			at += count
-		}
-		if err := seekJXRImageOutput(ctx, w, uint64(position)+total); err != nil {
+		if err := patchJXRStreamIndexTable(ctx, w, position, indexAt, total, s.packets); err != nil {
 			return err
 		}
 	}
 	return ctx.Err()
+}
+
+// patchJXRStreamIndexTable 在可定位输出中回填固定九字节宽度的码流包偏移索引表并恢复至码流末尾
+// 入参: ctx 已规范化Context, w 可定位输出, streamPos 码流起始位置, indexAt 索引表相对偏移, total 码流总字节数, packets 各包相对偏移切片
+// 返回: error 定位、写入或取消错误
+func patchJXRStreamIndexTable(ctx context.Context, w io.WriteSeeker, streamPos int64, indexAt, total uint64, packets []uint64) error {
+	if err := seekJXRImageOutput(ctx, w, uint64(streamPos)+indexAt); err != nil {
+		return err
+	}
+	var patch [9 * 256]byte
+	for at := 0; at < len(packets); {
+		count := min(len(packets)-at, 256)
+		for index := range count {
+			patch[index*9] = 0xfc
+			binary.BigEndian.PutUint64(patch[index*9+1:], packets[at+index])
+		}
+		if err := writeEncoderOutput(ctx, w, patch[:count*9]); err != nil {
+			return err
+		}
+		at += count
+	}
+	return seekJXRImageOutput(ctx, w, uint64(streamPos)+total)
 }
 
 // encodeJXRFileTilesSequential 从可重放有界块源顺序写出单图JXR容器文件到普通Writer，不要求Seek或完整原图及压缩结果

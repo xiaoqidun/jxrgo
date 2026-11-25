@@ -38,6 +38,7 @@ var errJXREncodingPlanMemory = fmt.Errorf("%w: encoding plan retained source mem
 type jxrNativeOutput struct {
 	format        Format
 	pixelFormat   [16]byte
+	resolution    *Resolution
 	iccProfile    []byte
 	colorHint     *ColorHint
 	colorEncoding *ColorEncoding
@@ -106,23 +107,25 @@ func encodeContextCore(ctx context.Context, w io.Writer, m image.Image, opts *En
 		return fmt.Errorf("%w: nil output or image", ErrInvalid)
 	}
 	limits := DefaultLimits()
+	preserveYCbCr := false
 	if opts != nil {
 		if err := checkJXREncodeOptions(*opts); err != nil {
 			return err
 		}
 		limits = opts.Limits.normalized()
+		preserveYCbCr = opts.PreserveYCbCr
 	}
-	raster, err := standardImageRaster(ctx, m, limits)
+	raster, err := standardImageRasterWithOptions(ctx, m, limits, preserveYCbCr)
 	if err != nil {
 		return err
 	}
 	return encodeRasterCore(ctx, w, raster, opts)
 }
 
-// standardImageRaster 将标准图像读取为独立原生样本，特化YCbCr、调色板及Alpha格式避免无意义转为64bppPRGBA
-// 入参: ctx Context, m 标准图像, limits 内部原生图像资源限制
-// 返回: *Raster 原点为零的原生图像, error 颜色、资源或取消错误
-func standardImageRaster(ctx context.Context, m image.Image, limits Limits) (*Raster, error) {
+// standardImageRasterWithOptions 将标准图像读取为独立原生样本，preserveYCbCr为真时保留对齐YCbCr原生子采样分量
+// 入参: ctx Context, m 标准图像, limits 内部原生图像资源限制, preserveYCbCr 是否保留原生YCbCr子采样分量
+// 返回: *Raster 原点为零的原生图像, error 颜色、资源、能力或取消错误
+func standardImageRasterWithOptions(ctx context.Context, m image.Image, limits Limits, preserveYCbCr bool) (*Raster, error) {
 	bounds := m.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
 	if width <= 0 || height <= 0 {
@@ -130,6 +133,11 @@ func standardImageRaster(ctx context.Context, m image.Image, limits Limits) (*Ra
 	}
 	if err := checkJXRDimensions(uint64(width), uint64(height), limits.MaxPixels); err != nil {
 		return nil, err
+	}
+	if preserveYCbCr {
+		if src, ok := m.(*image.YCbCr); ok {
+			return standardYCbCrNativeRaster(ctx, src, bounds, limits)
+		}
 	}
 	precision, count, space, alpha, premultiply := uint8(16), 4, ColorRGB, true, true
 	var paletteTable [][4]uint16
@@ -574,6 +582,85 @@ func copyStandardYCbCr(ctx context.Context, src *image.YCbCr, bounds image.Recta
 	return ctx.Err()
 }
 
+// standardYCbCrNativeRaster 将边界对齐的4:4:4、4:2:2或4:2:0标准YCbCr图像直接保留为原生YCC分量存储
+// 入参: ctx Context, src 源YCbCr图像, bounds 有效矩形, limits 内部原生图像资源限制
+// 返回: *Raster 原点为零的原生YCC图像, error 格式、缓冲、资源或取消错误
+func standardYCbCrNativeRaster(ctx context.Context, src *image.YCbCr, bounds image.Rectangle, limits Limits) (*Raster, error) {
+	width, height := bounds.Dx(), bounds.Dy()
+	var sx, sy uint8
+	switch src.SubsampleRatio {
+	case image.YCbCrSubsampleRatio444:
+		sx, sy = 1, 1
+	case image.YCbCrSubsampleRatio422:
+		sx, sy = 2, 1
+	case image.YCbCrSubsampleRatio420:
+		sx, sy = 2, 2
+	default:
+		return nil, fmt.Errorf("%w: native YCbCr subsample ratio", ErrUnsupported)
+	}
+	if width%int(sx) != 0 || height%int(sy) != 0 || bounds.Min.X%int(sx) != 0 || bounds.Min.Y%int(sy) != 0 {
+		return nil, fmt.Errorf("%w: native YCbCr subsample alignment", ErrUnsupported)
+	}
+	encoding := ColorEncoding{Primaries: 1, Transfer: 13, Matrix: 5, FullRange: true}
+	info := Info{
+		Bounds:        image.Rect(0, 0, width, height),
+		Channels:      3,
+		ColorSpace:    ColorYCC,
+		ColorEncoding: &encoding,
+		Components: []ComponentInfo{
+			{Format: SampleUnsigned, Precision: 8, XStep: 1, YStep: 1},
+			{Format: SampleUnsigned, Precision: 8, XStep: sx, YStep: sy},
+			{Format: SampleUnsigned, Precision: 8, XStep: sx, YStep: sy},
+		},
+	}
+	raster, err := newRasterContext(ctx, info, limits)
+	if err != nil {
+		return nil, err
+	}
+	p0 := raster.planes[0].values
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		syPos := bounds.Min.Y + y
+		rowBase := y * width
+		for x := range width {
+			if x&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			yi := src.YOffset(bounds.Min.X+x, syPos)
+			if yi < 0 || yi >= len(src.Y) {
+				return nil, fmt.Errorf("%w: standard YCbCr luma buffer", ErrInvalid)
+			}
+			p0[rowBase+x] = uint16(src.Y[yi])
+		}
+	}
+	cw, ch := width/int(sx), height/int(sy)
+	p1, p2 := raster.planes[1].values, raster.planes[2].values
+	for cy := range ch {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		syPos := bounds.Min.Y + cy*int(sy)
+		rowBase := cy * cw
+		for cx := range cw {
+			if cx&1023 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			ci := src.COffset(bounds.Min.X+cx*int(sx), syPos)
+			if ci < 0 || ci >= len(src.Cb) || ci >= len(src.Cr) {
+				return nil, fmt.Errorf("%w: standard YCbCr chroma buffer", ErrInvalid)
+			}
+			p1[rowBase+cx], p2[rowBase+cx] = uint16(src.Cb[ci]), uint16(src.Cr[ci])
+		}
+	}
+	return raster, ctx.Err()
+}
+
 // copyStandardPaletted 通过预计算调色板查找表高速写入三通道或四通道原生存储
 // 入参: ctx Context, pix 索引字节, stride 行步长, offset0 首像素偏移, width, height 尺寸, table 颜色查表, count 通道数, raster 目标原生图像
 // 返回: error 缓冲、调色板越界或取消错误
@@ -645,12 +732,15 @@ func jxrContainerMetadataRetained(retained, limit uint64, base Info, opts *Encod
 	return retained, retained, true
 }
 
-// jxrWithContainerMetadata 合并编码选项覆盖的色彩、EXIF、GPS、XMP、IPTC及描述标签，不修改原Info
+// jxrWithContainerMetadata 合并编码选项覆盖的分辨率、色彩、EXIF、GPS、XMP、IPTC及描述标签，不修改原Info
 // 入参: info 原生图像元数据, opts 可选编码选项
 // 返回: Info 合并后的图像元数据
 func jxrWithContainerMetadata(info Info, opts *EncodeOptions) Info {
 	if opts == nil {
 		return info
+	}
+	if opts.Resolution != nil {
+		info.Resolution = *opts.Resolution
 	}
 	if len(opts.ICCProfile) != 0 {
 		info.ICCProfile = opts.ICCProfile
@@ -677,6 +767,42 @@ func jxrWithContainerMetadata(info Info, opts *EncodeOptions) Info {
 		info.Description = opts.Description
 	}
 	return info
+}
+
+// jxrQualityQP 将有损质量预设（1至99）映射为标准ITU-T T.832量化索引
+// 入参: quality 有损质量值（1至99）
+// 返回: uint8 标准T.832量化索引
+func jxrQualityQP(quality int) uint8 {
+	if quality >= 80 {
+		return uint8(2 + (99-quality)*13/19)
+	}
+	return uint8(15 + (80-quality)*95/79)
+}
+
+// jxrQualityQuantization 按质量预设构造标准T.832三频带量化参数，低频保留更高精度减少块效应
+// 入参: quality 有损质量值（1至99）
+// 返回: *Quantization 独占量化配置
+func jxrQualityQuantization(quality int) *Quantization {
+	qp := jxrQualityQP(quality)
+	dc := qp
+	if qp > 2 {
+		dc = max(1, qp/2)
+	}
+	return &Quantization{DC: []uint8{dc}, Lowpass: []uint8{qp}, Highpass: []uint8{qp}}
+}
+
+// jxrResolveEncodeOptions 展开EncodeOptions中的Quality质量预设至标准量化表与有损标志，不修改调用方原配置
+// 入参: o 已校验的编码选项值副本
+// 返回: EncodeOptions 展开质量预设后的选项副本
+func jxrResolveEncodeOptions(o EncodeOptions) EncodeOptions {
+	if o.Quality > 0 && o.Quality < 100 {
+		if o.Quantization == nil {
+			o.Quantization = jxrQualityQuantization(o.Quality)
+		}
+		o.Lossy = true
+	}
+	o.Quality = 0
+	return o
 }
 
 // jxrInputTransform 按原生四二二采样方向确定编码网格的转置位，其他颜色保留明确请求的方向
@@ -957,7 +1083,7 @@ func makeJXREncodingPlan(ctx context.Context, raster *Raster, opts *EncodeOption
 func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *EncodeOptions, retained uint64) (jxrStream, jxrNativeOutput, error) {
 	var o EncodeOptions
 	if opts != nil {
-		o = *opts
+		o = jxrResolveEncodeOptions(*opts)
 	}
 	limits := o.Limits.normalized()
 	if o.Format == FormatUnknown {
@@ -966,6 +1092,10 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 	output := jxrNativeOutput{format: o.Format, stream: jxrStreamOutput{exact: !o.Lossy, workers: normalizeJXRWorkers(o.Workers), maxPixels: limits.MaxPixels, maxBytes: o.MaxOutputBytes, maxMemory: limits.MaxMemoryBytes}}
 	if o.Format == FormatJXR {
 		merged := jxrWithContainerMetadata(raster.info, &o)
+		if o.Resolution != nil {
+			res := *o.Resolution
+			output.resolution = &res
+		}
 		output.iccProfile, output.colorEncoding = merged.ICCProfile, merged.ColorEncoding
 		if o.ColorHint != nil {
 			hint := *o.ColorHint
@@ -1095,20 +1225,31 @@ func checkJXREncodeOptions(o EncodeOptions) error {
 	if o.Workers < 0 {
 		return fmt.Errorf("%w: negative encode workers", ErrInvalid)
 	}
+	if o.Quality < 0 || o.Quality > 100 {
+		return fmt.Errorf("%w: encode quality", ErrInvalid)
+	}
+	if o.Resolution != nil {
+		for _, resolution := range [2]float64{o.Resolution.X, o.Resolution.Y} {
+			if !geometryFinite(resolution) || resolution < 0 || resolution > 0 && (float32(resolution) == 0 || math.IsInf(float64(float32(resolution)), 0)) {
+				return fmt.Errorf("%w: encode resolution", ErrInvalid)
+			}
+		}
+	}
 	if o.MirrorSeparateAlpha && !o.SeparateAlpha {
 		return fmt.Errorf("%w: mirrored alpha requires separate alpha", ErrInvalid)
 	}
 	if o.SeparateAlpha && o.Format == FormatCodestream {
 		return fmt.Errorf("%w: separate alpha requires a file container", ErrInvalid)
 	}
-	if o.Format > FormatCodestream || o.Band > BandDC || o.Layout > LayoutFrequency || o.Overlap > OverlapTwo || o.Orientation > OrientationRotate90FlipXY || o.Subsampling > Subsampling420 || o.Subsampling != SubsamplingNone && !o.Lossy || o.Trim > 15 || o.Alpha != nil && o.Alpha.Band > BandDC {
+	effectiveLossy := o.Lossy || o.Quality > 0 && o.Quality < 100
+	if o.Format > FormatCodestream || o.Band > BandDC || o.Layout > LayoutFrequency || o.Overlap > OverlapTwo || o.Orientation > OrientationRotate90FlipXY || o.Subsampling > Subsampling420 || o.Subsampling != SubsamplingNone && !effectiveLossy || o.Trim > 15 || o.Alpha != nil && o.Alpha.Band > BandDC {
 		return fmt.Errorf("%w: encode options", ErrInvalid)
 	}
 	if o.ColorHint != nil && *o.ColorHint != ColorHintNone && *o.ColorHint != ColorHintSRGB && *o.ColorHint != ColorHintUnspecified {
 		return fmt.Errorf("%w: encode color hint", ErrInvalid)
 	}
 	if o.Uncompressed {
-		if o.Format == FormatCodestream || o.Layout != LayoutSpatial || o.Overlap != OverlapNone || o.Subsampling != SubsamplingNone || o.TileSize != (image.Point{}) || o.HardTiles || o.Lossy || o.LegacyHighpassPrediction || o.Band != BandAll || o.Trim != 0 || o.Scaled || o.Shift != 0 || o.Float != nil || o.Quantization != nil || o.Alpha != nil || o.MirrorSeparateAlpha || len(o.Profiles) != 0 || o.Window != nil || o.ChromaCenteringX != nil || o.ChromaCenteringY != nil {
+		if o.Format == FormatCodestream || o.Layout != LayoutSpatial || o.Overlap != OverlapNone || o.Subsampling != SubsamplingNone || o.TileSize != (image.Point{}) || o.HardTiles || o.Lossy || o.Quality != 0 || o.LegacyHighpassPrediction || o.Band != BandAll || o.Trim != 0 || o.Scaled || o.Shift != 0 || o.Float != nil || o.Quantization != nil || o.Alpha != nil || o.MirrorSeparateAlpha || len(o.Profiles) != 0 || o.Window != nil || o.ChromaCenteringX != nil || o.ChromaCenteringY != nil {
 			return fmt.Errorf("%w: uncompressed mode conflicts with compression options", ErrInvalid)
 		}
 	}
@@ -1782,6 +1923,9 @@ func encodeJXRNative(ctx context.Context, raster *Raster, layout jxrStream, opti
 		return data, nil
 	}
 	meta := raster.info
+	if options.resolution != nil {
+		meta.Resolution = *options.resolution
+	}
 	if len(options.iccProfile) != 0 {
 		meta.ICCProfile = options.iccProfile
 	}

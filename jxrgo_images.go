@@ -27,12 +27,13 @@ import (
 const jxrTileImagePlanWork uint64 = 4096
 
 // ImageInput 指定多图文件中的一幅原生图像及其编码选项，Options为nil采用无损JXR
-// Raster与Tiles二选一，且同次EncodeImages调用中所有条目须同为整图或同为逐块提供器
+// Raster、Tiles与Rows三选一；Tiles不可与Raster或Rows混用，Rows可与Raster组合流式编码多页或主图与预览图
 // Info或Raster.Info中的ImageType控制预览及页序列语义
 type ImageInput struct {
 	Raster  *Raster
 	Info    Info
 	Tiles   RasterTileReader
+	Rows    RasterRowReader
 	Options *EncodeOptions
 }
 
@@ -54,6 +55,8 @@ type jxrFileImagePlan struct {
 type jxrTileImagePlan struct {
 	info       Info
 	read       RasterTileReader
+	rows       RasterRowReader
+	raster     *Raster
 	options    EncodeOptions
 	retained   uint64
 	identifier [16]byte
@@ -119,9 +122,37 @@ func (d *Decoder) ImageDecoder(ctx context.Context, index int) (*Decoder, error)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	selected, err := d.imageDecoderIndependent(ctx, index)
+	selected, err := d.imageDecoderIndependent(ctx, index, nil)
 	if err != nil {
 		return nil, wrapJXRError("Decoder.ImageDecoder", err)
+	}
+	return selected, nil
+}
+
+// ImageDecoderWithOptions 按ImageCount的索引顺序创建指定图像的独立子解码器并允许显式覆写解码选项与独立预算
+// opts为nil时等价于ImageDecoder继承父解码器选项与剩余预算；opts非nil时为子解码器启用独立Limits、Workers、Band、KeepOrientation与LegacyHighpassPrediction，不受父第0页预算永久缩水影响
+// 入参: ctx Context，nil采用Background, index 从零开始的目录序号, opts 可选独立解码选项
+// 返回: *Decoder 独立子图像解码器, error 序号、选项、数据、资源、取消或关闭错误
+func (d *Decoder) ImageDecoderWithOptions(ctx context.Context, index int, opts *DecodeOptions) (*Decoder, error) {
+	if d == nil {
+		return nil, ErrClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if opts != nil {
+		if opts.Workers < 0 {
+			return nil, wrapJXRError("Decoder.ImageDecoderWithOptions", fmt.Errorf("%w: negative decode workers", ErrInvalid))
+		}
+		if opts.Band > BandDC {
+			return nil, wrapJXRError("Decoder.ImageDecoderWithOptions", fmt.Errorf("%w: decode band", ErrInvalid))
+		}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	selected, err := d.imageDecoderIndependent(ctx, index, opts)
+	if err != nil {
+		return nil, wrapJXRError("Decoder.ImageDecoderWithOptions", err)
 	}
 	return selected, nil
 }
@@ -274,13 +305,13 @@ func (d *Decoder) imageDecoder(ctx context.Context, index int) (*Decoder, error)
 	if index == 0 {
 		return d, nil
 	}
-	return d.parseDirectoryDecoder(ctx, &directory, false)
+	return d.parseDirectoryDecoderWithOptions(ctx, &directory, false, nil)
 }
 
 // imageDecoderIndependent 在持有父解码器锁时建立与父解码器完全无可变状态共享的独立单图子解码器
-// 入参: ctx 已规范化Context, index 从零开始的目录序号
+// 入参: ctx 已规范化Context, index 从零开始的目录序号, opts 可选独立解码选项覆写
 // 返回: *Decoder 独立子图像解码器, error 目录、数据、资源、取消或关闭错误
-func (d *Decoder) imageDecoderIndependent(ctx context.Context, index int) (*Decoder, error) {
+func (d *Decoder) imageDecoderIndependent(ctx context.Context, index int, opts *DecodeOptions) (*Decoder, error) {
 	if d.closed {
 		return nil, ErrClosed
 	}
@@ -295,11 +326,6 @@ func (d *Decoder) imageDecoderIndependent(ctx context.Context, index int) (*Deco
 		return nil, err
 	}
 	if d.source.format == FormatCodestream || d.singleImage {
-		retained, input := d.retainedHeaderWork(), d.inputWork()
-		parentExtra := retained + (input - uint64(cap(d.data)))
-		if parentExtra >= d.limits.MaxMemoryBytes {
-			return nil, &LimitError{Resource: "JPEG XR retained first image memory", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(parentExtra, 1)}
-		}
 		source := d.source
 		primaryInput := source.primary.input
 		if primaryInput == nil {
@@ -315,8 +341,16 @@ func (d *Decoder) imageDecoderIndependent(ctx context.Context, index int) (*Deco
 				source.container.imageInput = clonedPrimary
 			}
 		}
+		if source.primary.alpha != nil {
+			primaryAlpha := *source.primary.alpha
+			source.primary.alpha = &primaryAlpha
+		}
 		if source.alpha != nil {
 			alphaCopy := *source.alpha
+			if alphaCopy.alpha != nil {
+				alphaPlane := *alphaCopy.alpha
+				alphaCopy.alpha = &alphaPlane
+			}
 			source.alpha = &alphaCopy
 		}
 		var alphaInput *jxrReaderAt
@@ -339,28 +373,92 @@ func (d *Decoder) imageDecoderIndependent(ctx context.Context, index int) (*Deco
 			}
 		}
 		limits := d.limits
-		limits.MaxMemoryBytes -= parentExtra
-		selected := &Decoder{data: d.data, source: source, info: cloneInfo(d.info), limits: limits, singleImage: true, inputExtra: d.inputExtra, legacyHighpassPrediction: d.legacyHighpassPrediction, keepOrientation: d.keepOrientation}
-		selected.setWorkers(d.workers)
-		selected.setDecodeBand(d.decodeBand)
+		workers := d.workers
+		band := d.decodeBand
+		legacyHighpass := d.legacyHighpassPrediction
+		keepOrientation := d.keepOrientation
+		info := cloneInfo(d.info)
+		if opts == nil {
+			retained, input := d.retainedHeaderWork(), d.inputWork()
+			shared := uint64(cap(d.data)) + d.inputExtra
+			parentExtra := retained
+			if input > shared {
+				parentExtra += input - shared
+			}
+			if parentExtra >= limits.MaxMemoryBytes {
+				return nil, &LimitError{Resource: "JPEG XR retained first image memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(parentExtra, 1)}
+			}
+			limits.MaxMemoryBytes -= parentExtra
+		} else {
+			limits = opts.Limits.normalized()
+			workers = opts.Workers
+			band = opts.Band
+			legacyHighpass = opts.LegacyHighpassPrediction
+			keepOrientation = opts.KeepOrientation
+			if keepOrientation {
+				source.container.transform = 0
+			} else {
+				source.container.transform = uint32(source.container.orientation)
+			}
+			source.primary.primary.legacyHighpassPrediction = legacyHighpass
+			if source.primary.alpha != nil {
+				source.primary.alpha.legacyHighpassPrediction = legacyHighpass
+			}
+			if source.alpha != nil {
+				source.alpha.primary.legacyHighpassPrediction = legacyHighpass
+				if source.alpha.alpha != nil {
+					source.alpha.alpha.legacyHighpassPrediction = legacyHighpass
+				}
+			}
+			if source.container.transform != d.source.container.transform {
+				info = cloneInfo(source.info())
+			}
+			if err := checkJXRDimensions(uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy()), limits.MaxPixels); err != nil {
+				return nil, err
+			}
+		}
+		selected := &Decoder{data: d.data, source: source, info: info, limits: limits, singleImage: true, inputExtra: d.inputExtra, legacyHighpassPrediction: legacyHighpass, keepOrientation: keepOrientation}
+		selected.setWorkers(workers)
+		selected.setDecodeBand(band)
 		selected.bindInputContext(nil)
 		if err := selected.checkInfoCopy(); err != nil {
 			return nil, err
 		}
 		return selected, nil
 	}
-	return d.parseDirectoryDecoder(ctx, &directory, true)
+	return d.parseDirectoryDecoderWithOptions(ctx, &directory, true, opts)
 }
 
-// parseDirectoryDecoder 按剩余内存预算解析指定容器目录并装配共享或独立的子图像解码器
-// 入参: ctx 已规范化Context, directory 目标容器目录, independent 是否构建独立单图子解码器
+// parseDirectoryDecoderWithOptions 解析指定容器目录并按继承或显式独立选项装配子图像解码器
+// 入参: ctx 已规范化Context, directory 目标容器目录, independent 是否构建独立单图子解码器, opts 可选独立解码选项
 // 返回: *Decoder 目标图像解码器, error 数据、能力、资源或取消错误
-func (d *Decoder) parseDirectoryDecoder(ctx context.Context, directory *jxrDirectory, independent bool) (*Decoder, error) {
-	retained, input := d.retainedHeaderWork(), d.inputWork()
-	if input > d.limits.MaxMemoryBytes || retained > d.limits.MaxMemoryBytes-input {
-		return nil, &LimitError{Resource: "JPEG XR retained first image memory", Limit: d.limits.MaxMemoryBytes, Required: jxrSaturatedAdd(input, retained)}
+func (d *Decoder) parseDirectoryDecoderWithOptions(ctx context.Context, directory *jxrDirectory, independent bool, opts *DecodeOptions) (*Decoder, error) {
+	limits := d.limits
+	workers := d.workers
+	band := d.decodeBand
+	legacyHighpass := d.legacyHighpassPrediction
+	keepOrientation := d.keepOrientation
+	var parserLimit uint64
+	var parentExtra uint64
+	if opts == nil {
+		retained, input := d.retainedHeaderWork(), d.inputWork()
+		if input > limits.MaxMemoryBytes || retained > limits.MaxMemoryBytes-input {
+			return nil, &LimitError{Resource: "JPEG XR retained first image memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(input, retained)}
+		}
+		parserLimit = limits.MaxMemoryBytes - input - retained
+		parentExtra = retained + (input - uint64(cap(d.data)))
+	} else {
+		limits = opts.Limits.normalized()
+		workers = opts.Workers
+		band = opts.Band
+		legacyHighpass = opts.LegacyHighpassPrediction
+		keepOrientation = opts.KeepOrientation
+		if uint64(cap(d.data)) >= limits.MaxMemoryBytes {
+			return nil, &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(uint64(cap(d.data)), 1), Detail: "decoder retained input memory"}
+		}
+		parserLimit = limits.MaxMemoryBytes - uint64(cap(d.data))
 	}
-	parser := jxrParser{ctx: ctx, limit: d.limits.MaxMemoryBytes - input - retained, legacyHighpassPrediction: d.legacyHighpassPrediction}
+	parser := jxrParser{ctx: ctx, limit: parserLimit, legacyHighpassPrediction: legacyHighpass}
 	if d.fileInput != nil {
 		d.fileInput.ctx = ctx
 		defer func() { d.fileInput.ctx = nil }()
@@ -368,36 +466,34 @@ func (d *Decoder) parseDirectoryDecoder(ctx context.Context, directory *jxrDirec
 	if err := parser.reserve(directory.storageWork()); err != nil {
 		return nil, err
 	}
-	container, err := parser.directoryContainer(directory, d.limits.MaxPixels)
+	container, err := parser.directoryContainer(directory, limits.MaxPixels)
 	if err != nil {
 		return nil, err
 	}
-	source, err := parser.containerSource(&container, d.limits.MaxPixels)
+	source, err := parser.containerSource(&container, limits.MaxPixels)
 	if err != nil {
 		return nil, err
 	}
-	if d.keepOrientation {
+	if keepOrientation {
 		source.container.transform = 0
 	}
 	info, err := parser.info(&source)
 	if err != nil {
 		return nil, err
 	}
-	parentExtra := retained + (input - uint64(cap(d.data)))
 	var fileInput *jxrReaderAt
 	if !independent && d.fileInput != nil {
 		parentExtra -= jxrReaderAtWork
 		fileInput = d.fileInput
 	}
-	limits := d.limits
 	limits.MaxMemoryBytes -= parentExtra
 	extra := uint64(cap(container.exif)) + uint64(cap(container.gps))
 	if d.fileInput != nil {
 		extra += uint64(cap(container.profile)) + uint64(cap(container.xmp)) + uint64(cap(container.iptc))
 	}
-	selected := &Decoder{data: d.data, source: source, info: info, limits: limits, singleImage: independent, fileInput: fileInput, inputExtra: extra, legacyHighpassPrediction: d.legacyHighpassPrediction, keepOrientation: d.keepOrientation}
-	selected.setWorkers(d.workers)
-	selected.setDecodeBand(d.decodeBand)
+	selected := &Decoder{data: d.data, source: source, info: info, limits: limits, singleImage: independent, fileInput: fileInput, inputExtra: extra, legacyHighpassPrediction: legacyHighpass, keepOrientation: keepOrientation}
+	selected.setWorkers(workers)
+	selected.setDecodeBand(band)
 	selected.bindInputContext(nil)
 	if independent {
 		if err := selected.checkInfoCopy(); err != nil {
@@ -417,7 +513,7 @@ func cloneJXRReaderAt(src *jxrReaderAt) *jxrReaderAt {
 	return &jxrReaderAt{source: src.source, base: src.base, size: src.size}
 }
 
-// EncodeImages 逐图流式编码并写入JXR多图容器文件，支持整图Raster或有界分块Tiles提供器，每图写完后才链接前一目录
+// EncodeImages 逐图流式编码并写入JXR多图容器文件，支持整图Raster、有界分块Tiles或单遍顺序行源Rows，每图写完后才链接前一目录
 // w须位于文件起点且支持绝对定位，不关闭或截断输出，失败可能残留部分数据；调用期间不得并发修改输入图像及选项
 // 入参: ctx Context，nil采用Background, w 可定位输出, images 按目录顺序排列的图像, opts 全文件资源上限
 // 返回: error 容器关系、格式、精度、资源、取消、定位或写入错误
@@ -439,7 +535,16 @@ func EncodeImages(ctx context.Context, w io.WriteSeeker, images []ImageInput, op
 		}
 	}
 	maximum = min(maximum, uint64(math.MaxUint32))
-	if images[0].Tiles != nil {
+	hasTiles, hasRows := false, false
+	for _, item := range images {
+		if item.Tiles != nil {
+			hasTiles = true
+		}
+		if item.Rows != nil {
+			hasRows = true
+		}
+	}
+	if hasTiles {
 		if maximum < 8 {
 			return &LimitError{Resource: "JPEG XR tiled image file output bytes", Limit: maximum, Required: 8}
 		}
@@ -447,16 +552,25 @@ func EncodeImages(ctx context.Context, w io.WriteSeeker, images []ImageInput, op
 			return &LimitError{Resource: "JPEG XR tiled image file planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(4096, jxrSaturatedMul(uint64(len(images)), jxrTileImagePlanWork))}
 		}
 		for _, item := range images {
-			if item.Raster != nil || item.Tiles == nil {
+			if item.Raster != nil || item.Rows != nil || item.Tiles == nil {
 				return &FormatError{Op: "EncodeImages", Detail: "mixed raster and tiled image inputs"}
 			}
 		}
 		return wrapJXRError("EncodeImages", encodeJXRImagesTiles(ctx, w, images, limits, maximum))
 	}
-	for _, item := range images {
-		if item.Tiles != nil {
-			return &FormatError{Op: "EncodeImages", Detail: "mixed raster and tiled image inputs"}
+	if hasRows {
+		if maximum < 8 {
+			return &LimitError{Resource: "JPEG XR row image file output bytes", Limit: maximum, Required: 8}
 		}
+		if limits.MaxMemoryBytes < 4096 || uint64(len(images)) > (limits.MaxMemoryBytes-4096)/jxrTileImagePlanWork || uint64(len(images)) > uint64(^uint(0)>>1)/jxrTileImagePlanWork {
+			return &LimitError{Resource: "JPEG XR row image file planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(4096, jxrSaturatedMul(uint64(len(images)), jxrTileImagePlanWork))}
+		}
+		for _, item := range images {
+			if (item.Raster == nil) == (item.Rows == nil) {
+				return &FormatError{Op: "EncodeImages", Detail: "invalid row or raster image input"}
+			}
+		}
+		return wrapJXRError("EncodeImages", encodeJXRImagesRows(ctx, w, images, limits, maximum))
 	}
 	return wrapJXRError("EncodeImages", encodeJXRImages(ctx, w, images, limits, maximum))
 }
@@ -921,6 +1035,7 @@ func planJXRTileImageFile(ctx context.Context, images []ImageInput, limits Limit
 		if err != nil {
 			return nil, 0, err
 		}
+		clearJXRMergedMetadata(&options)
 		if work > limits.MaxMemoryBytes-state-retained-reserved {
 			return nil, 0, &LimitError{Resource: "tiled image descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, work)))}
 		}
@@ -983,10 +1098,25 @@ func jxrTileOptionsQuantizationWork(ctx context.Context, options EncodeOptions, 
 	return work, ctx.Err()
 }
 
+// clearJXRMergedMetadata 清空已合并并深拷贝至目标Info的容器元数据覆盖字段，避免二次覆盖或回调篡改
+// 入参: options 待清理的编码选项指针
+func clearJXRMergedMetadata(options *EncodeOptions) {
+	options.Resolution = nil
+	options.ICCProfile = nil
+	options.ColorHint = nil
+	options.ColorEncoding = nil
+	options.EXIF = nil
+	options.GPS = nil
+	options.XMP = nil
+	options.IPTC = nil
+	options.Description = nil
+}
+
 // snapshotJXRTileOptions 在共同容量内复制完整量化配置，不让首图回调改变后图的集合、复用和索引
 // 入参: ctx Context, info 已校验原生描述, options 已合并基本选项, maximum 原配置与副本共同容量
 // 返回: EncodeOptions 独占选项, uint64 量化原配置与副本的保守常驻容量, error 平面、量化、资源或取消错误
 func snapshotJXRTileOptions(ctx context.Context, info Info, options EncodeOptions, maximum uint64) (EncodeOptions, uint64, error) {
+	options = jxrResolveEncodeOptions(options)
 	if (options.Alpha != nil || options.SeparateAlpha) && !info.Alpha {
 		return options, 0, fmt.Errorf("%w: tiled image alpha options without alpha", ErrInvalid)
 	}
@@ -1010,7 +1140,7 @@ func snapshotJXRTileOptions(ctx context.Context, info Info, options EncodeOption
 		value := *options.Float
 		options.Float = &value
 	}
-	options.ColorHint = nil
+	clearJXRMergedMetadata(&options)
 	if options.Window != nil {
 		value := *options.Window
 		options.Window = &value
@@ -1087,6 +1217,221 @@ func writeJXRTileFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTil
 	if padding {
 		if end == maximum {
 			return 0, 0, &LimitError{Resource: "tiled image file alignment capacity", Limit: maximum, Required: jxrSaturatedAdd(end, 1)}
+		}
+		end++
+	}
+	return finishJXRImageOutput(ctx, w, start, end, previous, link, padding)
+}
+
+// encodeJXRImagesRows 逐图流式编码单遍行源与可选整图组合的多图JXR容器，每图写完后才链接前一目录
+// 入参: ctx 已规范化Context, w 可定位输出, images 按目录顺序排列的图像输入, limits 全文件资源上限, maximum 全文件输出上限
+// 返回: error 元数据、关系、能力、精度、资源、提供器、取消或I/O错误
+func encodeJXRImagesRows(ctx context.Context, w io.WriteSeeker, images []ImageInput, limits Limits, maximum uint64) error {
+	state := uint64(4096) + uint64(len(images))*jxrTileImagePlanWork
+	plans, retained, err := planJXRRowImageFile(ctx, images, limits, state, maximum)
+	if err != nil {
+		return err
+	}
+	position, err := w.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if position != 0 {
+		return fmt.Errorf("%w: JPEG XR row image file output position", ErrInvalid)
+	}
+	end, previous := uint64(8), uint64(0)
+	for index := range plans {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if end > maximum {
+			return &LimitError{Resource: "JPEG XR row image file output size", Limit: maximum, Required: end}
+		}
+		plan := &plans[index]
+		memory := limits.MaxMemoryBytes - state - (retained - plan.retained)
+		options, err := jxrFileImageOptions(&plan.options, limits, memory, maximum-end+8)
+		if err != nil {
+			return err
+		}
+		if plan.raster != nil {
+			end, previous, err = writeJXRFileImageTo(ctx, w, plan.raster, &options, end, previous, maximum, index == len(plans)-1)
+		} else {
+			end, previous, err = writeJXRRowFileImageTo(ctx, w, plan, options, end, previous, maximum, index == len(plans)-1)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+// planJXRRowImageFile 预检多图行源与整图条目的元数据、像素总量、页序列关系与独占选项快照
+// 入参: ctx Context, images 多图输入, limits 全文件上限, state 计划固定内存, maximum 全文件输出上限
+// 返回: []jxrTileImagePlan 独占快照, uint64 全部常驻额外内存, error 元数据、选项、关系、资源或取消错误
+func planJXRRowImageFile(ctx context.Context, images []ImageInput, limits Limits, state, maximum uint64) ([]jxrTileImagePlan, uint64, error) {
+	if state >= limits.MaxMemoryBytes {
+		return nil, 0, &LimitError{Resource: "row image snapshot planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, 1)}
+	}
+	plans := make([]jxrTileImagePlan, len(images))
+	retained, pixels := uint64(0), uint64(0)
+	for index, input := range images {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		options, err := jxrFileImageOptions(input.Options, limits, limits.MaxMemoryBytes-state-retained, maximum)
+		if err != nil {
+			return nil, 0, err
+		}
+		if err := checkJXREncodeOptions(options); err != nil {
+			return nil, 0, err
+		}
+		if input.Raster != nil {
+			work, err := jxrRasterWork(input.Raster, limits.MaxMemoryBytes-state-retained)
+			if err != nil {
+				return nil, 0, err
+			}
+			if work > limits.MaxMemoryBytes-state-retained {
+				return nil, 0, &LimitError{Resource: "row image file combined inputs", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, work))}
+			}
+			info := input.Raster.info
+			if options.SeparateAlpha && !info.Alpha {
+				return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
+			}
+			width, height := uint64(input.Raster.Bounds().Dx()), uint64(input.Raster.Bounds().Dy())
+			if height == 0 {
+				return nil, 0, fmt.Errorf("%w: JPEG XR image dimensions", ErrInvalid)
+			}
+			if width > (limits.MaxPixels-pixels)/height {
+				return nil, 0, &LimitError{Resource: "JPEG XR combined image pixels", Limit: limits.MaxPixels, Required: jxrSaturatedAdd(pixels, jxrSaturatedMul(width, height))}
+			}
+			pixels += width * height
+			identifier, _, err := jxrRasterIdentifier(info, [16]byte{})
+			if err != nil {
+				return nil, 0, err
+			}
+			retained += work
+			plans[index] = jxrTileImagePlan{info: info, raster: input.Raster, options: options, retained: work, identifier: identifier}
+			continue
+		}
+		info, work, err := prepareJXRTileInfo(ctx, input.Info, options)
+		if err != nil {
+			return nil, 0, err
+		}
+		clearJXRMergedMetadata(&options)
+		if work > limits.MaxMemoryBytes-state-retained {
+			return nil, 0, &LimitError{Resource: "row image file descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, work))}
+		}
+		retained += work
+		width, height := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
+		if width > (limits.MaxPixels-pixels)/height {
+			return nil, 0, &LimitError{Resource: "combined row image pixels", Limit: limits.MaxPixels, Required: jxrSaturatedAdd(pixels, jxrSaturatedMul(width, height))}
+		}
+		pixels += width * height
+		identifier, format, err := jxrRasterIdentifier(info, [16]byte{})
+		if err != nil {
+			return nil, 0, err
+		}
+		if !options.Uncompressed {
+			resolved := jxrResolveEncodeOptions(options)
+			if resolved.TileSize == (image.Point{}) {
+				resolved.TileSize = jxrDefaultRowTileSize(info, format, resolved)
+			}
+			options = resolved
+		}
+		reader := input.Rows
+		wrapped := func(ctx context.Context, y int, target *Raster) error {
+			if err := reader(ctx, y, target); err != nil {
+				return jxrCallbackError{err: err}
+			}
+			return nil
+		}
+		plans[index] = jxrTileImagePlan{info: info, rows: wrapped, options: options, retained: work, identifier: identifier}
+	}
+	if err := checkJXRImageSequence(ctx, len(plans), func(index int) (Info, [16]byte, Orientation) {
+		return plans[index].info, plans[index].identifier, plans[index].options.Orientation
+	}); err != nil {
+		return nil, 0, err
+	}
+	for index := range plans {
+		plan := &plans[index]
+		if plan.raster != nil || plan.options.Uncompressed {
+			continue
+		}
+		options, work, err := snapshotJXRTileOptions(ctx, plan.info, plan.options, limits.MaxMemoryBytes-state-retained)
+		if err != nil {
+			return nil, 0, err
+		}
+		plan.options, plan.retained = options, plan.retained+work
+		retained += work
+	}
+	return plans, retained, ctx.Err()
+}
+
+// writeJXRRowFileImageTo 在多图文件指定目录位置按单遍行流编码单幅图像并完成偶数对齐与目录链接
+// 入参: ctx Context, w 当前输出, plan 当前独占计划, options 当前合并选项, start 当前目录起点, previous 前一链接位置, maximum 全文件上限, last 是否末图
+// 返回: uint64 文件末尾位置, uint64 当前链接位置, error 布局、资源、提供器、取消或I/O错误
+func writeJXRRowFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTileImagePlan, options EncodeOptions, start, previous, maximum uint64, last bool) (uint64, uint64, error) {
+	var end, link uint64
+	var err error
+	if options.Uncompressed {
+		end, link, err = encodeJXRRowsUncompressedAt(ctx, w, plan.info, plan.rows, options, start)
+	} else {
+		limits := options.Limits.normalized()
+		input := plan.info
+		input.ICCProfile, input.EXIF, input.GPS, input.XMP, input.IPTC, input.Description = nil, nil, nil, nil, nil, nil
+		formatInfo, fmtErr := rasterPixelFormat(input)
+		if fmtErr != nil {
+			return 0, 0, fmtErr
+		}
+		var alpha jxrAlphaRowStorage
+		if options.SeparateAlpha {
+			var held uint64
+			alpha, held, err = makeJXRAlphaRowStorage(input, options.Scratch, limits.MaxMemoryBytes)
+			if err != nil {
+				return 0, 0, err
+			}
+			limits.MaxMemoryBytes -= held
+		}
+		height := jxrRingHeight(input, formatInfo.color, options)
+		cacheInfo, ringWork, ringErr := jxrRegionInfo(input, image.Rect(0, 0, input.Bounds.Dx(), height))
+		if ringErr != nil {
+			return 0, 0, ringErr
+		}
+		if ringWork >= limits.MaxMemoryBytes {
+			return 0, 0, &LimitError{Resource: "row ring storage", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(ringWork, 1)}
+		}
+		limits.MaxMemoryBytes -= ringWork
+		options.Limits = limits
+		step := 1
+		for _, component := range input.Components {
+			step = max(step, int(component.YStep))
+		}
+		source := jxrRowInput{info: cacheInfo, read: plan.rows, height: input.Bounds.Dy(), step: step, maxWork: ringWork}
+		if options.SeparateAlpha {
+			end, link, err = encodeJXRSeparateRowsAt(ctx, w, plan.info, &source, &alpha, options, start)
+		} else {
+			metadata := Raster{info: plan.info}
+			streamLayout, output, planErr := makeJXREncodingPlanRetained(ctx, &metadata, &options, plan.retained)
+			if planErr != nil {
+				return 0, 0, jxrPlanLimitError(planErr, output.stream.maxMemory, plan.retained)
+			}
+			output.stream.rowOrder = true
+			end, link, err = writeJXRFileAt(ctx, w, plan.info, &streamLayout, output.stream, plan.retained, start, func(selected jxrStreamOutput) error {
+				selected.maxMemory -= plan.retained
+				return encodeJXRProvidedTilesTo(ctx, w, plan.info, &streamLayout, selected, source.load)
+			})
+		}
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	if end > maximum {
+		return 0, 0, &LimitError{Resource: "row image file output capacity", Limit: maximum, Required: end}
+	}
+	padding := !last && end&1 != 0
+	if padding {
+		if end == maximum {
+			return 0, 0, &LimitError{Resource: "row image file alignment capacity", Limit: maximum, Required: jxrSaturatedAdd(end, 1)}
 		}
 		end++
 	}

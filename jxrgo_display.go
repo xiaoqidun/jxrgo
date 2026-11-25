@@ -99,6 +99,20 @@ type ColorConverter struct {
 	transform ColorTransform
 }
 
+// StripRegion 保存条带在完整显示网格中的矩形范围及其原生样本视图，供全方向无缝跨带转换定位上下或左右邻域
+type StripRegion struct {
+	Region image.Rectangle
+	Raster *Raster
+}
+
+// jxrStripNeighbors 保存经显示几何解算后的上下或左右相邻条带指针，单次转换至多沿单轴存在邻带
+type jxrStripNeighbors struct {
+	top    *Raster
+	bottom *Raster
+	left   *Raster
+	right  *Raster
+}
+
 // Display 按分量相位将原生图像绘制为十六位非预乘sRGB图像，不修改原图也不构造整幅重采样中间图
 // 未知色度相位按ITU-T T.832默认居中相位处理；色彩按Transform优先、ApplyICC内建ICC或默认CICP与BT.2446方法A策略转换
 // 入参: ctx Context，nil采用Background, opts 显示策略及限制，nil采用默认值
@@ -330,7 +344,7 @@ func (lr *LinearReader) readRow(ctx context.Context, y int, dst []float64) error
 	bounds := lr.info.Bounds
 	width, height := bounds.Dx(), bounds.Dy()
 	row := y - bounds.Min.Y
-	if row < 0 || row >= height || len(dst) < width*4 {
+	if row < 0 || row >= height || int64(len(dst)) < int64(width)*4 {
 		return fmt.Errorf("%w: linear reader row or destination", ErrInvalid)
 	}
 	count := len(lr.components)
@@ -579,7 +593,7 @@ func (rr *RGBReader) readRow(ctx context.Context, y int, dst []float64) error {
 	bounds := rr.info.Bounds
 	width, height := bounds.Dx(), bounds.Dy()
 	row := y - bounds.Min.Y
-	if row < 0 || row >= height || len(dst) < width*4 {
+	if row < 0 || row >= height || int64(len(dst)) < int64(width)*4 {
 		return fmt.Errorf("%w: RGB reader row or destination", ErrInvalid)
 	}
 	count := len(rr.components)
@@ -823,7 +837,7 @@ func displayJXRSample(source Component, x, y, width, height int, filter Resample
 // 返回: float64 非预乘红、绿、蓝显示值
 func displayJXRColor(info Info, values []float64, alpha float64, linear bool) (float64, float64, float64) {
 	if info.Premultiplied {
-		if !(alpha > 0) {
+		if !(alpha > 0) || !geometryFinite(alpha) {
 			return 0, 0, 0
 		}
 		jxrUnpremultiplyDisplay(values[:info.Channels], alpha)
@@ -850,11 +864,10 @@ func displayJXRColor(info Info, values []float64, alpha float64, linear bool) (f
 	return red, green, blue
 }
 
-// jxrUnpremultiplyDisplay 按显示透明度恢复非预乘设备分量
+// jxrUnpremultiplyDisplay 按原透明度恢复非预乘设备分量，非正或非有限透明度清零颜色，有限正数直接相除
 // 入参: values 原生颜色工作值, alpha 原透明度
 func jxrUnpremultiplyDisplay(values []float64, alpha float64) {
-	alpha = colorClamp(alpha)
-	if math.IsNaN(alpha) || alpha == 0 {
+	if !(alpha > 0) || !geometryFinite(alpha) {
 		clear(values)
 		return
 	}
@@ -1652,7 +1665,7 @@ func (c *ColorConverter) ConvertRowXYZ(ctx context.Context, src *Raster, y int, 
 
 // ConvertStripRowNRGBA 结合相邻上下行带将当前行带局部行号y转换为八位非预乘sRGB RGBA扫描行
 // 在ResampleBilinear下跨带边界读取相邻带色度样本以彻底消除YCC420/422的跨带接缝，prev或next为nil表示图像顶底边界
-// 适用于等宽水平相邻行带；含转置方向时应配合KeepOrientation: true解码
+// 仅适用于自顶向下的全宽水平相邻行带；遇到转置竖直列带时返回ErrInvalid，全部八种方向应使用ConvertStripRegionNRGBA
 // 入参: ctx Context，nil采用Background, prev 上方相邻行带（可nil）, curr 当前行带, next 下方相邻行带（可nil）, y 当前带行坐标, dst 目标八位RGBA字节切片
 // 返回: error 参数、坐标、色彩、数值、变换或取消错误
 func (c *ColorConverter) ConvertStripRowNRGBA(ctx context.Context, prev, curr, next *Raster, y int, dst []byte) error {
@@ -1667,7 +1680,7 @@ func (c *ColorConverter) ConvertStripRowNRGBA(ctx context.Context, prev, curr, n
 
 // ConvertStripRowNRGBA64 结合相邻上下行带将当前行带局部行号y转换为大端十六位非预乘sRGB RGBA扫描行
 // 在ResampleBilinear下跨带边界读取相邻带色度样本以彻底消除YCC420/422的跨带接缝，prev或next为nil表示图像顶底边界
-// 适用于等宽水平相邻行带；含转置方向时应配合KeepOrientation: true解码
+// 仅适用于自顶向下的全宽水平相邻行带；遇到转置竖直列带时返回ErrInvalid，全部八种方向应使用ConvertStripRegionNRGBA64
 // 入参: ctx Context，nil采用Background, prev 上方相邻行带（可nil）, curr 当前行带, next 下方相邻行带（可nil）, y 当前带行坐标, dst 目标十六位大端RGBA字节切片
 // 返回: error 参数、坐标、色彩、数值、变换或取消错误
 func (c *ColorConverter) ConvertStripRowNRGBA64(ctx context.Context, prev, curr, next *Raster, y int, dst []byte) error {
@@ -1682,7 +1695,7 @@ func (c *ColorConverter) ConvertStripRowNRGBA64(ctx context.Context, prev, curr,
 
 // ConvertStripRowLinear 结合相邻上下行带将当前行带局部行号y转换为未裁剪的D65线性scRGB浮点RGBA扫描行
 // 在ResampleBilinear下跨带边界读取相邻带色度样本以消除YCC420/422的跨带接缝，prev或next为nil表示图像顶底边界
-// 适用于等宽水平相邻行带；含转置方向时应配合KeepOrientation: true解码
+// 仅适用于自顶向下的全宽水平相邻行带；遇到转置竖直列带时返回ErrInvalid，全部八种方向应使用ConvertStripRegionLinear
 // 入参: ctx Context，nil采用Background, prev 上方相邻行带（可nil）, curr 当前行带, next 下方相邻行带（可nil）, y 当前带行坐标, dst 目标线性scRGB浮点切片
 // 返回: error 参数、坐标、色彩、数值、变换或取消错误
 func (c *ColorConverter) ConvertStripRowLinear(ctx context.Context, prev, curr, next *Raster, y int, dst []float64) error {
@@ -1697,7 +1710,7 @@ func (c *ColorConverter) ConvertStripRowLinear(ctx context.Context, prev, curr, 
 
 // ConvertStripRowXYZ 结合相邻上下行带将当前行带局部行号y转换为D50 PCS XYZ与原透明度四个float64值
 // 在ResampleBilinear下跨带边界读取相邻带色度样本以消除YCC420/422的跨带接缝，prev或next为nil表示图像顶底边界
-// 适用于等宽水平相邻行带；含转置方向时应配合KeepOrientation: true解码
+// 仅适用于自顶向下的全宽水平相邻行带；遇到转置竖直列带时返回ErrInvalid，全部八种方向应使用ConvertStripRegionXYZ
 // 入参: ctx Context，nil采用Background, prev 上方相邻行带（可nil）, curr 当前行带, next 下方相邻行带（可nil）, y 当前带行坐标, dst 目标D50 XYZ与Alpha浮点切片
 // 返回: error 参数、坐标、色彩、数值、变换或取消错误
 func (c *ColorConverter) ConvertStripRowXYZ(ctx context.Context, prev, curr, next *Raster, y int, dst []float64) error {
@@ -1706,6 +1719,78 @@ func (c *ColorConverter) ConvertStripRowXYZ(ctx context.Context, prev, curr, nex
 	}
 	if err := c.convertStripRowXYZ(ctx, prev, curr, next, y, dst); err != nil {
 		return wrapJXRError("ColorConverter.ConvertStripRowXYZ", err)
+	}
+	return nil
+}
+
+// ConvertStripRegionNRGBA 按显示区域几何自动识别正序水平行带、倒序水平行带与转置竖直列带的上下或左右邻域，将当前带局部行y转换为八位非预乘sRGB RGBA扫描行
+// 支持DecodeStrips输出的全部八种方向条带无缝色度重采样，零值StripRegion表示图像边界
+// 入参: ctx Context，nil采用Background, prev 回调序前一邻带（可零值）, curr 当前条带, next 回调序后一邻带（可零值）, y 当前带局部行坐标, dst 目标八位RGBA字节切片
+// 返回: error 参数、区域几何、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertStripRegionNRGBA(ctx context.Context, prev, curr, next StripRegion, y int, dst []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	neighbors, err := c.resolveStripRegionNeighbors(prev, curr, next)
+	if err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRegionNRGBA", err)
+	}
+	if err := c.convertStripNeighborsNRGBA(ctx, neighbors, curr.Raster, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRegionNRGBA", err)
+	}
+	return nil
+}
+
+// ConvertStripRegionNRGBA64 按显示区域几何自动识别正序水平行带、倒序水平行带与转置竖直列带的上下或左右邻域，将当前带局部行y转换为大端十六位非预乘sRGB RGBA扫描行
+// 支持DecodeStrips输出的全部八种方向条带无缝色度重采样，零值StripRegion表示图像边界
+// 入参: ctx Context，nil采用Background, prev 回调序前一邻带（可零值）, curr 当前条带, next 回调序后一邻带（可零值）, y 当前带局部行坐标, dst 目标十六位大端RGBA字节切片
+// 返回: error 参数、区域几何、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertStripRegionNRGBA64(ctx context.Context, prev, curr, next StripRegion, y int, dst []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	neighbors, err := c.resolveStripRegionNeighbors(prev, curr, next)
+	if err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRegionNRGBA64", err)
+	}
+	if err := c.convertStripNeighborsNRGBA64(ctx, neighbors, curr.Raster, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRegionNRGBA64", err)
+	}
+	return nil
+}
+
+// ConvertStripRegionLinear 按显示区域几何自动识别正序水平行带、倒序水平行带与转置竖直列带的上下或左右邻域，将当前带局部行y转换为未裁剪D65线性scRGB浮点扫描行
+// 支持DecodeStrips输出的全部八种方向条带无缝色度重采样，零值StripRegion表示图像边界
+// 入参: ctx Context，nil采用Background, prev 回调序前一邻带（可零值）, curr 当前条带, next 回调序后一邻带（可零值）, y 当前带局部行坐标, dst 目标线性scRGB浮点切片
+// 返回: error 参数、区域几何、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertStripRegionLinear(ctx context.Context, prev, curr, next StripRegion, y int, dst []float64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	neighbors, err := c.resolveStripRegionNeighbors(prev, curr, next)
+	if err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRegionLinear", err)
+	}
+	if err := c.convertStripNeighborsLinear(ctx, neighbors, curr.Raster, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRegionLinear", err)
+	}
+	return nil
+}
+
+// ConvertStripRegionXYZ 按显示区域几何自动识别正序水平行带、倒序水平行带与转置竖直列带的上下或左右邻域，将当前带局部行y转换为D50 PCS XYZ与原透明度扫描行
+// 支持DecodeStrips输出的全部八种方向条带无缝色度重采样，零值StripRegion表示图像边界
+// 入参: ctx Context，nil采用Background, prev 回调序前一邻带（可零值）, curr 当前条带, next 回调序后一邻带（可零值）, y 当前带局部行坐标, dst 目标D50 XYZ与Alpha浮点切片
+// 返回: error 参数、区域几何、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) ConvertStripRegionXYZ(ctx context.Context, prev, curr, next StripRegion, y int, dst []float64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	neighbors, err := c.resolveStripRegionNeighbors(prev, curr, next)
+	if err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRegionXYZ", err)
+	}
+	if err := c.convertStripNeighborsXYZ(ctx, neighbors, curr.Raster, y, dst); err != nil {
+		return wrapJXRError("ColorConverter.ConvertStripRegionXYZ", err)
 	}
 	return nil
 }
@@ -1733,14 +1818,26 @@ func (c *ColorConverter) checkSource(src *Raster) error {
 	return nil
 }
 
-// checkStripNeighbors 校验当前行带与可选相邻上下行带的兼容性、统一行宽及一致色度相位
+// checkStripNeighbors 校验当前行带与可选相邻上下行带的兼容性、分量行宽一致、YStep对齐及一致色度相位
 // 入参: prev 上方行带, curr 当前行带, next 下方行带
 // 返回: error 不兼容或无效参数错误
 func (c *ColorConverter) checkStripNeighbors(prev, curr, next *Raster) error {
 	if err := c.checkSource(curr); err != nil {
 		return err
 	}
-	width := curr.Bounds().Dx()
+	width, height := curr.Bounds().Dx(), curr.Bounds().Dy()
+	hasNeighbor := prev != nil || next != nil
+	if hasNeighbor && !c.info.Bounds.Empty() && width != c.info.Bounds.Dx() {
+		return fmt.Errorf("%w: color converter horizontal strip width mismatch", ErrInvalid)
+	}
+	for _, comp := range curr.info.Components {
+		if comp.Bounds.Dx() <= 0 || comp.Bounds.Dy() <= 0 {
+			return fmt.Errorf("%w: color converter strip component bounds", ErrInvalid)
+		}
+		if hasNeighbor && (height%int(comp.YStep) != 0 || comp.Bounds.Dy() != height/int(comp.YStep)) {
+			return fmt.Errorf("%w: color converter strip vertical step alignment", ErrInvalid)
+		}
+	}
 	for _, neighbor := range [2]*Raster{prev, next} {
 		if neighbor == nil {
 			continue
@@ -1751,39 +1848,131 @@ func (c *ColorConverter) checkStripNeighbors(prev, curr, next *Raster) error {
 		if neighbor.Bounds().Dx() != width {
 			return fmt.Errorf("%w: color converter strip width mismatch", ErrInvalid)
 		}
+		nHeight := neighbor.Bounds().Dy()
 		for index, comp := range neighbor.info.Components {
-			if !jxrSharedChromaPhase(comp, curr.info.Components[index]) {
+			currComp := curr.info.Components[index]
+			if !jxrSharedChromaPhase(comp, currComp) {
 				return fmt.Errorf("%w: color converter strip chroma phase mismatch", ErrInvalid)
+			}
+			if comp.Bounds.Dx() != currComp.Bounds.Dx() || comp.Bounds.Dy() <= 0 {
+				return fmt.Errorf("%w: color converter strip component width mismatch", ErrInvalid)
+			}
+			if nHeight%int(comp.YStep) != 0 || comp.Bounds.Dy() != nHeight/int(comp.YStep) {
+				return fmt.Errorf("%w: color converter strip neighbor vertical step alignment", ErrInvalid)
 			}
 		}
 	}
 	return nil
 }
 
-// prepareStripRow 校验取消状态、相邻行带兼容性、行号范围与目标切片长度
-// 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dstLen 目标缓冲元素长度, elemPerPixel 每像素目标元素数
-// 返回: int 零起点局部行号, int 图像宽度, int 图像高度, error 参数、坐标或取消错误
-func (c *ColorConverter) prepareStripRow(ctx context.Context, prev, curr, next *Raster, y, dstLen, elemPerPixel int) (int, int, int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, 0, 0, err
+// checkStripRegionItem 校验单个条带区域与原生样本尺寸、边界及分量采样步长对齐一致
+// 入参: item 待校验条带区域
+// 返回: error 条带区域、样本或步长不合法错误
+func (c *ColorConverter) checkStripRegionItem(item StripRegion) error {
+	if err := c.checkSource(item.Raster); err != nil {
+		return err
 	}
-	if err := c.checkStripNeighbors(prev, curr, next); err != nil {
-		return 0, 0, 0, err
+	bounds := item.Raster.Bounds()
+	if item.Region.Empty() || item.Region.Min.X < 0 || item.Region.Min.Y < 0 || item.Region.Dx() != bounds.Dx() || item.Region.Dy() != bounds.Dy() {
+		return fmt.Errorf("%w: color converter strip region mismatch", ErrInvalid)
 	}
+	if !c.info.Bounds.Empty() && !item.Region.In(c.info.Bounds) {
+		return fmt.Errorf("%w: color converter strip region out of bounds", ErrInvalid)
+	}
+	for _, comp := range item.Raster.info.Components {
+		sx, sy := int(comp.XStep), int(comp.YStep)
+		if item.Region.Min.X%sx != 0 || item.Region.Min.Y%sy != 0 || item.Region.Dx()%sx != 0 || item.Region.Dy()%sy != 0 || comp.Bounds.Dx() != item.Region.Dx()/sx || comp.Bounds.Dy() != item.Region.Dy()/sy {
+			return fmt.Errorf("%w: color converter strip region step alignment", ErrInvalid)
+		}
+	}
+	return nil
+}
+
+// resolveStripRegionNeighbors 根据显示区域精确贴边关系将prev与next解析为上下或左右邻带，自动适配正倒序水平带与四类竖直列带
+// 入参: prev 前一邻带, curr 当前条带, next 后一邻带
+// 返回: jxrStripNeighbors 已校验的上下或左右邻带, error 几何错位、重叠或混轴错误
+func (c *ColorConverter) resolveStripRegionNeighbors(prev, curr, next StripRegion) (jxrStripNeighbors, error) {
+	var neighbors jxrStripNeighbors
+	if err := c.checkStripRegionItem(curr); err != nil {
+		return neighbors, err
+	}
+	for _, item := range [2]StripRegion{prev, next} {
+		if item.Raster == nil && item.Region.Empty() {
+			continue
+		}
+		if item.Raster == nil || item.Region.Empty() {
+			return jxrStripNeighbors{}, fmt.Errorf("%w: color converter incomplete strip neighbor", ErrInvalid)
+		}
+		if err := c.checkStripRegionItem(item); err != nil {
+			return jxrStripNeighbors{}, err
+		}
+		for index, comp := range item.Raster.info.Components {
+			if !jxrSharedChromaPhase(comp, curr.Raster.info.Components[index]) {
+				return jxrStripNeighbors{}, fmt.Errorf("%w: color converter strip chroma phase mismatch", ErrInvalid)
+			}
+		}
+		switch {
+		case item.Region.Min.X == curr.Region.Min.X && item.Region.Max.X == curr.Region.Max.X && item.Region.Max.Y == curr.Region.Min.Y:
+			if neighbors.top != nil {
+				return jxrStripNeighbors{}, fmt.Errorf("%w: color converter duplicate top strip", ErrInvalid)
+			}
+			neighbors.top = item.Raster
+		case item.Region.Min.X == curr.Region.Min.X && item.Region.Max.X == curr.Region.Max.X && item.Region.Min.Y == curr.Region.Max.Y:
+			if neighbors.bottom != nil {
+				return jxrStripNeighbors{}, fmt.Errorf("%w: color converter duplicate bottom strip", ErrInvalid)
+			}
+			neighbors.bottom = item.Raster
+		case item.Region.Min.Y == curr.Region.Min.Y && item.Region.Max.Y == curr.Region.Max.Y && item.Region.Max.X == curr.Region.Min.X:
+			if neighbors.left != nil {
+				return jxrStripNeighbors{}, fmt.Errorf("%w: color converter duplicate left strip", ErrInvalid)
+			}
+			neighbors.left = item.Raster
+		case item.Region.Min.Y == curr.Region.Min.Y && item.Region.Max.Y == curr.Region.Max.Y && item.Region.Min.X == curr.Region.Max.X:
+			if neighbors.right != nil {
+				return jxrStripNeighbors{}, fmt.Errorf("%w: color converter duplicate right strip", ErrInvalid)
+			}
+			neighbors.right = item.Raster
+		default:
+			return jxrStripNeighbors{}, fmt.Errorf("%w: color converter strip neighbor not adjacent", ErrInvalid)
+		}
+	}
+	if (neighbors.top != nil || neighbors.bottom != nil) && (neighbors.left != nil || neighbors.right != nil) {
+		return jxrStripNeighbors{}, fmt.Errorf("%w: color converter mixed strip neighbor axes", ErrInvalid)
+	}
+	return neighbors, nil
+}
+
+// prepareStripRowBounds 校验当前条带行坐标及目标切片长度并返回局部零起点行号与条带尺寸
+// 入参: curr 当前条带, y 目标行坐标, dstLen 目标缓冲元素长度, elemPerPixel 每像素目标元素数
+// 返回: int 零起点局部行号, int 条带宽度, int 条带高度, error 坐标或目标长度错误
+func prepareStripRowBounds(curr *Raster, y, dstLen, elemPerPixel int) (int, int, int, error) {
 	bounds := curr.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
 	row := y - bounds.Min.Y
-	if row < 0 || row >= height || dstLen < width*elemPerPixel {
+	if row < 0 || row >= height || int64(dstLen) < int64(width)*int64(elemPerPixel) {
 		return 0, 0, 0, fmt.Errorf("%w: color converter row or destination", ErrInvalid)
 	}
 	return row, width, height, nil
 }
 
-// convertStripRowNRGBA 执行八位非预乘sRGB RGBA逐行及跨带转换，含原生整数快路径
+// convertStripRowNRGBA 执行八位非预乘sRGB RGBA逐行及上下跨带转换，含原生整数快路径
 // 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dst 目标八位RGBA缓冲
 // 返回: error 参数、坐标、色彩、数值、变换或取消错误
 func (c *ColorConverter) convertStripRowNRGBA(ctx context.Context, prev, curr, next *Raster, y int, dst []byte) error {
-	row, width, height, err := c.prepareStripRow(ctx, prev, curr, next, y, len(dst), 4)
+	if err := c.checkStripNeighbors(prev, curr, next); err != nil {
+		return err
+	}
+	return c.convertStripNeighborsNRGBA(ctx, jxrStripNeighbors{top: prev, bottom: next}, curr, y, dst)
+}
+
+// convertStripNeighborsNRGBA 在已校验邻带几何上执行八位非预乘sRGB RGBA逐行及跨带转换
+// 入参: ctx 已规范化Context, neighbors 上下或左右邻带, curr 当前条带, y 目标行坐标, dst 目标八位RGBA缓冲
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) convertStripNeighborsNRGBA(ctx context.Context, neighbors jxrStripNeighbors, curr *Raster, y int, dst []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	row, width, height, err := prepareStripRowBounds(curr, y, len(dst), 4)
 	if err != nil {
 		return err
 	}
@@ -1801,7 +1990,7 @@ func (c *ColorConverter) convertStripRowNRGBA(ctx context.Context, prev, curr, n
 			}
 		}
 	}
-	return c.walkStripRow(ctx, prev, curr, next, row, width, height, func(x int, values []float64, alpha float64) error {
+	return c.walkStripRowNeighbors(ctx, neighbors, curr, row, width, height, func(x int, values []float64, alpha float64) error {
 		red, green, blue, err := c.displayPixel(ctx, curr.info, values, alpha)
 		if err != nil {
 			return err
@@ -1812,11 +2001,24 @@ func (c *ColorConverter) convertStripRowNRGBA(ctx context.Context, prev, curr, n
 	})
 }
 
-// convertStripRowNRGBA64 执行大端十六位非预乘sRGB RGBA逐行及跨带转换，含原生整数快路径
+// convertStripRowNRGBA64 执行大端十六位非预乘sRGB RGBA逐行及上下跨带转换，含原生整数快路径
 // 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dst 目标十六位大端RGBA缓冲
 // 返回: error 参数、坐标、色彩、数值、变换或取消错误
 func (c *ColorConverter) convertStripRowNRGBA64(ctx context.Context, prev, curr, next *Raster, y int, dst []byte) error {
-	row, width, height, err := c.prepareStripRow(ctx, prev, curr, next, y, len(dst), 8)
+	if err := c.checkStripNeighbors(prev, curr, next); err != nil {
+		return err
+	}
+	return c.convertStripNeighborsNRGBA64(ctx, jxrStripNeighbors{top: prev, bottom: next}, curr, y, dst)
+}
+
+// convertStripNeighborsNRGBA64 在已校验邻带几何上执行大端十六位非预乘sRGB RGBA逐行及跨带转换
+// 入参: ctx 已规范化Context, neighbors 上下或左右邻带, curr 当前条带, y 目标行坐标, dst 目标十六位大端RGBA缓冲
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) convertStripNeighborsNRGBA64(ctx context.Context, neighbors jxrStripNeighbors, curr *Raster, y int, dst []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	row, width, height, err := prepareStripRowBounds(curr, y, len(dst), 8)
 	if err != nil {
 		return err
 	}
@@ -1826,7 +2028,7 @@ func (c *ColorConverter) convertStripRowNRGBA64(ctx context.Context, prev, curr,
 			return ctx.Err()
 		}
 	}
-	return c.walkStripRow(ctx, prev, curr, next, row, width, height, func(x int, values []float64, alpha float64) error {
+	return c.walkStripRowNeighbors(ctx, neighbors, curr, row, width, height, func(x int, values []float64, alpha float64) error {
 		red, green, blue, err := c.displayPixel(ctx, curr.info, values, alpha)
 		if err != nil {
 			return err
@@ -1838,15 +2040,28 @@ func (c *ColorConverter) convertStripRowNRGBA64(ctx context.Context, prev, curr,
 	})
 }
 
-// convertStripRowLinear 执行未裁剪D65线性scRGB RGBA逐行及跨带转换
+// convertStripRowLinear 执行未裁剪D65线性scRGB RGBA逐行及上下跨带转换
 // 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dst 目标线性scRGB浮点切片
 // 返回: error 参数、坐标、色彩、数值、变换或取消错误
 func (c *ColorConverter) convertStripRowLinear(ctx context.Context, prev, curr, next *Raster, y int, dst []float64) error {
-	row, width, height, err := c.prepareStripRow(ctx, prev, curr, next, y, len(dst), 4)
+	if err := c.checkStripNeighbors(prev, curr, next); err != nil {
+		return err
+	}
+	return c.convertStripNeighborsLinear(ctx, jxrStripNeighbors{top: prev, bottom: next}, curr, y, dst)
+}
+
+// convertStripNeighborsLinear 在已校验邻带几何上执行未裁剪D65线性scRGB RGBA逐行及跨带转换
+// 入参: ctx 已规范化Context, neighbors 上下或左右邻带, curr 当前条带, y 目标行坐标, dst 目标线性scRGB浮点切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) convertStripNeighborsLinear(ctx context.Context, neighbors jxrStripNeighbors, curr *Raster, y int, dst []float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	row, width, height, err := prepareStripRowBounds(curr, y, len(dst), 4)
 	if err != nil {
 		return err
 	}
-	return c.walkStripRow(ctx, prev, curr, next, row, width, height, func(x int, values []float64, alpha float64) error {
+	return c.walkStripRowNeighbors(ctx, neighbors, curr, row, width, height, func(x int, values []float64, alpha float64) error {
 		red, green, blue, err := c.linearPixel(ctx, curr.info, values, alpha)
 		if err != nil {
 			return err
@@ -1857,15 +2072,28 @@ func (c *ColorConverter) convertStripRowLinear(ctx context.Context, prev, curr, 
 	})
 }
 
-// convertStripRowXYZ 执行D50 PCS XYZ与原透明度逐行及跨带转换
+// convertStripRowXYZ 执行D50 PCS XYZ与原透明度逐行及上下跨带转换
 // 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, y 目标行坐标, dst 目标D50 XYZ与Alpha浮点切片
 // 返回: error 参数、坐标、色彩、数值、变换或取消错误
 func (c *ColorConverter) convertStripRowXYZ(ctx context.Context, prev, curr, next *Raster, y int, dst []float64) error {
-	row, width, height, err := c.prepareStripRow(ctx, prev, curr, next, y, len(dst), 4)
+	if err := c.checkStripNeighbors(prev, curr, next); err != nil {
+		return err
+	}
+	return c.convertStripNeighborsXYZ(ctx, jxrStripNeighbors{top: prev, bottom: next}, curr, y, dst)
+}
+
+// convertStripNeighborsXYZ 在已校验邻带几何上执行D50 PCS XYZ与原透明度逐行及跨带转换
+// 入参: ctx 已规范化Context, neighbors 上下或左右邻带, curr 当前条带, y 目标行坐标, dst 目标D50 XYZ与Alpha浮点切片
+// 返回: error 参数、坐标、色彩、数值、变换或取消错误
+func (c *ColorConverter) convertStripNeighborsXYZ(ctx context.Context, neighbors jxrStripNeighbors, curr *Raster, y int, dst []float64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	row, width, height, err := prepareStripRowBounds(curr, y, len(dst), 4)
 	if err != nil {
 		return err
 	}
-	return c.walkStripRow(ctx, prev, curr, next, row, width, height, func(x int, values []float64, alpha float64) error {
+	return c.walkStripRowNeighbors(ctx, neighbors, curr, row, width, height, func(x int, values []float64, alpha float64) error {
 		vx, vy, vz, err := c.xyzPixel(ctx, curr.info, values, alpha)
 		if err != nil {
 			return err
@@ -1876,10 +2104,10 @@ func (c *ColorConverter) convertStripRowXYZ(ctx context.Context, prev, curr, nex
 	})
 }
 
-// walkStripRow 在单行内为各分量执行零分配栈上采样并驱动逐像素输出回调，支持跨带边界读取上下邻带色度
-// 入参: ctx 已规范化Context, prev 上方行带, curr 当前行带, next 下方行带, row 零起点行号, width,height 当前带尺寸, emit 单像素输出回调
+// walkStripRowNeighbors 在单行内为各分量执行零分配栈上采样并驱动逐像素输出回调，支持跨带边界读取上下或左右邻带色度
+// 入参: ctx 已规范化Context, neighbors 上下或左右邻带, curr 当前条带, row 零起点行号, width,height 当前带尺寸, emit 单像素输出回调
 // 返回: error 采样、色彩或取消错误
-func (c *ColorConverter) walkStripRow(ctx context.Context, prev, curr, next *Raster, row, width, height int, emit func(int, []float64, float64) error) error {
+func (c *ColorConverter) walkStripRowNeighbors(ctx context.Context, neighbors jxrStripNeighbors, curr *Raster, row, width, height int, emit func(int, []float64, float64) error) error {
 	count := len(curr.info.Components)
 	var valueStorage [9]float64
 	values := valueStorage[:]
@@ -1888,26 +2116,31 @@ func (c *ColorConverter) walkStripRow(ctx context.Context, prev, curr, next *Ras
 	} else {
 		values = values[:count]
 	}
-	hasPrev, hasNext := prev != nil, next != nil
-	useNearestFast := c.filter == ResampleNearest && !hasPrev && !hasNext && curr.Bounds().Min == (image.Point{})
-	var currStorage, prevStorage, nextStorage [9]Component
-	var currComps, prevComps, nextComps []Component
+	horizontal := neighbors.left != nil || neighbors.right != nil
+	firstRaster, secondRaster := neighbors.top, neighbors.bottom
+	if horizontal {
+		firstRaster, secondRaster = neighbors.left, neighbors.right
+	}
+	hasFirst, hasSecond := firstRaster != nil, secondRaster != nil
+	useNearestFast := c.filter == ResampleNearest && !hasFirst && !hasSecond && curr.Bounds().Min == (image.Point{})
+	var currStorage, firstStorage, secondStorage [9]Component
+	var currComps, firstComps, secondComps []Component
 	if !useNearestFast {
 		if count > len(currStorage) {
 			currComps = make([]Component, count)
-			if hasPrev {
-				prevComps = make([]Component, count)
+			if hasFirst {
+				firstComps = make([]Component, count)
 			}
-			if hasNext {
-				nextComps = make([]Component, count)
+			if hasSecond {
+				secondComps = make([]Component, count)
 			}
 		} else {
 			currComps = currStorage[:count]
-			if hasPrev {
-				prevComps = prevStorage[:count]
+			if hasFirst {
+				firstComps = firstStorage[:count]
 			}
-			if hasNext {
-				nextComps = nextStorage[:count]
+			if hasSecond {
+				secondComps = secondStorage[:count]
 			}
 		}
 		for index := range count {
@@ -1916,14 +2149,14 @@ func (c *ColorConverter) walkStripRow(ctx context.Context, prev, curr, next *Ras
 			if err != nil {
 				return err
 			}
-			if hasPrev {
-				prevComps[index], err = prev.component(index)
+			if hasFirst {
+				firstComps[index], err = firstRaster.component(index)
 				if err != nil {
 					return err
 				}
 			}
-			if hasNext {
-				nextComps[index], err = next.component(index)
+			if hasSecond {
+				secondComps[index], err = secondRaster.component(index)
 				if err != nil {
 					return err
 				}
@@ -1942,15 +2175,15 @@ func (c *ColorConverter) walkStripRow(ctx context.Context, prev, curr, next *Ras
 			}
 		} else {
 			for index := range count {
-				var prevComp, nextComp Component
-				if hasPrev {
-					prevComp = prevComps[index]
+				var firstComp, secondComp Component
+				if hasFirst {
+					firstComp = firstComps[index]
 				}
-				if hasNext {
-					nextComp = nextComps[index]
+				if hasSecond {
+					secondComp = secondComps[index]
 				}
 				var err error
-				values[index], err = displayJXRStripSample(prevComp, currComps[index], nextComp, hasPrev, hasNext, x, row, width, height, c.filter)
+				values[index], err = displayJXRStripSampleNeighbors(firstComp, currComps[index], secondComp, hasFirst, hasSecond, horizontal, x, row, width, height, c.filter)
 				if err != nil {
 					return err
 				}
@@ -2024,34 +2257,56 @@ func (c *ColorConverter) xyzPixel(ctx context.Context, info Info, values []float
 	return xyz[0], xyz[1], xyz[2], nil
 }
 
-// displayJXRStripSample 在当前行带及可选上下邻带内按分量相位采样，双线性模式下无缝跨带读取相邻色度行
-// 入参: prevComp,currComp,nextComp 三带同一分量视图, hasPrev,hasNext 是否存在上下邻带, x,row 零起点显示坐标, width,height 当前带尺寸, filter 采样滤波
+// displayJXRStripSampleNeighbors 在当前带及上下或左右邻带内按分量相位采样，双线性模式下无缝跨带读取相邻色度行或列
+// 入参: firstComp,currComp,secondComp 三带同一分量视图, hasFirst,hasSecond 是否存在前后邻带, horizontal 是否左右拼接, x,row 零起点显示坐标, width,height 当前带尺寸, filter 采样滤波
 // 返回: float64 采样数值, error 样本或非有限插值错误
-func displayJXRStripSample(prevComp, currComp, nextComp Component, hasPrev, hasNext bool, x, row, width, height int, filter ResampleFilter) (float64, error) {
+func displayJXRStripSampleNeighbors(firstComp, currComp, secondComp Component, hasFirst, hasSecond, horizontal bool, x, row, width, height int, filter ResampleFilter) (float64, error) {
 	info := currComp.info
 	if info.XStep == 1 && info.YStep == 1 && info.Bounds.Dx() == width && info.Bounds.Dy() == height {
 		return currComp.sampleAt(info.Bounds.Min.X+x, info.Bounds.Min.Y+row)
 	}
 	offsetX := jxrEffectiveOffset(info.XOffset, info.XStep, info.XPositionKnown)
 	offsetY := jxrEffectiveOffset(info.YOffset, info.YStep, info.YPositionKnown)
-	x0, x1, fx := resampleJXRAxis(x, width, width, info.Bounds.Dx(), offsetX, info.XStep)
-	currH := info.Bounds.Dy()
-	minY, maxY := 0, currH-1
-	if hasPrev && prevComp.info.Bounds.Dy() > 0 {
-		minY = -1
+	currW, currH := info.Bounds.Dx(), info.Bounds.Dy()
+	var x0, x1, y0, y1 int
+	var fx, fy float64
+	if horizontal {
+		minX, maxX := 0, currW-1
+		if hasFirst {
+			minX = -1
+		}
+		if hasSecond {
+			maxX = currW
+		}
+		posX := (float64(x) - offsetX) / float64(info.XStep)
+		if posX < float64(minX) {
+			posX = float64(minX)
+		} else if posX > float64(maxX) {
+			posX = float64(maxX)
+		}
+		x0 = int(math.Floor(posX))
+		x1 = min(x0+1, maxX)
+		fx = posX - float64(x0)
+		y0, y1, fy = resampleJXRAxis(row, height, height, currH, offsetY, info.YStep)
+	} else {
+		x0, x1, fx = resampleJXRAxis(x, width, width, currW, offsetX, info.XStep)
+		minY, maxY := 0, currH-1
+		if hasFirst {
+			minY = -1
+		}
+		if hasSecond {
+			maxY = currH
+		}
+		posY := (float64(row) - offsetY) / float64(info.YStep)
+		if posY < float64(minY) {
+			posY = float64(minY)
+		} else if posY > float64(maxY) {
+			posY = float64(maxY)
+		}
+		y0 = int(math.Floor(posY))
+		y1 = min(y0+1, maxY)
+		fy = posY - float64(y0)
 	}
-	if hasNext && nextComp.info.Bounds.Dy() > 0 {
-		maxY = currH
-	}
-	posY := (float64(row) - offsetY) / float64(info.YStep)
-	if posY < float64(minY) {
-		posY = float64(minY)
-	} else if posY > float64(maxY) {
-		posY = float64(maxY)
-	}
-	y0 := int(math.Floor(posY))
-	y1 := min(y0+1, maxY)
-	fy := posY - float64(y0)
 	if filter == ResampleNearest {
 		if fx >= 0.5 {
 			x0 = x1
@@ -2059,17 +2314,17 @@ func displayJXRStripSample(prevComp, currComp, nextComp Component, hasPrev, hasN
 		if fy >= 0.5 {
 			y0 = y1
 		}
-		return jxrStripComponentSample(prevComp, currComp, nextComp, currH, x0, y0)
+		return jxrStripComponentSampleNeighbors(firstComp, currComp, secondComp, horizontal, currW, currH, x0, y0)
 	}
 	if fx == 0 && fy == 0 {
-		return jxrStripComponentSample(prevComp, currComp, nextComp, currH, x0, y0)
+		return jxrStripComponentSampleNeighbors(firstComp, currComp, secondComp, horizontal, currW, currH, x0, y0)
 	}
 	var values [4]float64
 	for index, point := range [4]image.Point{{X: x0, Y: y0}, {X: x1, Y: y0}, {X: x0, Y: y1}, {X: x1, Y: y1}} {
 		if index&1 != 0 && fx == 0 || index&2 != 0 && fy == 0 {
 			continue
 		}
-		value, err := jxrStripComponentSample(prevComp, currComp, nextComp, currH, point.X, point.Y)
+		value, err := jxrStripComponentSampleNeighbors(firstComp, currComp, secondComp, horizontal, currW, currH, point.X, point.Y)
 		if err != nil {
 			return 0, err
 		}
@@ -2081,15 +2336,24 @@ func displayJXRStripSample(prevComp, currComp, nextComp Component, hasPrev, hasN
 	return (values[0]*(1-fx)+values[1]*fx)*(1-fy) + (values[2]*(1-fx)+values[3]*fx)*fy, nil
 }
 
-// jxrStripComponentSample 按跨带局部纵坐标从当前带或上下邻带边界行读取单个分量样本
-// 入参: prevComp,currComp,nextComp 三带分量视图, currH 当前带分量高度, cx,cy 分量局部坐标
+// jxrStripComponentSampleNeighbors 按跨带局部坐标从当前带或上下/左右邻带边界读取单个分量样本
+// 入参: firstComp,currComp,secondComp 三带分量视图, horizontal 是否左右拼接, currW,currH 当前带分量尺寸, cx,cy 分量局部坐标
 // 返回: float64 分量数值, error 坐标或视图错误
-func jxrStripComponentSample(prevComp, currComp, nextComp Component, currH, cx, cy int) (float64, error) {
+func jxrStripComponentSampleNeighbors(firstComp, currComp, secondComp Component, horizontal bool, currW, currH, cx, cy int) (float64, error) {
+	if horizontal {
+		if cx < 0 {
+			return firstComp.sampleAt(firstComp.info.Bounds.Max.X-1, firstComp.info.Bounds.Min.Y+cy)
+		}
+		if cx >= currW {
+			return secondComp.sampleAt(secondComp.info.Bounds.Min.X, secondComp.info.Bounds.Min.Y+cy)
+		}
+		return currComp.sampleAt(currComp.info.Bounds.Min.X+cx, currComp.info.Bounds.Min.Y+cy)
+	}
 	if cy < 0 {
-		return prevComp.sampleAt(prevComp.info.Bounds.Min.X+cx, prevComp.info.Bounds.Max.Y-1)
+		return firstComp.sampleAt(firstComp.info.Bounds.Min.X+cx, firstComp.info.Bounds.Max.Y-1)
 	}
 	if cy >= currH {
-		return nextComp.sampleAt(nextComp.info.Bounds.Min.X+cx, nextComp.info.Bounds.Min.Y)
+		return secondComp.sampleAt(secondComp.info.Bounds.Min.X+cx, secondComp.info.Bounds.Min.Y)
 	}
 	return currComp.sampleAt(currComp.info.Bounds.Min.X+cx, currComp.info.Bounds.Min.Y+cy)
 }

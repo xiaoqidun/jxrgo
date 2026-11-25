@@ -262,9 +262,10 @@ type ImageDescription struct {
 }
 
 // EncodeOptions 指定编码格式、布局、精度、并发、元数据与资源上限，零值采用无损JXR及全部频带
-// TileSize以编码网格像素计且须为十六倍数，仅Lossy允许精度损失与Subsampling下采样，SeparateAlpha写入独立透明度码流
-// Profiles指定档次与级别声明，ICCProfile、ColorHint、ColorEncoding、EXIF、GPS、XMP、IPTC与Description非空时优先于源Info写入容器；Uncompressed启用0xBC03无压缩容器模式
-// Window指定编码窗口边距，ChromaCenteringX与ChromaCenteringY指定色度采样相位（0至4或7）；Workers零值自动，MaxOutputBytes零值采用64MiB
+// TileSize以编码网格像素计且须为十六倍数，仅Lossy或Quality(1至99)允许精度损失与Subsampling下采样，SeparateAlpha写入独立透明度码流
+// Quality取0保持默认无损或显式Quantization，取1至100且未手动指定Quantization时自动映射标准T.832量化参数；Resolution非nil时优先于源Info写入0xBC82/0xBC83
+// PreserveYCbCr为真时Encode与EncodeContext对边界对齐的4:4:4/4:2:2/4:2:0标准YCbCr保留原生YCC分量；Profiles、ICCProfile、ColorHint、ColorEncoding、EXIF、GPS、XMP、IPTC与Description非空时优先于源Info写入容器
+// Uncompressed启用0xBC03无压缩容器模式，Window指定编码窗口边距，ChromaCenteringX与ChromaCenteringY指定色度采样相位（0至4或7）；Workers零值自动，MaxOutputBytes零值采用64MiB
 type EncodeOptions struct {
 	Format                   Format
 	Layout                   Layout
@@ -274,6 +275,8 @@ type EncodeOptions struct {
 	TileSize                 image.Point
 	HardTiles                bool
 	Lossy                    bool
+	Quality                  int
+	PreserveYCbCr            bool
 	LegacyHighpassPrediction bool
 	Workers                  int
 	Band                     Band
@@ -286,6 +289,7 @@ type EncodeOptions struct {
 	SeparateAlpha            bool
 	MirrorSeparateAlpha      bool
 	Profiles                 []ProfileLevel
+	Resolution               *Resolution
 	ICCProfile               []byte
 	ColorHint                *ColorHint
 	ColorEncoding            *ColorEncoding
@@ -594,52 +598,78 @@ func (r *Raster) ReadRowNRGBA(y int, dst []byte) error {
 // 入参: y 图像行坐标, dst 目标八位RGBA字节缓冲
 // 返回: error 参数、坐标、缓冲或格式能力错误
 func (r *Raster) readRowNRGBA(y int, dst []byte) error {
-	if r == nil || r.Bounds().Empty() {
-		return fmt.Errorf("%w: nil or empty raster", ErrInvalid)
+	if r != nil && r.info.ColorSpace == ColorRGB && r.info.Channels == 3 && len(r.info.Components) > 0 && r.info.Components[0].Format == SampleRGBE {
+		_, row, width, stride, err := r.prepareRowBounds(y, len(dst), 4)
+		if err != nil {
+			return err
+		}
+		return r.readRowRGBENRGBA(row, width, stride, dst)
 	}
-	bounds := r.Bounds()
-	width, height := bounds.Dx(), bounds.Dy()
-	row := y - bounds.Min.Y
-	if row < 0 || row >= height || len(dst) < width*4 {
-		return fmt.Errorf("%w: raster row or destination", ErrInvalid)
+	rowBase, width, precision, interleaved, err := r.prepareIntegerRow(y, len(dst), 4, true)
+	if err != nil {
+		return err
 	}
 	info := r.info
-	stride := info.Channels
-	if info.Alpha {
-		stride++
-	}
-	if len(info.Components) != stride {
-		return fmt.Errorf("%w: raster components", ErrInvalid)
-	}
 	isGray := info.ColorSpace == ColorGray && info.Channels == 1
 	isRGB := info.ColorSpace == ColorRGB && info.Channels == 3
 	if !isGray && !isRGB {
 		return fmt.Errorf("%w: integer NRGBA row color space", ErrUnsupported)
 	}
-	if isRGB && info.Components[0].Format == SampleRGBE {
-		return r.readRowRGBENRGBA(row, width, stride, dst)
-	}
-	precision := info.Components[0].Precision
-	if precision != 8 && precision != 16 {
-		return fmt.Errorf("%w: integer NRGBA row bit depth", ErrUnsupported)
-	}
-	for _, comp := range info.Components {
-		if comp.Format != SampleUnsigned || comp.Inverted || comp.Precision != precision || comp.XStep != 1 || comp.YStep != 1 || comp.Bounds != bounds {
-			return fmt.Errorf("%w: integer NRGBA row component layout", ErrUnsupported)
-		}
-	}
-	interleaved, err := r.checkIntegerRowStorage(bounds, info.Channels, info.Alpha, stride)
-	if err != nil {
-		return err
-	}
 	dst = dst[:width*4]
-	rowBase := row * width
 	if precision == 8 {
 		r.readRowNRGBA8(rowBase, width, isGray, info.Alpha, info.Premultiplied, interleaved, dst)
 	} else {
 		r.readRowNRGBA16(rowBase, width, isGray, info.Alpha, info.Premultiplied, interleaved, dst)
 	}
 	return nil
+}
+
+// prepareRowBounds 校验光栅非空性、行范围、行字节长度及分量总数
+// 入参: y 行坐标, bufLen 行缓冲字节长度, bytesPerPixel 每像素字节数
+// 返回: image.Rectangle 图像范围, int 零起点行号, int 图像宽度, int 分量总数, error 参数或坐标错误
+func (r *Raster) prepareRowBounds(y, bufLen, bytesPerPixel int) (image.Rectangle, int, int, int, error) {
+	if r == nil || r.Bounds().Empty() {
+		return image.Rectangle{}, 0, 0, 0, fmt.Errorf("%w: nil or empty raster", ErrInvalid)
+	}
+	bounds := r.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	row := y - bounds.Min.Y
+	if row < 0 || row >= height || int64(bufLen) < int64(width)*int64(bytesPerPixel) {
+		return image.Rectangle{}, 0, 0, 0, fmt.Errorf("%w: raster row or buffer", ErrInvalid)
+	}
+	stride := r.info.Channels
+	if r.info.Alpha {
+		stride++
+	}
+	if len(r.info.Components) != stride {
+		return image.Rectangle{}, 0, 0, 0, fmt.Errorf("%w: raster components", ErrInvalid)
+	}
+	return bounds, row, width, stride, nil
+}
+
+// prepareIntegerRow 校验整数行读写目标的非空性、行界、缓冲长度与无符号整数存储布局
+// 入参: y 行坐标, bufLen 行缓冲字节长度, bytesPerPixel 每像素字节数, allowPrecision8 是否接受八位样本
+// 返回: int 零起点行偏移, int 行宽, uint8 样本位深, bool 是否交织存储, error 参数、坐标或能力错误
+func (r *Raster) prepareIntegerRow(y, bufLen, bytesPerPixel int, allowPrecision8 bool) (int, int, uint8, bool, error) {
+	bounds, row, width, stride, err := r.prepareRowBounds(y, bufLen, bytesPerPixel)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	info := r.info
+	precision := info.Components[0].Precision
+	if precision != 16 && (!allowPrecision8 || precision != 8) {
+		return 0, 0, 0, false, fmt.Errorf("%w: integer row bit depth", ErrUnsupported)
+	}
+	for _, comp := range info.Components {
+		if comp.Format != SampleUnsigned || comp.Inverted || comp.Precision != precision || comp.XStep != 1 || comp.YStep != 1 || comp.Bounds != bounds {
+			return 0, 0, 0, false, fmt.Errorf("%w: integer row component layout", ErrUnsupported)
+		}
+	}
+	interleaved, err := r.checkIntegerRowStorage(bounds, info.Channels, info.Alpha, stride)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	return row * width, width, precision, interleaved, nil
 }
 
 // checkIntegerRowStorage 校验纯整数行读取所需的十六位紧凑交织或分平面底层存储布局
@@ -960,18 +990,391 @@ func (r *Raster) ReadRowCMYKAlpha(y int, cmyk, alpha []byte) error {
 	return nil
 }
 
+// WriteRowNRGBA 将紧凑八位非预乘RGBA扫描行零分配写入原生八位或十六位非预乘无符号RGB图像
+// src长度须不少于图像宽度乘以四；十六位目标按乘以257精确扩展，目标无Alpha时忽略源Alpha字节；预乘、非RGB或不支持的位深返回ErrUnsupported
+// 入参: y 图像行坐标, src 源八位非预乘RGBA字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) WriteRowNRGBA(y int, src []byte) error {
+	if err := r.writeRowNRGBA(y, src); err != nil {
+		return wrapJXRError("Raster.WriteRowNRGBA", err)
+	}
+	return nil
+}
+
+// WriteRowNRGBA64 将大端十六位非预乘RGBA扫描行零分配写入原生十六位非预乘无符号RGB图像
+// src长度须不少于图像宽度乘以八，字节序与image.NRGBA64.Pix一致；目标无Alpha时忽略源Alpha字；预乘、非RGB或非十六位返回ErrUnsupported
+// 入参: y 图像行坐标, src 源大端十六位非预乘RGBA字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) WriteRowNRGBA64(y int, src []byte) error {
+	if err := r.writeRowNRGBA64(y, src); err != nil {
+		return wrapJXRError("Raster.WriteRowNRGBA64", err)
+	}
+	return nil
+}
+
+// WriteRowGray 将紧凑八位灰度扫描行零分配写入原生八位或十六位无Alpha无符号灰度图像
+// src长度须不少于图像宽度；十六位目标按乘以257精确扩展；含Alpha、非灰度或不支持的位深返回ErrUnsupported
+// 入参: y 图像行坐标, src 源八位灰度字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) WriteRowGray(y int, src []byte) error {
+	if err := r.writeRowGray(y, src); err != nil {
+		return wrapJXRError("Raster.WriteRowGray", err)
+	}
+	return nil
+}
+
+// WriteRowGray16 将大端十六位灰度扫描行零分配写入原生十六位无Alpha无符号灰度图像
+// src长度须不少于图像宽度乘以二，字节序与image.Gray16.Pix一致；含Alpha、非灰度或非十六位返回ErrUnsupported
+// 入参: y 图像行坐标, src 源大端十六位灰度字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) WriteRowGray16(y int, src []byte) error {
+	if err := r.writeRowGray16(y, src); err != nil {
+		return wrapJXRError("Raster.WriteRowGray16", err)
+	}
+	return nil
+}
+
+// WriteRowCMYK 将紧凑八位CMYK扫描行零分配写入原生八位或十六位非预乘无符号CMYK或CMYKDirect图像
+// src长度须不少于图像宽度乘以四；十六位目标按乘以257精确扩展，目标含Alpha时自动填充不透明；预乘或非CMYK返回ErrUnsupported
+// 入参: y 图像行坐标, src 源八位CMYK字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) WriteRowCMYK(y int, src []byte) error {
+	if err := r.writeRowCMYK(y, src, nil); err != nil {
+		return wrapJXRError("Raster.WriteRowCMYK", err)
+	}
+	return nil
+}
+
+// WriteRowCMYKAlpha 将紧凑八位CMYK及可选独立八位Alpha扫描行零分配写入原生八位或十六位非预乘无符号CMYK或CMYKDirect图像
+// cmyk长度须不少于图像宽度乘以四，alpha非nil时长度须不少于图像宽度（目标含Alpha且alpha为nil时填充不透明，目标无Alpha时忽略alpha）；不支持预乘CMYK
+// 入参: y 图像行坐标, cmyk 源八位CMYK字节缓冲, alpha 可选独立八位Alpha字节缓冲
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) WriteRowCMYKAlpha(y int, cmyk, alpha []byte) error {
+	if err := r.writeRowCMYK(y, cmyk, alpha); err != nil {
+		return wrapJXRError("Raster.WriteRowCMYKAlpha", err)
+	}
+	return nil
+}
+
+// writeRowNRGBA 执行八位非预乘RGBA到原生八位或十六位RGB图像的零分配批量行写入
+// 入参: y 行坐标, src 源八位RGBA字节切片
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) writeRowNRGBA(y int, src []byte) error {
+	rowBase, width, precision, interleaved, err := r.prepareIntegerRow(y, len(src), 4, true)
+	if err != nil {
+		return err
+	}
+	info := r.info
+	if info.ColorSpace != ColorRGB || info.Channels != 3 || info.Premultiplied {
+		return fmt.Errorf("%w: integer NRGBA row write color space", ErrUnsupported)
+	}
+	src = src[:width*4]
+	_ = src[width*4-1]
+	if interleaved {
+		stride := 3
+		if info.Alpha {
+			stride = 4
+		}
+		dst := r.native.values[rowBase*stride : (rowBase+width)*stride]
+		_ = dst[width*stride-1]
+		if precision == 8 {
+			if !info.Alpha {
+				for x := range width {
+					si, di := x*4, x*3
+					dst[di], dst[di+1], dst[di+2] = uint16(src[si]), uint16(src[si+1]), uint16(src[si+2])
+				}
+				return nil
+			}
+			for x := range width {
+				o := x * 4
+				dst[o], dst[o+1], dst[o+2], dst[o+3] = uint16(src[o]), uint16(src[o+1]), uint16(src[o+2]), uint16(src[o+3])
+			}
+			return nil
+		}
+		if !info.Alpha {
+			for x := range width {
+				si, di := x*4, x*3
+				dst[di], dst[di+1], dst[di+2] = uint16(src[si])*257, uint16(src[si+1])*257, uint16(src[si+2])*257
+			}
+			return nil
+		}
+		for x := range width {
+			o := x * 4
+			dst[o], dst[o+1], dst[o+2], dst[o+3] = uint16(src[o])*257, uint16(src[o+1])*257, uint16(src[o+2])*257, uint16(src[o+3])*257
+		}
+		return nil
+	}
+	r0 := r.planes[0].values[rowBase : rowBase+width]
+	g0 := r.planes[1].values[rowBase : rowBase+width]
+	b0 := r.planes[2].values[rowBase : rowBase+width]
+	_ = r0[width-1]
+	_ = g0[width-1]
+	_ = b0[width-1]
+	if precision == 8 {
+		if !info.Alpha {
+			for x := range width {
+				o := x * 4
+				r0[x], g0[x], b0[x] = uint16(src[o]), uint16(src[o+1]), uint16(src[o+2])
+			}
+			return nil
+		}
+		a0 := r.planes[3].values[rowBase : rowBase+width]
+		_ = a0[width-1]
+		for x := range width {
+			o := x * 4
+			r0[x], g0[x], b0[x], a0[x] = uint16(src[o]), uint16(src[o+1]), uint16(src[o+2]), uint16(src[o+3])
+		}
+		return nil
+	}
+	if !info.Alpha {
+		for x := range width {
+			o := x * 4
+			r0[x], g0[x], b0[x] = uint16(src[o])*257, uint16(src[o+1])*257, uint16(src[o+2])*257
+		}
+		return nil
+	}
+	a0 := r.planes[3].values[rowBase : rowBase+width]
+	_ = a0[width-1]
+	for x := range width {
+		o := x * 4
+		r0[x], g0[x], b0[x], a0[x] = uint16(src[o])*257, uint16(src[o+1])*257, uint16(src[o+2])*257, uint16(src[o+3])*257
+	}
+	return nil
+}
+
+// writeRowNRGBA64 执行大端十六位非预乘RGBA到原生十六位RGB图像的零分配批量行写入
+// 入参: y 行坐标, src 源大端十六位RGBA字节切片
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) writeRowNRGBA64(y int, src []byte) error {
+	rowBase, width, _, interleaved, err := r.prepareIntegerRow(y, len(src), 8, false)
+	if err != nil {
+		return err
+	}
+	info := r.info
+	if info.ColorSpace != ColorRGB || info.Channels != 3 || info.Premultiplied {
+		return fmt.Errorf("%w: integer NRGBA64 row write color space", ErrUnsupported)
+	}
+	src = src[:width*8]
+	_ = src[width*8-1]
+	if interleaved {
+		stride := 3
+		if info.Alpha {
+			stride = 4
+		}
+		dst := r.native.values[rowBase*stride : (rowBase+width)*stride]
+		_ = dst[width*stride-1]
+		if !info.Alpha {
+			for x := range width {
+				si, di := x*8, x*3
+				dst[di] = uint16(src[si])<<8 | uint16(src[si+1])
+				dst[di+1] = uint16(src[si+2])<<8 | uint16(src[si+3])
+				dst[di+2] = uint16(src[si+4])<<8 | uint16(src[si+5])
+			}
+			return nil
+		}
+		for x := range width {
+			si, di := x*8, x*4
+			dst[di] = uint16(src[si])<<8 | uint16(src[si+1])
+			dst[di+1] = uint16(src[si+2])<<8 | uint16(src[si+3])
+			dst[di+2] = uint16(src[si+4])<<8 | uint16(src[si+5])
+			dst[di+3] = uint16(src[si+6])<<8 | uint16(src[si+7])
+		}
+		return nil
+	}
+	r0 := r.planes[0].values[rowBase : rowBase+width]
+	g0 := r.planes[1].values[rowBase : rowBase+width]
+	b0 := r.planes[2].values[rowBase : rowBase+width]
+	_ = r0[width-1]
+	_ = g0[width-1]
+	_ = b0[width-1]
+	if !info.Alpha {
+		for x := range width {
+			o := x * 8
+			r0[x] = uint16(src[o])<<8 | uint16(src[o+1])
+			g0[x] = uint16(src[o+2])<<8 | uint16(src[o+3])
+			b0[x] = uint16(src[o+4])<<8 | uint16(src[o+5])
+		}
+		return nil
+	}
+	a0 := r.planes[3].values[rowBase : rowBase+width]
+	_ = a0[width-1]
+	for x := range width {
+		o := x * 8
+		r0[x] = uint16(src[o])<<8 | uint16(src[o+1])
+		g0[x] = uint16(src[o+2])<<8 | uint16(src[o+3])
+		b0[x] = uint16(src[o+4])<<8 | uint16(src[o+5])
+		a0[x] = uint16(src[o+6])<<8 | uint16(src[o+7])
+	}
+	return nil
+}
+
+// writeRowGray 执行紧凑八位灰度到原生八位或十六位无Alpha灰度图像的零分配批量行写入
+// 入参: y 行坐标, src 源八位灰度字节切片
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) writeRowGray(y int, src []byte) error {
+	rowBase, width, precision, interleaved, err := r.prepareIntegerRow(y, len(src), 1, true)
+	if err != nil {
+		return err
+	}
+	info := r.info
+	if info.ColorSpace != ColorGray || info.Channels != 1 || info.Alpha {
+		return fmt.Errorf("%w: integer gray row write color space", ErrUnsupported)
+	}
+	src = src[:width]
+	var dst []uint16
+	if interleaved {
+		dst = r.native.values[rowBase : rowBase+width]
+	} else {
+		dst = r.planes[0].values[rowBase : rowBase+width]
+	}
+	_ = src[width-1]
+	_ = dst[width-1]
+	if precision == 8 {
+		for x := range width {
+			dst[x] = uint16(src[x])
+		}
+		return nil
+	}
+	for x := range width {
+		dst[x] = uint16(src[x]) * 257
+	}
+	return nil
+}
+
+// writeRowGray16 执行大端十六位灰度到原生十六位无Alpha灰度图像的零分配批量行写入
+// 入参: y 行坐标, src 源大端十六位灰度字节切片
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) writeRowGray16(y int, src []byte) error {
+	rowBase, width, _, interleaved, err := r.prepareIntegerRow(y, len(src), 2, false)
+	if err != nil {
+		return err
+	}
+	info := r.info
+	if info.ColorSpace != ColorGray || info.Channels != 1 || info.Alpha {
+		return fmt.Errorf("%w: integer gray16 row write color space", ErrUnsupported)
+	}
+	src = src[:width*2]
+	var dst []uint16
+	if interleaved {
+		dst = r.native.values[rowBase : rowBase+width]
+	} else {
+		dst = r.planes[0].values[rowBase : rowBase+width]
+	}
+	_ = src[width*2-1]
+	_ = dst[width-1]
+	for x := range width {
+		o := x * 2
+		dst[x] = uint16(src[o])<<8 | uint16(src[o+1])
+	}
+	return nil
+}
+
+// writeRowCMYK 执行八位CMYK及可选独立八位Alpha到原生八位或十六位CMYK图像的零分配批量行写入
+// 入参: y 行坐标, cmyk 源八位CMYK字节切片, alpha 可选源八位Alpha字节切片
+// 返回: error 参数、坐标、缓冲或格式能力错误
+func (r *Raster) writeRowCMYK(y int, cmyk, alpha []byte) error {
+	rowBase, width, precision, interleaved, err := r.prepareIntegerRow(y, len(cmyk), 4, true)
+	if err != nil {
+		return err
+	}
+	if alpha != nil && len(alpha) < width {
+		return fmt.Errorf("%w: CMYK row alpha source", ErrInvalid)
+	}
+	info := r.info
+	if (info.ColorSpace != ColorCMYK && info.ColorSpace != ColorCMYKDirect) || info.Channels != 4 || info.Premultiplied {
+		return fmt.Errorf("%w: integer CMYK row write color space", ErrUnsupported)
+	}
+	cmyk = cmyk[:width*4]
+	_ = cmyk[width*4-1]
+	if alpha != nil {
+		alpha = alpha[:width]
+		_ = alpha[width-1]
+	}
+	if interleaved {
+		stride := 4
+		if info.Alpha {
+			stride = 5
+		}
+		dst := r.native.values[rowBase*stride : (rowBase+width)*stride]
+		_ = dst[width*stride-1]
+		if precision == 8 {
+			for x := range width {
+				si, di := x*4, x*stride
+				dst[di], dst[di+1], dst[di+2], dst[di+3] = uint16(cmyk[si]), uint16(cmyk[si+1]), uint16(cmyk[si+2]), uint16(cmyk[si+3])
+				if info.Alpha {
+					if alpha != nil {
+						dst[di+4] = uint16(alpha[x])
+					} else {
+						dst[di+4] = 255
+					}
+				}
+			}
+			return nil
+		}
+		for x := range width {
+			si, di := x*4, x*stride
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = uint16(cmyk[si])*257, uint16(cmyk[si+1])*257, uint16(cmyk[si+2])*257, uint16(cmyk[si+3])*257
+			if info.Alpha {
+				if alpha != nil {
+					dst[di+4] = uint16(alpha[x]) * 257
+				} else {
+					dst[di+4] = 65535
+				}
+			}
+		}
+		return nil
+	}
+	c0 := r.planes[0].values[rowBase : rowBase+width]
+	m0 := r.planes[1].values[rowBase : rowBase+width]
+	y0 := r.planes[2].values[rowBase : rowBase+width]
+	k0 := r.planes[3].values[rowBase : rowBase+width]
+	_ = c0[width-1]
+	_ = m0[width-1]
+	_ = y0[width-1]
+	_ = k0[width-1]
+	var a0 []uint16
+	if info.Alpha {
+		a0 = r.planes[4].values[rowBase : rowBase+width]
+		_ = a0[width-1]
+	}
+	if precision == 8 {
+		for x := range width {
+			o := x * 4
+			c0[x], m0[x], y0[x], k0[x] = uint16(cmyk[o]), uint16(cmyk[o+1]), uint16(cmyk[o+2]), uint16(cmyk[o+3])
+			if info.Alpha {
+				if alpha != nil {
+					a0[x] = uint16(alpha[x])
+				} else {
+					a0[x] = 255
+				}
+			}
+		}
+		return nil
+	}
+	for x := range width {
+		o := x * 4
+		c0[x], m0[x], y0[x], k0[x] = uint16(cmyk[o])*257, uint16(cmyk[o+1])*257, uint16(cmyk[o+2])*257, uint16(cmyk[o+3])*257
+		if info.Alpha {
+			if alpha != nil {
+				a0[x] = uint16(alpha[x]) * 257
+			} else {
+				a0[x] = 65535
+			}
+		}
+	}
+	return nil
+}
+
 // readRowCMYK 在纯整数域完成八位或十六位CMYK及可选独立Alpha扫描行读取，由公开入口归一化错误
 // 入参: y 图像行坐标, cmyk 目标八位CMYK字节缓冲, alpha 可选独立八位Alpha字节缓冲
 // 返回: error 参数、坐标、缓冲或格式能力错误
 func (r *Raster) readRowCMYK(y int, cmyk, alpha []byte) error {
-	if r == nil || r.Bounds().Empty() {
-		return fmt.Errorf("%w: nil or empty raster", ErrInvalid)
+	if r != nil && !r.Bounds().Empty() && alpha != nil && len(alpha) < r.Bounds().Dx() {
+		return fmt.Errorf("%w: CMYK row alpha destination", ErrInvalid)
 	}
-	bounds := r.Bounds()
-	width, height := bounds.Dx(), bounds.Dy()
-	row := y - bounds.Min.Y
-	if row < 0 || row >= height || len(cmyk) < width*4 || alpha != nil && len(alpha) < width {
-		return fmt.Errorf("%w: CMYK row or destination", ErrInvalid)
+	rowBase, width, precision, interleaved, err := r.prepareIntegerRow(y, len(cmyk), 4, true)
+	if err != nil {
+		return err
 	}
 	info := r.info
 	if (info.ColorSpace != ColorCMYK && info.ColorSpace != ColorCMYKDirect) || info.Channels != 4 {
@@ -984,27 +1387,10 @@ func (r *Raster) readRowCMYK(y int, cmyk, alpha []byte) error {
 	if info.Alpha {
 		stride = 5
 	}
-	if len(info.Components) != stride {
-		return fmt.Errorf("%w: CMYK row components", ErrInvalid)
-	}
-	precision := info.Components[0].Precision
-	if precision != 8 && precision != 16 {
-		return fmt.Errorf("%w: integer CMYK row bit depth", ErrUnsupported)
-	}
-	for _, comp := range info.Components {
-		if comp.Format != SampleUnsigned || comp.Inverted || comp.Precision != precision || comp.XStep != 1 || comp.YStep != 1 || comp.Bounds != bounds {
-			return fmt.Errorf("%w: integer CMYK row component layout", ErrUnsupported)
-		}
-	}
-	interleaved, err := r.checkIntegerRowStorage(bounds, 4, info.Alpha, stride)
-	if err != nil {
-		return err
-	}
 	cmyk = cmyk[:width*4]
 	if alpha != nil {
 		alpha = alpha[:width]
 	}
-	rowBase := row * width
 	if interleaved {
 		src := r.native.values[rowBase*stride : (rowBase+width)*stride]
 		if precision == 8 {
@@ -2068,7 +2454,7 @@ func (c Component) sampleIndex(x, y int) (int, error) {
 	if c.source.alpha {
 		stride++
 	}
-	return (y*c.source.bounds.Dx()+x)*stride + c.index, nil
+	return ((y-c.source.bounds.Min.Y)*c.source.bounds.Dx()+(x-c.source.bounds.Min.X))*stride + c.index, nil
 }
 
 // sampleValueBits 按目标数值格式生成样本位模式，采用最近值及中点取偶舍入

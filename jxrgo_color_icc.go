@@ -559,14 +559,10 @@ func jxrICCMulMatrix(left, columns [3][3]float64) [3][3]float64 {
 	return result
 }
 
-// jxrICCXYZToSRGB 返回ICC注册的sRGB2014色度矩阵之逆
+// jxrICCXYZToSRGB 返回与jxrSRGBToXYZD50精确互逆的ICC D50 PCS到线性sRGB矩阵
 // 返回: [3][3]float64 D50 PCS到线性sRGB的矩阵
 func jxrICCXYZToSRGB() [3][3]float64 {
-	return [3][3]float64{
-		{3.134112153323845, -1.6173924595518705, -0.49063340456472027},
-		{-0.9787872961391832, 1.9162795864266209, 0.03345471423138195},
-		{0.07198304438569493, -0.22898585024754495, 1.4053851315844992},
-	}
+	return jxrXYZD50ToSRGB
 }
 
 // evalOutput 执行可选YCC预处理与ICC核心模型，返回PCS或设备链接目标三通道
@@ -717,7 +713,7 @@ func (mapping *jxrDisplayMapping) color(ctx context.Context, info Info, samples 
 		return red, green, blue, nil
 	}
 	if info.Premultiplied {
-		if !(alpha > 0) {
+		if !(alpha > 0) || !geometryFinite(alpha) {
 			return 0, 0, 0, nil
 		}
 		jxrUnpremultiplyDisplay(samples[:info.Channels], alpha)
@@ -1193,7 +1189,7 @@ func jxrICCLabXYZ(l, a, b float64) [3]float64 {
 	fy := (l + 16) / 116
 	fx := fy + a/500
 	fz := fy - b/200
-	return [3]float64{0.9642 * jxrICCLabInverse(fx), jxrICCLabInverse(fy), 0.8249 * jxrICCLabInverse(fz)}
+	return [3]float64{jxrICCD50White[0] * jxrICCLabInverse(fx), jxrICCD50White[1] * jxrICCLabInverse(fy), jxrICCD50White[2] * jxrICCLabInverse(fz)}
 }
 
 // jxrICCLabInverse 反演CIE Lab分段非线性

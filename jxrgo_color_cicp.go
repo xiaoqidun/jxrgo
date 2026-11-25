@@ -110,6 +110,9 @@ var jxrSRGBToXYZD50 = func() [3][3]float64 {
 	return mapped
 }()
 
+// jxrXYZD50ToSRGB 保存与jxrSRGBToXYZD50精确互逆的ICC D50 PCS XYZ到线性sRGB矩阵
+var jxrXYZD50ToSRGB = jxrInvertCompositionMatrix(jxrSRGBToXYZD50)
+
 // jxrCICPColorDisplay 保存H.273信号的范围、矩阵及传递参数
 type jxrCICPColorDisplay struct {
 	matrix       [3][3]float64
@@ -495,7 +498,7 @@ func jxrRGBChromaticityMatrix(xy [3][2]float64, whiteXY [2]float64) ([3][3]float
 // 返回: float64 非预乘红、绿、蓝sRGB值
 func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha float64) (float64, float64, float64) {
 	if info.Premultiplied {
-		if !(alpha > 0) {
+		if !(alpha > 0) || !geometryFinite(alpha) {
 			return 0, 0, 0
 		}
 		jxrUnpremultiplyDisplay(samples[:info.Channels], alpha)

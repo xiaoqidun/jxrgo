@@ -66,6 +66,7 @@ func encodeJXRSeparateAlpha(ctx context.Context, raster *Raster, options EncodeO
 	if err := checkJXREncodeOptions(options); err != nil {
 		return nil, err
 	}
+	options = jxrResolveEncodeOptions(options)
 	limits := options.Limits.normalized()
 	inputWork, err := jxrRasterWork(raster, limits.MaxMemoryBytes)
 	if err != nil {
@@ -329,20 +330,28 @@ func encodeJXRSeparateRows(ctx context.Context, w io.WriteSeeker, info Info, sou
 	if info.ImageType&ImageTypePreview != 0 {
 		return fmt.Errorf("%w: JPEG XR preview requires corresponding image", ErrInvalid)
 	}
+	_, _, err := encodeJXRSeparateRowsAt(ctx, w, info, source, alpha, options, 8)
+	return err
+}
+
+// encodeJXRSeparateRowsAt 在指定容器目录起点单遍流式写入独立透明度图像，首遍暂存透明度，次遍不再读取原始行源
+// 入参: ctx Context, w 文件输出, info 完整描述, source 共用行缓存, alpha 透明度暂存, options 文件选项, directory 目录起点
+// 返回: uint64 图像结束位置, uint64 当前目录链接位置, error 参数、资源、源、暂存、取消或输出错误
+func encodeJXRSeparateRowsAt(ctx context.Context, w io.WriteSeeker, info Info, source *jxrRowInput, alpha *jxrAlphaRowStorage, options EncodeOptions, directory uint64) (uint64, uint64, error) {
 	info, retained, err := prepareJXRTileInfo(ctx, info, options)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 	input, err := makeJXRSeparateTileInput(ctx, info, options, retained)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 	if alpha.storage != nil {
 		if sameInterfaceTarget(w, alpha.storage) {
-			return fmt.Errorf("%w: row alpha scratch aliases output", ErrInvalid)
+			return 0, 0, fmt.Errorf("%w: row alpha scratch aliases output", ErrInvalid)
 		}
 		if err := seekJXRImageOutput(ctx, alpha.storage, 0); err != nil {
-			return err
+			return 0, 0, err
 		}
 	}
 	read := source.read
@@ -352,7 +361,7 @@ func encodeJXRSeparateRows(ctx context.Context, w io.WriteSeeker, info Info, sou
 		}
 		return alpha.transfer(ctx, &source.row.planes[info.Channels], true)
 	}
-	_, _, err = writeJXRSeparatePacketsAt(ctx, w, input.file, 8, func(index int, maximum uint64) error {
+	return writeJXRSeparatePacketsAt(ctx, w, input.file, directory, func(index int, maximum uint64) error {
 		if index == 1 {
 			if source.next != source.height || alpha.position != alpha.length {
 				return fmt.Errorf("%w: incomplete row alpha scratch", ErrInvalid)
@@ -371,7 +380,6 @@ func encodeJXRSeparateRows(ctx context.Context, w io.WriteSeeker, info Info, sou
 		selected.maxBytes, selected.rowOrder = maximum, true
 		return encodeJXRProjectedTilesTo(ctx, w, input.file.info, input.info[index], &input.file.layout[index], selected, source.load, index == 1, input.mirror)
 	})
-	return err
 }
 
 // transfer 按原生位模式保存或恢复一条透明度行带，不改变精度、预乘状态或浮点特殊值
@@ -471,6 +479,7 @@ func readJXRAlphaRowStorage(ctx context.Context, source io.Reader, target []byte
 // 入参: ctx Context, raster 原生图像, options 已校验文件选项
 // 返回: jxrSeparateInput 常驻输入和编码计划, error 参数、能力、资源或取消错误
 func makeJXRSeparateInput(ctx context.Context, raster *Raster, options EncodeOptions) (jxrSeparateInput, error) {
+	options = jxrResolveEncodeOptions(options)
 	var result jxrSeparateInput
 	limits := options.Limits.normalized()
 	inputWork, err := jxrRasterWork(raster, limits.MaxMemoryBytes)
@@ -672,6 +681,7 @@ func writeJXRSeparatePacketsAt(ctx context.Context, w io.WriteSeeker, file jxrSe
 // 入参: ctx Context, info 已复制原生元数据, options 已校验文件选项, retained 原始元数据及ICC容量
 // 返回: jxrSeparateTileInput 两个真实码流的布局, error 参数、能力、资源或取消错误
 func makeJXRSeparateTileInput(ctx context.Context, info Info, options EncodeOptions, retained uint64) (jxrSeparateTileInput, error) {
+	options = jxrResolveEncodeOptions(options)
 	result := jxrSeparateTileInput{mirror: options.MirrorSeparateAlpha}
 	if !info.Alpha || info.Channels < 1 || len(info.Components) != info.Channels+1 {
 		return result, fmt.Errorf("%w: separate tile alpha source components", ErrInvalid)

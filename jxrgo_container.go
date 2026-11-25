@@ -2292,14 +2292,16 @@ func (parser *jxrParser) profiles(b *jxrBits, end uint64) ([]jxrProfileLevel, er
 // checkProfile 按声明校验已定义的档次及级别，缺省声明采用高级档次和级别255
 // 返回: error 档次或级别约束错误
 func (s *jxrStream) checkProfile() error {
-	count := s.primary.channels
-	if s.alpha != nil {
+	format := jxrCodedFormat(s)
+	hasAlpha := format.alpha || s.alpha != nil
+	count := format.channels
+	if hasAlpha {
 		count++
 	}
 	if len(s.profiles) == 0 {
 		return s.checkLevel(jxrDefaultLevel, count)
 	}
-	return s.checkProfileList(s.profiles, s.alpha != nil, count)
+	return s.checkProfileList(s.profiles, hasAlpha, count)
 }
 
 // checkProfileList 校验给定档次与级别列表是否满足主码流约束
@@ -2357,9 +2359,9 @@ func (s *jxrStream) profileAllowed(profile uint8, alpha bool) bool {
 	}
 }
 
-// checkLevel 检查级别对应的尺寸、分块、头部与缓冲约束，保留级别按不低于它的最近已定义级别处理
+// checkLevel 检查级别对应的尺寸、分块与缓冲约束，保留级别按不低于它的最近已定义级别处理
 // 入参: level 声明或推定的级别, channels 所属声明规定的分量数，包含透明度而不包含填充
-// 返回: error 尺寸、分块、头部或缓冲约束错误
+// 返回: error 尺寸、分块或缓冲约束错误
 func (s *jxrStream) checkLevel(level uint8, channels int) error {
 	limits := [...]jxrLevel{
 		{4, 1 << 10, 1 << 4, 1 << 10, 1 << 22},
@@ -2377,8 +2379,8 @@ func (s *jxrStream) checkLevel(level uint8, channels int) error {
 		h := &s.header
 		width := h.width + uint64(h.left) + uint64(h.right)
 		height := h.height + uint64(h.top) + uint64(h.bottom)
-		if width > limit.dimension || height > limit.dimension || uint64(len(h.columns)-1) > limit.tiles || uint64(len(h.rows)-1) > limit.tiles || limit.level <= 128 && !h.short {
-			return fmt.Errorf("%w: JPEG XR level dimensions or header", ErrInvalid)
+		if width > limit.dimension || height > limit.dimension || uint64(len(h.columns)-1) > limit.tiles || uint64(len(h.rows)-1) > limit.tiles {
+			return fmt.Errorf("%w: JPEG XR level dimensions", ErrInvalid)
 		}
 		for _, boundaries := range [][]uint32{h.columns, h.rows} {
 			for i := 1; i < len(boundaries); i++ {

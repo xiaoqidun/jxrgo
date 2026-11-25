@@ -692,6 +692,10 @@ func (output *jxrStripRowOutput) copy(ctx context.Context, h *jxrHeader, views [
 	output.view.info.Components = output.components
 	output.view.planes = output.planes
 	for index, component := range output.cache.info.Components {
+		if region.Dx()%int(component.XStep) != 0 || region.Dy()%int(component.YStep) != 0 {
+			output.view = Raster{}
+			return fmt.Errorf("%w: JPEG XR strip component alignment", ErrInvalid)
+		}
 		component.Bounds = image.Rect(0, 0, region.Dx()/int(component.XStep), region.Dy()/int(component.YStep))
 		output.components[index] = component
 		plane := output.cache.planes[index]
