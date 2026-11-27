@@ -17,7 +17,6 @@ package jxrgo
 import (
 	"context"
 	"fmt"
-	"slices"
 )
 
 // jxrPrediction 保存反量化前的一项DC及六项低通预测系数和量化索引
@@ -35,7 +34,7 @@ type jxrTileRow struct {
 	residual []uint16
 }
 
-// jxrEncodedMacro 保存供熵编码使用的宏块残差、相邻预测缓存及两种高通方向
+// jxrEncodedMacro 保存供熵编码使用的宏块残差、相邻预测缓存及高通扫描方向
 type jxrEncodedMacro struct {
 	dc       []int64
 	lp       [][16]int64
@@ -46,33 +45,6 @@ type jxrEncodedMacro struct {
 	cache    jxrPrediction
 	dcMode   uint8
 	scanMode uint8
-	highMode uint8
-}
-
-// applyJXRDC 加入或移除同一规范性DC预测，缓存只读且不跨越分块
-// 入参: p 图像平面, values DC系数, left, top, corner 相邻缓存, firstColumn, firstRow 分块边缘, residual 是否移除预测
-// 返回: uint8 预测方向, error 缓冲、缓存或数值错误
-func applyJXRDC(p *jxrPlane, values []int64, left, top, corner *jxrPrediction, firstColumn, firstRow, residual bool) (uint8, error) {
-	if p == nil || len(values) < p.channels {
-		return 3, fmt.Errorf("%w: JPEG XR DC prediction buffer", ErrInvalid)
-	}
-	if err := checkJXRPlaneComponents(p); err != nil {
-		return 3, err
-	}
-	if err := checkJXRWords(values[:p.channels], true); err != nil {
-		return 3, err
-	}
-	if !firstColumn && (left == nil || len(left.values) < p.channels) || !firstRow && (top == nil || len(top.values) < p.channels) || !firstColumn && !firstRow && (corner == nil || len(corner.values) < p.channels) {
-		return 3, fmt.Errorf("%w: JPEG XR DC prediction cache", ErrInvalid)
-	}
-	for i := range p.channels {
-		if !firstColumn && (left.values[i][0] < jxrLongWordMin || left.values[i][0] > jxrLongWordMax) ||
-			!firstRow && (top.values[i][0] < jxrLongWordMin || top.values[i][0] > jxrLongWordMax) ||
-			!firstColumn && !firstRow && (corner.values[i][0] < jxrLongWordMin || corner.values[i][0] > jxrLongWordMax) {
-			return 3, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
-		}
-	}
-	return applyJXRDCChecked(p, values, left, top, corner, firstColumn, firstRow, residual)
 }
 
 // applyJXRDCChecked 在平面、缓冲与相邻缓存静态布局已校验前提下执行规范性DC预测，完整保留标准32位算术字长溢出检查
@@ -137,39 +109,6 @@ func applyJXRDCChecked(p *jxrPlane, values []int64, left, top, corner *jxrPredic
 	return mode, nil
 }
 
-// applyJXRLP 加入或移除低通预测，YUV422链式预测在逆过程先于相邻宏块预测移除
-// 入参: p 图像平面, values 低通系数, dcMode DC方向, index 量化索引, left, top 相邻缓存, residual 是否移除预测
-// 返回: error 缓冲、缓存、方向或数值错误
-func applyJXRLP(p *jxrPlane, values [][16]int64, dcMode, index uint8, left, top *jxrPrediction, residual bool) error {
-	if p == nil || len(values) < p.channels || dcMode > 3 {
-		return fmt.Errorf("%w: JPEG XR lowpass prediction buffer or mode", ErrInvalid)
-	}
-	if err := checkJXRPlaneComponents(p); err != nil {
-		return err
-	}
-	if dcMode == 0 && (left == nil || len(left.values) < p.channels) {
-		return fmt.Errorf("%w: JPEG XR left lowpass prediction cache", ErrInvalid)
-	}
-	if dcMode == 1 && (top == nil || len(top.values) < p.channels) {
-		return fmt.Errorf("%w: JPEG XR top lowpass prediction cache", ErrInvalid)
-	}
-	for i := range p.channels {
-		if err := checkJXRWords(values[i][1:], true); err != nil {
-			return err
-		}
-		if dcMode == 0 && index == left.index {
-			if err := checkJXRWords(left.values[i][:], true); err != nil {
-				return err
-			}
-		} else if dcMode == 1 && index == top.index {
-			if err := checkJXRWords(top.values[i][:], true); err != nil {
-				return err
-			}
-		}
-	}
-	return applyJXRLPChecked(p, values, dcMode, index, left, top, residual)
-}
-
 // applyJXRLPChecked 在平面与相邻缓存已校验前提下执行低通预测，完整保留标准32位算术字长溢出检查
 // 入参: p 已校验图像平面, values 低通系数, dcMode DC方向, index 量化索引, left, top 相邻缓存, residual 是否移除预测
 // 返回: error 数值范围错误
@@ -224,20 +163,6 @@ func applyJXRLPChecked(p *jxrPlane, values [][16]int64, dcMode, index uint8, lef
 	return nil
 }
 
-// storeJXRLow 将反量化前的系数写入已有独立缓存，不分配或替换缓存存储
-// 入参: p 图像平面, dc DC系数, lp 低通系数，nil表示全零, index 量化索引, dst 目标缓存
-// 返回: error 缓冲容量错误
-func storeJXRLow(p *jxrPlane, dc []int64, lp [][16]int64, index uint8, dst *jxrPrediction) error {
-	if p == nil || dst == nil || len(dc) < p.channels || lp != nil && len(lp) < p.channels || len(dst.values) != p.channels {
-		return fmt.Errorf("%w: JPEG XR prediction storage", ErrInvalid)
-	}
-	if err := checkJXRPlaneComponents(p); err != nil {
-		return err
-	}
-	storeJXRLowChecked(p, dc, lp, index, dst)
-	return nil
-}
-
 // storeJXRLowChecked 在平面与预测缓存已预分配校验前提下直接写入预测缓存
 // 入参: p 已校验图像平面, dc DC系数, lp 低通系数，nil表示全零, index 量化索引, dst 已预分配目标缓存
 func storeJXRLowChecked(p *jxrPlane, dc []int64, lp [][16]int64, index uint8, dst *jxrPrediction) {
@@ -261,24 +186,6 @@ func storeJXRLowChecked(p *jxrPlane, dc []int64, lp [][16]int64, index uint8, ds
 			}
 		}
 	}
-}
-
-// jxrHighpassMode 按低通系数强度计算高通方向，多分量格式只用第一分量选择方向
-// 入参: p 图像平面, values 当前阶段的DC及低通系数
-// 返回: uint8 左、上或不预测的方向, error 缓冲或数值错误
-func jxrHighpassMode(p *jxrPlane, values [][16]int64) (uint8, error) {
-	if p == nil || len(values) < p.channels {
-		return 2, fmt.Errorf("%w: JPEG XR highpass direction buffer", ErrInvalid)
-	}
-	if err := checkJXRPlaneComponents(p); err != nil {
-		return 2, err
-	}
-	for i := range p.channels {
-		if err := checkJXRWords(values[i][1:], true); err != nil {
-			return 2, err
-		}
-	}
-	return jxrHighpassModeChecked(p, values)
 }
 
 // jxrHighpassModeChecked 在平面与低通系数范围已校验前提下计算高通方向，保留强度累加的32位溢出检查
@@ -312,13 +219,6 @@ func jxrHighpassModeChecked(p *jxrPlane, values [][16]int64) (uint8, error) {
 	return 2, nil
 }
 
-// residualJXRHigh 按逆块顺序移除宏块内高通预测，不在相邻子块被修改后使用其值
-// 入参: p 平面格式, values 分量步长为256的系数缓冲, mode 左、上或不预测的方向
-// 返回: error 缓冲、方向或数值错误
-func residualJXRHigh(p *jxrPlane, values []int64, mode uint8) error {
-	return applyJXRHighPrediction(p, values, mode, true)
-}
-
 // dequantJXRHigh 按高通量化集合缩放有效块的非DC系数
 // 入参: p 图像平面, values 分量步长为256的高通系数缓冲, q 分块量化参数, index 当前量化集合索引, longWord 是否使用三十二位范围
 // 返回: error 索引、缓冲或数值范围错误
@@ -346,22 +246,6 @@ func dequantJXRHigh(p *jxrPlane, values []int64, q *jxrTileQuant, index int, lon
 		}
 	}
 	return nil
-}
-
-// applyJXRHighPrediction 执行或移除宏块内高通预测，反向处理先访问子块以保留原始邻块值
-// 入参: p 平面格式, values 系数缓冲, mode 预测方向, residual 是否移除预测
-// 返回: error 格式、缓冲、方向或数值错误
-func applyJXRHighPrediction(p *jxrPlane, values []int64, mode uint8, residual bool) error {
-	if err := checkJXRPlaneComponents(p); err != nil {
-		return err
-	}
-	if len(values) < p.channels*256 || mode > 2 {
-		return fmt.Errorf("%w: JPEG XR highpass prediction buffer or mode", ErrInvalid)
-	}
-	if err := checkJXRWords(values[:p.channels*256], true); err != nil {
-		return err
-	}
-	return applyJXRHighPredictionChecked(p, values, mode, residual)
 }
 
 // applyJXRHighPredictionChecked 在平面与系数范围已校验前提下执行高通预测，完整保留标准32位算术字长溢出检查
@@ -517,45 +401,6 @@ func (r *jxrTileRow) advance(x int, current *jxrTileNeighbor) error {
 	return nil
 }
 
-// prepareMacro 按解码逆过程在复用输出缓冲中准备宏块残差，不修改原始变换系数
-// 入参: ctx Context, q 分块量化集合, lpIndex, hpIndex 当前量化索引, m 宏块及相邻缓存, exact 是否要求精确恢复, output 独立且可复用的残差缓冲
-// 返回: error 布局、容量、索引、精度、数值或取消错误
-func (c *jxrCoefficients) prepareMacro(ctx context.Context, q *jxrTileQuant, lpIndex, hpIndex int, m jxrMacroContext, exact bool, output *jxrEncodedMacro) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	p := &c.plane
-	if err := checkJXRPlaneComponents(p); err != nil {
-		return err
-	}
-	if p.bands > 3 || m.at < 0 || m.at >= len(c.info) || output == nil || len(output.high) < p.channels*256 {
-		return fmt.Errorf("%w: JPEG XR encoder macro layout", ErrInvalid)
-	}
-	if uint64(m.at)+1 > uint64(len(c.low))/uint64(p.channels*16) || uint64(m.at)+1 > uint64(len(c.high))/uint64(p.channels*256) {
-		return fmt.Errorf("%w: JPEG XR encoder macro coefficient storage", ErrInvalid)
-	}
-	if q == nil || q.lpCount < 1 || q.lpCount > 16 || q.hpCount < 1 || q.hpCount > 16 || len(q.lp) < q.lpCount || len(q.hp) < q.hpCount || lpIndex < 0 || lpIndex >= q.lpCount || hpIndex < 0 || hpIndex >= q.hpCount {
-		return fmt.Errorf("%w: JPEG XR encoder quantization index", ErrInvalid)
-	}
-	if len(q.dc) != p.channels || len(q.lp[lpIndex]) != p.channels || len(q.hp[hpIndex]) != p.channels {
-		return fmt.Errorf("%w: JPEG XR encoder quantization component count", ErrInvalid)
-	}
-	if p.bands != 3 && q.useDC {
-		if q.lpCount != 1 || !slices.Equal(q.lp[0][:p.channels], q.dc[:p.channels]) {
-			return fmt.Errorf("%w: JPEG XR encoder DC quantization reuse", ErrInvalid)
-		}
-	}
-	if p.bands < 2 && q.useLP {
-		if q.hpCount != q.lpCount || hpIndex != lpIndex || !slices.Equal(q.hp[hpIndex][:p.channels], q.lp[lpIndex][:p.channels]) {
-			return fmt.Errorf("%w: JPEG XR encoder lowpass quantization reuse", ErrInvalid)
-		}
-	}
-	if err := output.prepareLowStorage(p.channels); err != nil {
-		return err
-	}
-	return c.prepareMacroChecked(ctx, q, lpIndex, hpIndex, m, exact, output)
-}
-
 // prepareMacroChecked 在分块静态平面、量化集合与复用残差缓冲已校验前提下准备宏块残差，保留全部动态索引与字长范围检查
 // 入参: ctx Context, q 已校验分块量化集合, lpIndex, hpIndex 当前宏块量化索引, m 宏块及相邻缓存, exact 是否要求精确恢复, output 已初始化残差缓冲
 // 返回: error 索引、精度、数值或取消错误
@@ -565,12 +410,6 @@ func (c *jxrCoefficients) prepareMacroChecked(ctx context.Context, q *jxrTileQua
 		return fmt.Errorf("%w: JPEG XR encoder quantization index", ErrInvalid)
 	}
 	low, high := c.lowMacro(m.at), c.highMacro(m.at)
-	if err := checkJXRWordsContext(ctx, low, c.longWord); err != nil {
-		return err
-	}
-	if err := checkJXRWordsContext(ctx, high, c.longWord); err != nil {
-		return err
-	}
 	values := output.workLow
 	copy(values, low)
 	copy(output.high, high)
@@ -614,7 +453,7 @@ func (c *jxrCoefficients) prepareMacroChecked(ctx context.Context, q *jxrTileQua
 		output.cache.values = make([][7]int64, p.channels)
 	}
 	storeJXRLowChecked(p, output.dc[:p.channels], output.lp[:p.channels], uint8(lpIndex), &output.cache)
-	output.scanMode, output.highMode = 2, 2
+	output.scanMode = 2
 	if p.bands < 2 {
 		if err := c.prepareHighpass(ctx, q, lpIndex, hpIndex, exact, output); err != nil {
 			return err
@@ -663,7 +502,6 @@ func (c *jxrCoefficients) prepareHighpass(ctx context.Context, q *jxrTileQuant, 
 	output.scanMode = mode
 	hp := q.hp[hpIndex]
 	if !p.legacyHighpassPrediction {
-		output.highMode = mode
 		if err := quantJXRHigh(ctx, p, output.high, hp, c.longWord, exact); err != nil {
 			return err
 		}
@@ -679,7 +517,6 @@ func (c *jxrCoefficients) prepareHighpass(ctx context.Context, q *jxrTileQuant, 
 	if err != nil {
 		return err
 	}
-	output.highMode = mode
 	if err := applyJXRHighPredictionChecked(p, output.high, mode, true); err != nil {
 		return err
 	}

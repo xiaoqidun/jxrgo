@@ -72,22 +72,14 @@ type jxrUncompressedLayout struct {
 	alphaBytes    uint64
 }
 
-// jxrIntegerOutputComponents 执行整数样本的颜色转换、偏置、缩放及范围裁剪，输入已完成采样转换
-// 入参: h 图像头, p 当前平面, values 逐分量重建样本并原地替换, alpha 是否为透明度平面
-// 返回: int 输出分量数, error 颜色、数值能力或数据错误
-func jxrIntegerOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha bool) (int, error) {
-	if h.depth == 4 || h.depth == 7 || h.color == 8 && !alpha {
-		return 0, fmt.Errorf("%w: JPEG XR non-integer output", ErrUnsupported)
+// jxrIntegerOutputChecked 在平面、输出颜色组合与缓冲容量已校验前提下执行整数输出转换与裁剪
+// 入参: h 图像头, p 已校验平面, values 原地替换的样本缓冲, color 有效输出颜色格式, count 已校验输出分量数
+// 返回: error 数值范围或位深错误
+func jxrIntegerOutputChecked(h *jxrHeader, p *jxrPlane, values []int64, color uint8, count int) error {
+	if err := jxrColorOutputChecked(h, p, values, color); err != nil {
+		return err
 	}
-	count, err := jxrColorOutputComponents(h, p, values, alpha)
-	if err != nil {
-		return 0, err
-	}
-	color := h.color
-	if alpha {
-		color = 0
-	}
-	return jxrIntegerScaleComponents(h, p, values, color, count)
+	return jxrIntegerScaleChecked(h, p, values, color, count)
 }
 
 // jxrOutputCount 校验平面输出颜色组合，确定转换后有效分量数
@@ -118,30 +110,19 @@ func jxrOutputCount(h *jxrHeader, p *jxrPlane, alpha bool) (int, error) {
 	}
 }
 
-// jxrColorOutputComponents 执行输出颜色转换，采样转换由调用方先行完成
-// 入参: h 图像头, p 当前平面, values 原地转换的分量值, alpha 是否为透明度平面
-// 返回: int 输出分量数, error 颜色组合或数值范围错误
-func jxrColorOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha bool) (int, error) {
-	count, err := jxrOutputCount(h, p, alpha)
-	if err != nil {
-		return 0, err
-	}
-	if len(values) < max(p.channels, count) {
-		return 0, fmt.Errorf("%w: JPEG XR color output storage", ErrInvalid)
-	}
-	color := h.color
-	if alpha {
-		color = 0
-	}
-	if err := checkJXRWords(values[:p.channels], true); err != nil {
-		return 0, err
+// jxrColorOutputChecked 在平面与存储已校验前提下执行输出颜色转换并保留三十二位算术溢出检查
+// 入参: h 图像头, p 已校验平面, values 原地转换的分量值, color 有效输出颜色格式
+// 返回: error 颜色或数值范围错误
+func jxrColorOutputChecked(h *jxrHeader, p *jxrPlane, values []int64, color uint8) error {
+	for _, value := range values[:p.channels] {
+		if value < jxrLongWordMin || value > jxrLongWordMax {
+			return fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
+		}
 	}
 	check := newJXRArithmetic(true)
 	switch color {
 	case 0:
-		count = 1
 	case 1, 2, 3:
-		count = 3
 		if p.color == 0 && color == 3 {
 			values[1], values[2] = 0, 0
 		}
@@ -151,13 +132,10 @@ func jxrColorOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha b
 		c := check.value(values[1] + m + (values[2] >> 1))
 		y := check.value(c - values[2])
 		values[0], values[1], values[2], values[3] = c, m, y, k
-		count = 4
 	case 5:
 		values[0], values[1], values[2], values[3] = values[1], values[2], values[3], values[0]
-		count = 4
 	case 6:
 	case 7, 8:
-		count = 3
 		if p.color == 0 {
 			values[1], values[2] = values[0], values[0]
 		} else {
@@ -171,24 +149,15 @@ func jxrColorOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha b
 			values[0], values[2] = values[2], values[0]
 		}
 	default:
-		return 0, fmt.Errorf("%w: JPEG XR output color", ErrUnsupported)
+		return fmt.Errorf("%w: JPEG XR output color", ErrUnsupported)
 	}
-	if err := check.error(); err != nil {
-		return 0, err
-	}
-	return count, nil
+	return check.error()
 }
 
-// jxrIntegerScaleComponents 执行整数分量的偏置、缩放、范围裁剪及二值亮度位模式转换
-// 入参: h 图像头, p 当前平面, values 原地替换的分量值, color 输出颜色格式, count 分量数
-// 返回: int 输出分量数, error 数值范围或位深错误
-func jxrIntegerScaleComponents(h *jxrHeader, p *jxrPlane, values []int64, color uint8, count int) (int, error) {
-	if count < 1 || count > rasterMaxComponents || count > len(values) {
-		return 0, fmt.Errorf("%w: JPEG XR output component count", ErrInvalid)
-	}
-	if err := checkJXRWords(values[:count], true); err != nil {
-		return 0, err
-	}
+// jxrIntegerScaleChecked 在输入范围与分量数已校验前提下执行整数偏置、缩放、裁剪与二值反转
+// 入参: h 图像头, p 已校验平面, values 已在三十二位范围内的分量值, color 输出颜色格式, count 分量数
+// 返回: error 数值范围或位深错误
+func jxrIntegerScaleChecked(h *jxrHeader, p *jxrPlane, values []int64, color uint8, count int) error {
 	bias := int64(0)
 	switch h.depth {
 	case 0, 15, 3, 6:
@@ -203,7 +172,7 @@ func jxrIntegerScaleComponents(h *jxrHeader, p *jxrPlane, values []int64, color 
 	case 10:
 		bias = 32
 	default:
-		return 0, fmt.Errorf("%w: JPEG XR integer output depth", ErrUnsupported)
+		return fmt.Errorf("%w: JPEG XR integer output depth", ErrUnsupported)
 	}
 	if h.depth == 2 || h.depth == 3 || h.depth == 6 {
 		bias >>= p.shift
@@ -225,7 +194,7 @@ func jxrIntegerScaleComponents(h *jxrHeader, p *jxrPlane, values []int64, color 
 		}
 		value := values[i] + (componentBias << scale)
 		if value < jxrLongWordMin || value > jxrLongWordMax {
-			return 0, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
+			return fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 		}
 		componentScale := scale
 		if color == 7 && h.depth == 10 && i != 1 {
@@ -235,10 +204,10 @@ func jxrIntegerScaleComponents(h *jxrHeader, p *jxrPlane, values []int64, color 
 		if h.depth == 2 || h.depth == 3 || h.depth == 6 {
 			if p.shift >= 32 {
 				if value != 0 {
-					return 0, fmt.Errorf("%w: JPEG XR signed32 output range", ErrInvalid)
+					return fmt.Errorf("%w: JPEG XR signed32 output range", ErrInvalid)
 				}
 			} else if value < (-1<<31)>>p.shift || value > (1<<31-1)>>p.shift {
-				return 0, fmt.Errorf("%w: JPEG XR signed32 output range", ErrInvalid)
+				return fmt.Errorf("%w: JPEG XR signed32 output range", ErrInvalid)
 			} else {
 				value <<= p.shift
 			}
@@ -271,7 +240,7 @@ func jxrIntegerScaleComponents(h *jxrHeader, p *jxrPlane, values []int64, color 
 		}
 		values[i] = value
 	}
-	return count, nil
+	return nil
 }
 
 // jxrIntegerInput 将整数位模式转换为去偏置预缩放颜色样本，精确模式拒绝有效位丢弃，不执行颜色变换
@@ -393,39 +362,6 @@ func jxrIntegerInputSample(h *jxrHeader, color uint8, bias int64, precision, shi
 		return 0, fmt.Errorf("%w: JPEG XR word range", ErrInvalid)
 	}
 	return value, nil
-}
-
-// jxrFloatOutputComponents 将重建样本转换为半精度或单精度浮点位模式，不转换未定义的填充分量
-// 入参: h 图像头, p 当前平面, values 逐分量重建及颜色转换工作缓冲, alpha 是否为透明度平面, result 浮点位模式目标
-// 返回: int 分量数, error 数值、存储或颜色错误
-func jxrFloatOutputComponents(h *jxrHeader, p *jxrPlane, values []int64, alpha bool, result []uint32) (int, error) {
-	if h.depth != 4 && h.depth != 7 {
-		return 0, fmt.Errorf("%w: JPEG XR floating-point depth", ErrInvalid)
-	}
-	if !alpha && h.color != 0 && (h.color != 7 || p.color != 3) {
-		return 0, fmt.Errorf("%w: JPEG XR floating-point color", ErrInvalid)
-	}
-	count, err := jxrOutputCount(h, p, alpha)
-	if err != nil {
-		return 0, err
-	}
-	if len(result) < count {
-		return 0, fmt.Errorf("%w: JPEG XR floating-point output storage", ErrInvalid)
-	}
-	if _, err := jxrColorOutputComponents(h, p, values, alpha); err != nil {
-		return 0, err
-	}
-	for i := range count {
-		value := values[i]
-		if p.scaled {
-			value = (value + 3) >> 3
-		}
-		result[i], err = jxrFloatBits(value, h.depth, p.mantissa, p.exponent)
-		if err != nil {
-			return 0, err
-		}
-	}
-	return count, nil
 }
 
 // jxrFloatBits 将输出缩放后的整数值恢复为浮点位模式，保留符号、非规格化数及非有限数编码
@@ -624,20 +560,6 @@ func jxrFloatInputBits(bits uint32, depth, mantissa uint8, bias int8, exact bool
 	return value, nil
 }
 
-// jxrRGBEOutputComponents 转换共享指数RGBE分量并裁剪到字节范围
-// 入参: h 图像头, p 主平面, values 逐分量重建样本
-// 返回: [4]uint8 RGBE值, error 颜色或位深错误
-func jxrRGBEOutputComponents(h *jxrHeader, p *jxrPlane, values []int64) ([4]uint8, error) {
-	var result [4]uint8
-	if h.color != 8 || h.depth != 1 || p.color != 3 {
-		return result, fmt.Errorf("%w: JPEG XR RGBE format", ErrInvalid)
-	}
-	if _, err := jxrColorOutputComponents(h, p, values, false); err != nil {
-		return result, err
-	}
-	return jxrRGBEPackComponents(p, values), nil
-}
-
 // jxrRGBEPackComponents 缩放RGB整数样本并打包为共享指数RGBE格式，不重复执行颜色变换
 // 入参: p 平面缩放参数, values 已通过数值校验的RGB样本
 // 返回: [4]uint8 RGBE值
@@ -729,21 +651,49 @@ func jxrRasterBitsComponents(h *jxrHeader, p *jxrPlane, number uint8, values []i
 	if len(result) < count || len(values) < max(count, p.channels) {
 		return 0, fmt.Errorf("%w: JPEG XR native output storage", ErrInvalid)
 	}
-	if number == jxrHalf || number == jxrFloat {
-		return jxrFloatOutputComponents(h, p, values, alpha, result)
+	color := h.color
+	if alpha {
+		color = 0
 	}
-	if number == jxrRGBE && !alpha {
-		bits, err := jxrRGBEOutputComponents(h, p, values)
-		if err != nil {
+	if number == jxrHalf || number == jxrFloat {
+		if h.depth != 4 && h.depth != 7 {
+			return 0, fmt.Errorf("%w: JPEG XR floating-point depth", ErrInvalid)
+		}
+		if !alpha && h.color != 0 && (h.color != 7 || p.color != 3) {
+			return 0, fmt.Errorf("%w: JPEG XR floating-point color", ErrInvalid)
+		}
+		if err := jxrColorOutputChecked(h, p, values, color); err != nil {
 			return 0, err
 		}
+		for i := range count {
+			value := values[i]
+			if p.scaled {
+				value = (value + 3) >> 3
+			}
+			result[i], err = jxrFloatBits(value, h.depth, p.mantissa, p.exponent)
+			if err != nil {
+				return 0, err
+			}
+		}
+		return count, nil
+	}
+	if number == jxrRGBE && !alpha {
+		if h.color != 8 || h.depth != 1 || p.color != 3 {
+			return 0, fmt.Errorf("%w: JPEG XR RGBE format", ErrInvalid)
+		}
+		if err := jxrColorOutputChecked(h, p, values, color); err != nil {
+			return 0, err
+		}
+		bits := jxrRGBEPackComponents(p, values)
 		for index := range 3 {
 			result[index] = uint32(bits[index]) | uint32(bits[3])<<8
 		}
 		return 3, nil
 	}
-	count, err = jxrIntegerOutputComponents(h, p, values, alpha)
-	if err != nil {
+	if h.depth == 4 || h.depth == 7 || h.color == 8 && !alpha {
+		return 0, fmt.Errorf("%w: JPEG XR non-integer output", ErrUnsupported)
+	}
+	if err := jxrIntegerOutputChecked(h, p, values, color, count); err != nil {
 		return 0, err
 	}
 	for index := range count {
@@ -755,6 +705,96 @@ func jxrRasterBitsComponents(h *jxrHeader, p *jxrPlane, number uint8, values []i
 	return count, nil
 }
 
+// jxrUnsignedFastParams 计算无移位八位或十六位无符号整数快路径共用的偏置、舍入、上限与移位参数
+// 入参: depth 图像头位深编码, scaled 是否启用预缩放
+// 返回: int64 全偏置, int64 半偏置, int64 舍入量, int64 裁剪上限, uint8 右移位数
+func jxrUnsignedFastParams(depth uint8, scaled bool) (int64, int64, int64, int64, uint8) {
+	bias, high := int64(128), int64(255)
+	scale, round := uint8(0), int64(0)
+	if depth == 2 {
+		bias, high = 32768, 65535
+		if scaled {
+			scale, round = 3, 4
+		}
+	} else if scaled {
+		scale, round = 3, 3
+	}
+	return bias << scale, (bias >> 1) << scale, round, high, scale
+}
+
+// jxrFastUnsignedGray1 完成单通道无符号样本的32位范围检查、偏置与裁剪
+// 入参: v0 原始重建值, off 偏置, round 舍入量, high 裁剪上限, scale 右移位数
+// 返回: uint16 裁剪结果, bool 是否在32位安全范围内
+func jxrFastUnsignedGray1(v0, off, round, high int64, scale uint8) (uint16, bool) {
+	y0 := v0 + off
+	if ((uint64(v0)+jxrInt32Bias)|(uint64(y0)+jxrInt32Bias))>>32 != 0 {
+		return 0, false
+	}
+	return uint16(min(high, max(0, (y0+round)>>scale))), true
+}
+
+// jxrFastUnsignedRGB3 完成YCoCg到无符号RGB三通道的32位范围检查、逆色度变换与裁剪
+// 入参: v0,v1,v2 原始重建值, off 偏置, round 舍入量, high 裁剪上限, scale 右移位数
+// 返回: uint16 红通道, uint16 绿通道, uint16 蓝通道, bool 是否在32位安全范围内
+func jxrFastUnsignedRGB3(v0, v1, v2, off, round, high int64, scale uint8) (uint16, uint16, uint16, bool) {
+	t := -v1
+	g := v0 - (t >> 1)
+	r := t + g - ((v2 + 1) >> 1)
+	b := v2 + r
+	r0, g0, b0 := r+off, g+off, b+off
+	ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) |
+		(uint64(t) + jxrInt32Bias) | (uint64(g) + jxrInt32Bias) | (uint64(r) + jxrInt32Bias) | (uint64(b) + jxrInt32Bias) |
+		(uint64(r0) + jxrInt32Bias) | (uint64(g0) + jxrInt32Bias) | (uint64(b0) + jxrInt32Bias)
+	if ov>>32 != 0 {
+		return 0, 0, 0, false
+	}
+	return uint16(min(high, max(0, (r0+round)>>scale))), uint16(min(high, max(0, (g0+round)>>scale))), uint16(min(high, max(0, (b0+round)>>scale))), true
+}
+
+// jxrFastUnsignedYCC3 完成无符号YCC三通道直通的32位范围检查、偏置与裁剪
+// 入参: v0,v1,v2 原始重建值, off 偏置, round 舍入量, high 裁剪上限, scale 右移位数
+// 返回: uint16 通道0, uint16 通道1, uint16 通道2, bool 是否在32位安全范围内
+func jxrFastUnsignedYCC3(v0, v1, v2, off, round, high int64, scale uint8) (uint16, uint16, uint16, bool) {
+	y0, u0, w0 := v0+off, v1+off, v2+off
+	ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) |
+		(uint64(y0) + jxrInt32Bias) | (uint64(u0) + jxrInt32Bias) | (uint64(w0) + jxrInt32Bias)
+	if ov>>32 != 0 {
+		return 0, 0, 0, false
+	}
+	return uint16(min(high, max(0, (y0+round)>>scale))), uint16(min(high, max(0, (u0+round)>>scale))), uint16(min(high, max(0, (w0+round)>>scale))), true
+}
+
+// jxrFastUnsignedCMYK4 完成YUVK到无符号CMYK四通道的32位范围检查、逆变换与裁剪
+// 入参: v0,v1,v2,v3 原始重建值, halfOff 半偏置, round 舍入量, high 裁剪上限, scale 右移位数
+// 返回: uint16 C通道, uint16 M通道, uint16 Y通道, uint16 K通道, bool 是否在32位安全范围内
+func jxrFastUnsignedCMYK4(v0, v1, v2, v3, halfOff, round, high int64, scale uint8) (uint16, uint16, uint16, uint16, bool) {
+	k := v3 + (v0 >> 1)
+	m := k - v0 - (v1 >> 1)
+	cv := v1 + m + (v2 >> 1)
+	yv := cv - v2
+	c0, m0, y0, k0 := cv+halfOff, m+halfOff, yv+halfOff, k-halfOff
+	ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) | (uint64(v3) + jxrInt32Bias) |
+		(uint64(k) + jxrInt32Bias) | (uint64(m) + jxrInt32Bias) | (uint64(cv) + jxrInt32Bias) | (uint64(yv) + jxrInt32Bias) |
+		(uint64(c0) + jxrInt32Bias) | (uint64(m0) + jxrInt32Bias) | (uint64(y0) + jxrInt32Bias) | (uint64(k0) + jxrInt32Bias)
+	if ov>>32 != 0 {
+		return 0, 0, 0, 0, false
+	}
+	return uint16(min(high, max(0, (c0+round)>>scale))), uint16(min(high, max(0, (m0+round)>>scale))), uint16(min(high, max(0, (y0+round)>>scale))), uint16(min(high, max(0, (k0+round)>>scale))), true
+}
+
+// jxrFastUnsignedCMYKDirect4 完成无符号CMYK直通四通道重排的32位范围检查、偏置与裁剪
+// 入参: v0,v1,v2,v3 原始重建值, off 偏置, round 舍入量, high 裁剪上限, scale 右移位数
+// 返回: uint16 C通道, uint16 M通道, uint16 Y通道, uint16 K通道, bool 是否在32位安全范围内
+func jxrFastUnsignedCMYKDirect4(v0, v1, v2, v3, off, round, high int64, scale uint8) (uint16, uint16, uint16, uint16, bool) {
+	c0, m0, y0, k0 := v1+off, v2+off, v3+off, v0+off
+	ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) | (uint64(v3) + jxrInt32Bias) |
+		(uint64(c0) + jxrInt32Bias) | (uint64(m0) + jxrInt32Bias) | (uint64(y0) + jxrInt32Bias) | (uint64(k0) + jxrInt32Bias)
+	if ov>>32 != 0 {
+		return 0, 0, 0, 0, false
+	}
+	return uint16(min(high, max(0, (c0+round)>>scale))), uint16(min(high, max(0, (m0+round)>>scale))), uint16(min(high, max(0, (y0+round)>>scale))), uint16(min(high, max(0, (k0+round)>>scale))), true
+}
+
 // jxrFastUnsignedBitsComponents 在无移位八位或十六位无符号整数路径直接完成颜色转换、范围检查与裁剪
 // 入参: h 图像头, p 当前平面, values 重建样本, alpha 是否为透明度平面, result 原生位模式目标
 // 返回: int 分量数, bool 是否已完成快路径输出
@@ -763,28 +803,17 @@ func jxrFastUnsignedBitsComponents(h *jxrHeader, p *jxrPlane, values []int64, al
 	if alpha {
 		color = 0
 	}
-	bias, high := int64(128), int64(255)
-	scale, round := uint8(0), int64(0)
-	if h.depth == 2 {
-		bias, high = 32768, 65535
-		if p.scaled {
-			scale, round = 3, 4
-		}
-	} else if p.scaled {
-		scale, round = 3, 3
-	}
-	off := bias << scale
+	off, halfOff, round, high, scale := jxrUnsignedFastParams(h.depth, p.scaled)
 	switch color {
 	case 0:
 		if p.color != 0 || p.channels != 1 || len(values) < 1 || len(result) < 1 {
 			return 0, false
 		}
-		v0 := values[0]
-		y0 := v0 + off
-		if ((uint64(v0)+jxrInt32Bias)|(uint64(y0)+jxrInt32Bias))>>32 != 0 {
+		v, ok := jxrFastUnsignedGray1(values[0], off, round, high, scale)
+		if !ok {
 			return 0, false
 		}
-		result[0] = uint32(min(high, max(0, (y0+round)>>scale)))
+		result[0] = uint32(v)
 		return 1, true
 	case 7:
 		if len(values) < 3 || len(result) < 3 {
@@ -794,71 +823,41 @@ func jxrFastUnsignedBitsComponents(h *jxrHeader, p *jxrPlane, values []int64, al
 			if p.channels != 1 {
 				return 0, false
 			}
-			v0 := values[0]
-			r0 := v0 + off
-			if ((uint64(v0)+jxrInt32Bias)|(uint64(r0)+jxrInt32Bias))>>32 != 0 {
+			c, ok := jxrFastUnsignedGray1(values[0], off, round, high, scale)
+			if !ok {
 				return 0, false
 			}
-			c := uint32(min(high, max(0, (r0+round)>>scale)))
-			result[0], result[1], result[2] = c, c, c
+			result[0], result[1], result[2] = uint32(c), uint32(c), uint32(c)
 			return 3, true
 		}
 		if p.color > 3 || p.channels != 3 {
 			return 0, false
 		}
-		v0, v1, v2 := values[0], values[1], values[2]
-		t := -v1
-		g := v0 - (t >> 1)
-		r := t + g - ((v2 + 1) >> 1)
-		b := v2 + r
-		r0, g0, b0 := r+off, g+off, b+off
-		ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) |
-			(uint64(t) + jxrInt32Bias) | (uint64(g) + jxrInt32Bias) | (uint64(r) + jxrInt32Bias) | (uint64(b) + jxrInt32Bias) |
-			(uint64(r0) + jxrInt32Bias) | (uint64(g0) + jxrInt32Bias) | (uint64(b0) + jxrInt32Bias)
-		if ov>>32 != 0 {
+		r, g, b, ok := jxrFastUnsignedRGB3(values[0], values[1], values[2], off, round, high, scale)
+		if !ok {
 			return 0, false
 		}
-		result[0] = uint32(min(high, max(0, (r0+round)>>scale)))
-		result[1] = uint32(min(high, max(0, (g0+round)>>scale)))
-		result[2] = uint32(min(high, max(0, (b0+round)>>scale)))
+		result[0], result[1], result[2] = uint32(r), uint32(g), uint32(b)
 		return 3, true
 	case 4:
 		if p.color != 4 || p.channels != 4 || len(values) < 4 || len(result) < 4 {
 			return 0, false
 		}
-		halfOff := (bias >> 1) << scale
-		v0, v1, v2, v3 := values[0], values[1], values[2], values[3]
-		k := v3 + (v0 >> 1)
-		m := k - v0 - (v1 >> 1)
-		cv := v1 + m + (v2 >> 1)
-		yv := cv - v2
-		c0, m0, y0, k0 := cv+halfOff, m+halfOff, yv+halfOff, k-halfOff
-		ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) | (uint64(v3) + jxrInt32Bias) |
-			(uint64(k) + jxrInt32Bias) | (uint64(m) + jxrInt32Bias) | (uint64(cv) + jxrInt32Bias) | (uint64(yv) + jxrInt32Bias) |
-			(uint64(c0) + jxrInt32Bias) | (uint64(m0) + jxrInt32Bias) | (uint64(y0) + jxrInt32Bias) | (uint64(k0) + jxrInt32Bias)
-		if ov>>32 != 0 {
+		c, m, y, k, ok := jxrFastUnsignedCMYK4(values[0], values[1], values[2], values[3], halfOff, round, high, scale)
+		if !ok {
 			return 0, false
 		}
-		result[0] = uint32(min(high, max(0, (c0+round)>>scale)))
-		result[1] = uint32(min(high, max(0, (m0+round)>>scale)))
-		result[2] = uint32(min(high, max(0, (y0+round)>>scale)))
-		result[3] = uint32(min(high, max(0, (k0+round)>>scale)))
+		result[0], result[1], result[2], result[3] = uint32(c), uint32(m), uint32(y), uint32(k)
 		return 4, true
 	case 5:
 		if p.color != 4 || p.channels != 4 || len(values) < 4 || len(result) < 4 {
 			return 0, false
 		}
-		v0, v1, v2, v3 := values[0], values[1], values[2], values[3]
-		c0, m0, y0, k0 := v1+off, v2+off, v3+off, v0+off
-		ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) | (uint64(v3) + jxrInt32Bias) |
-			(uint64(c0) + jxrInt32Bias) | (uint64(m0) + jxrInt32Bias) | (uint64(y0) + jxrInt32Bias) | (uint64(k0) + jxrInt32Bias)
-		if ov>>32 != 0 {
+		c, m, y, k, ok := jxrFastUnsignedCMYKDirect4(values[0], values[1], values[2], values[3], off, round, high, scale)
+		if !ok {
 			return 0, false
 		}
-		result[0] = uint32(min(high, max(0, (c0+round)>>scale)))
-		result[1] = uint32(min(high, max(0, (m0+round)>>scale)))
-		result[2] = uint32(min(high, max(0, (y0+round)>>scale)))
-		result[3] = uint32(min(high, max(0, (k0+round)>>scale)))
+		result[0], result[1], result[2], result[3] = uint32(c), uint32(m), uint32(y), uint32(k)
 		return 4, true
 	case 1, 2, 3:
 		if len(values) < 3 || len(result) < 3 {
@@ -868,29 +867,22 @@ func jxrFastUnsignedBitsComponents(h *jxrHeader, p *jxrPlane, values []int64, al
 			if p.channels != 1 {
 				return 0, false
 			}
-			v0 := values[0]
-			y0 := v0 + off
-			if ((uint64(v0)+jxrInt32Bias)|(uint64(y0)+jxrInt32Bias))>>32 != 0 {
+			y0, ok := jxrFastUnsignedGray1(values[0], off, round, high, scale)
+			if !ok {
 				return 0, false
 			}
-			result[0] = uint32(min(high, max(0, (y0+round)>>scale)))
 			z := uint32(min(high, max(0, (off+round)>>scale)))
-			result[1], result[2] = z, z
+			result[0], result[1], result[2] = uint32(y0), z, z
 			return 3, true
 		}
 		if color != 3 && p.color != color || color == 3 && p.color > 3 || p.channels != 3 {
 			return 0, false
 		}
-		v0, v1, v2 := values[0], values[1], values[2]
-		y0, u0, w0 := v0+off, v1+off, v2+off
-		ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) |
-			(uint64(y0) + jxrInt32Bias) | (uint64(u0) + jxrInt32Bias) | (uint64(w0) + jxrInt32Bias)
-		if ov>>32 != 0 {
+		y0, u0, w0, ok := jxrFastUnsignedYCC3(values[0], values[1], values[2], off, round, high, scale)
+		if !ok {
 			return 0, false
 		}
-		result[0] = uint32(min(high, max(0, (y0+round)>>scale)))
-		result[1] = uint32(min(high, max(0, (u0+round)>>scale)))
-		result[2] = uint32(min(high, max(0, (w0+round)>>scale)))
+		result[0], result[1], result[2] = uint32(y0), uint32(u0), uint32(w0)
 		return 3, true
 	}
 	return 0, false
@@ -908,9 +900,22 @@ func (s *jxrRasterSource) decodeSubsampled(ctx context.Context, state *jxrCoeffi
 	if count > uint64(^uint(0)>>1)/s.sampleBytes() || units > maxPixels {
 		return nil, fmt.Errorf("%w: subsampled output storage", ErrLimit)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	info := s.info()
 	raster := &Raster{info: info, planes: make([]imageComponents, len(info.Components))}
 	opacityNumber := s.container.format.number
+	if state.header.depth == 4 || state.header.depth == 7 || state.header.color == 8 {
+		return nil, fmt.Errorf("%w: JPEG XR non-integer output", ErrUnsupported)
+	}
+	mainCount, err := jxrOutputCount(&state.header, &state.primary.plane, false)
+	if err != nil {
+		return nil, err
+	}
+	if max(state.primary.plane.channels, mainCount) > 3 {
+		return nil, fmt.Errorf("%w: JPEG XR color output storage", ErrInvalid)
+	}
 	for index, component := range info.Components {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -929,23 +934,24 @@ func (s *jxrRasterSource) decodeSubsampled(ctx context.Context, state *jxrCoeffi
 				sy = 2
 			}
 		}
+		isAlpha := index == info.Channels
+		if isAlpha && (alpha == nil || alphaPlane == nil) {
+			return nil, fmt.Errorf("%w: subsampled alpha plane", ErrInvalid)
+		}
 		width, height := int(s.container.width)/sx, int(s.container.height)/sy
 		for y := range height {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 			for x := range width {
-				if x&1023 == 0 {
+				if x&1023 == 1023 {
 					if err := ctx.Err(); err != nil {
 						return nil, err
 					}
 				}
 				var values [3]int64
 				var bits uint32
-				if index == info.Channels {
-					if alpha == nil || alphaPlane == nil {
-						return nil, fmt.Errorf("%w: subsampled alpha plane", ErrInvalid)
-					}
+				if isAlpha {
 					values[0] = alpha.at(x+int(alphaHeader.left), y+int(alphaHeader.top))
 					var codes [1]uint32
 					if _, err := jxrRasterBitsComponents(alphaHeader, &alphaPlane.plane, opacityNumber, values[:], alphaHeader.alpha, codes[:]); err != nil {
@@ -954,7 +960,7 @@ func (s *jxrRasterSource) decodeSubsampled(ctx context.Context, state *jxrCoeffi
 					bits = codes[0]
 				} else {
 					values[index] = views[index].at(x+int(state.header.left)/sx, y+int(state.header.top)/sy)
-					if _, err := jxrIntegerOutputComponents(&state.header, &state.primary.plane, values[:], false); err != nil {
+					if err := jxrIntegerOutputChecked(&state.header, &state.primary.plane, values[:], state.header.color, mainCount); err != nil {
 						return nil, err
 					}
 					bits = uint32(values[index])
@@ -972,13 +978,12 @@ func (s *jxrRasterSource) decodeSubsampled(ctx context.Context, state *jxrCoeffi
 }
 
 // sampleJXRChroma 依次执行色度垂直与水平上采样，不分配整幅中间图像
-// 入参: v 色度样本视图, p 平面参数, component 色度分量编号, x, y 亮度样本坐标
+// 入参: v 色度样本视图, p 平面参数, x, y 亮度样本坐标
 // 返回: int64 上采样后的色度值
-func sampleJXRChroma(v *jxrComponentView, p *jxrPlane, component, x, y int) int64 {
-	chromaX, chromaY := p.chromaPhase(component)
-	k, neighbor, weight := jxrSamplePosition(x, v.width, chromaX)
+func sampleJXRChroma(v *jxrComponentView, p *jxrPlane, x, y int) int64 {
+	k, neighbor, weight := jxrSamplePosition(x, v.width, p.chromaX)
 	if p.color == 1 {
-		row, next, vertical := jxrSamplePosition(y, v.height, chromaY)
+		row, next, vertical := jxrSamplePosition(y, v.height, p.chromaY)
 		a := ((8-vertical)*v.at(k, row) + vertical*v.at(k, next) + 4) >> 3
 		b := ((8-vertical)*v.at(neighbor, row) + vertical*v.at(neighbor, next) + 4) >> 3
 		return ((8-weight)*a + weight*b + 4) >> 3
@@ -1100,7 +1105,7 @@ func (r *Raster) resample(ctx context.Context, size image.Point, opts *ResampleO
 					if err != nil {
 						return nil, err
 					}
-					output.planes[index].copySample(y*size.X+x, source.source, at)
+					output.planes[index].storeBits(y*size.X+x, source.source.sampleBits(at))
 					continue
 				}
 				bits, err := resampleJXRBilinear(source, x0, x1, y0, y1, fx, fy)

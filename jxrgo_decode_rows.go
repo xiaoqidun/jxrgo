@@ -408,7 +408,7 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 				} else {
 					values[0] = views[0].at(sx, sy)
 					for i := 1; i < len(views); i++ {
-						values[i] = sampleJXRChroma(&views[i], p, i, sx, sy)
+						values[i] = sampleJXRChroma(&views[i], p, sx, sy)
 					}
 				}
 				n, err := jxrRasterBitsComponents(&state.header, p, c.format.number, values, false, components)
@@ -537,13 +537,6 @@ func (d *Decoder) planStrips(ctx context.Context, retained uint64) (jxrStripPlan
 		if stream != nil {
 			if len(stream.header.columns) < 2 || len(stream.header.rows) < 2 {
 				return plan, fmt.Errorf("%w: JPEG XR strip geometry", ErrUnsupported)
-			}
-			for _, plane := range [2]*jxrPlane{&stream.primary, stream.alpha} {
-				if plane != nil {
-					if err := checkJXRModelComponents(plane); err != nil {
-						return plan, err
-					}
-				}
 			}
 		}
 	}
@@ -802,14 +795,6 @@ func newJXRSpatialRows(ctx context.Context, data []byte, s *jxrStream, tile int,
 	if tile >= len(s.packets) {
 		return nil, fmt.Errorf("%w: JPEG XR spatial row packet", ErrInvalid)
 	}
-	if err := checkJXRModelComponents(&s.primary); err != nil {
-		return nil, err
-	}
-	if s.alpha != nil {
-		if err := checkJXRModelComponents(s.alpha); err != nil {
-			return nil, err
-		}
-	}
 	columns := len(s.header.columns) - 1
 	x, y := tile%columns, tile/columns
 	r := &jxrSpatialRows{bits: jxrPacketReader(data, s, tile), width: int(s.header.columns[x+1] - s.header.columns[x]), height: int(s.header.rows[y+1] - s.header.rows[y]), decodeBand: s.decodeBand}
@@ -975,7 +960,7 @@ func jxrFrequencyRowWork(s *jxrStream, tile int) uint64 {
 
 // newJXRFrequencyRows 在总额度内建立独立频带状态，按DC到精细位的顺序解析量化复用关系
 // 入参: ctx Context, data 码流字节视图, s 已校验频率流, tile 分块序号, maximum 总工作额度
-// 返回: *jxrFrequencyRows 连续行状态, error 数据、模型、资源或取消错误
+// 返回: *jxrFrequencyRows 连续行状态, error 数据、资源或取消错误
 func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile int, maximum uint64) (*jxrFrequencyRows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -988,13 +973,6 @@ func newJXRFrequencyRows(ctx context.Context, data []byte, s *jxrStream, tile in
 		return nil, fmt.Errorf("%w: JPEG XR frequency row packet", ErrInvalid)
 	}
 	count := min(streamCount, 4-int(s.decodeBand))
-	for _, p := range [2]*jxrPlane{&s.primary, s.alpha} {
-		if p != nil {
-			if err := checkJXRModelComponents(p); err != nil {
-				return nil, err
-			}
-		}
-	}
 	columns := len(s.header.columns) - 1
 	x, y := tile%columns, tile/columns
 	r := &jxrFrequencyRows{width: int(s.header.columns[x+1] - s.header.columns[x]), height: int(s.header.rows[y+1] - s.header.rows[y]), count: count}
@@ -1525,7 +1503,7 @@ func jxrRowReconstructionStream(s *jxrStream) jxrStream {
 
 // newJXRNeighborhoodRows 在读取任何包前检查合计工作，实际各列状态延迟至对应原分块行才创建
 // 入参: ctx Context, data 可选完整字节, s 已校验局部码流, maximum 合计行额度
-// 返回: *jxrTileRows 连续局部行读取器, error 几何、模型、资源或取消错误
+// 返回: *jxrTileRows 连续局部行读取器, error 资源或取消错误
 func newJXRNeighborhoodRows(ctx context.Context, data []byte, s *jxrStream, maximum uint64) (*jxrTileRows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1538,20 +1516,13 @@ func newJXRNeighborhoodRows(ctx context.Context, data []byte, s *jxrStream, maxi
 
 // newJXRTileRows 在完整网格行额度内创建惰性熵调度器，构造期间不读取包或分配所有分块行状态
 // 入参: ctx Context, data 可选完整字节, s 已校验完整或局部流, maximum 当前行总额度
-// 返回: *jxrTileRows 连续行读取器, error 几何、模型、资源或取消错误
+// 返回: *jxrTileRows 连续行读取器, error 资源或取消错误
 func newJXRTileRows(ctx context.Context, data []byte, s *jxrStream, maximum uint64) (*jxrTileRows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if jxrTileRowsWork(s) > min(maximum, uint64(^uint(0)>>1)) {
 		return nil, fmt.Errorf("%w: JPEG XR tile row memory", ErrLimit)
-	}
-	for _, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
-		if plane != nil {
-			if err := checkJXRModelComponents(plane); err != nil {
-				return nil, err
-			}
-		}
 	}
 	r := &jxrTileRows{source: *s, data: data, maximum: maximum, width: int(s.header.columns[len(s.header.columns)-1]), height: int(s.header.rows[len(s.header.rows)-1]), activeRow: -1}
 	columns := len(s.header.columns) - 1

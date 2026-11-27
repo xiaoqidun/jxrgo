@@ -240,7 +240,7 @@ func jxrReadICCTransform(ctx context.Context, profile []byte, info Info, maximum
 		}
 	}
 	available := maximum - uint64(len(tags))*16
-	baseMatrix := jxrICCXYZToSRGB()
+	baseMatrix := jxrXYZD50ToSRGB
 	outMatrix := baseMatrix
 	pcsScale := [3]float64{1, 1, 1}
 	if intent == IntentAbsolute && class != "link" && class != "abst" && !(profile[8] == 2 && class == "mntr") {
@@ -557,12 +557,6 @@ func jxrICCMulMatrix(left, columns [3][3]float64) [3][3]float64 {
 		}
 	}
 	return result
-}
-
-// jxrICCXYZToSRGB 返回与jxrSRGBToXYZD50精确互逆的ICC D50 PCS到线性sRGB矩阵
-// 返回: [3][3]float64 D50 PCS到线性sRGB的矩阵
-func jxrICCXYZToSRGB() [3][3]float64 {
-	return jxrXYZD50ToSRGB
 }
 
 // evalOutput 执行可选YCC预处理与ICC核心模型，返回PCS或设备链接目标三通道
@@ -979,19 +973,17 @@ func jxrReadICCLegacyLUT(data []byte, channels, outputs int, target uint8, xyzIn
 	}
 	var inputMatrix [9]float64
 	hasMatrix := false
-	for index := range 9 {
-		raw := binary.BigEndian.Uint32(data[12+4*index:])
-		var expected uint32
-		if index%4 == 0 {
-			expected = 65536
-		}
-		if xyzInput {
+	if xyzInput {
+		for index := range 9 {
+			raw := binary.BigEndian.Uint32(data[12+4*index:])
+			var expected uint32
+			if index%4 == 0 {
+				expected = 65536
+			}
 			inputMatrix[index] = jxrICCFixed(data[12+4*index:])
 			if raw != expected {
 				hasMatrix = true
 			}
-		} else if raw != expected {
-			return nil, fmt.Errorf("%w: ICC device lookup matrix", ErrInvalid)
 		}
 	}
 	inputEnd := header + channels*inputs*precision
@@ -1371,7 +1363,7 @@ func jxrReadICCFloatStage(p *jxrParser, data []byte) (jxrICCFloatStage, error) {
 	return stage, nil
 }
 
-// jxrCheckICCFloat32 校验ICC大端单精度浮点字节并拒绝非规格化数、无穷大和NaN
+// jxrCheckICCFloat32 校验ICC大端单精度浮点字节并拒绝无穷大和NaN
 // 入参: p 取消状态, data 对齐的IEEE二进制32位数值
 // 返回: error 数值编码或取消错误
 func jxrCheckICCFloat32(p *jxrParser, data []byte) error {
@@ -1382,7 +1374,7 @@ func jxrCheckICCFloat32(p *jxrParser, data []byte) error {
 			}
 		}
 		bits := binary.BigEndian.Uint32(data[at:]) & 0x7fffffff
-		if bits != 0 && bits < 0x00800000 || bits >= 0x7f800000 {
+		if bits >= 0x7f800000 {
 			return fmt.Errorf("%w: ICC float32Number", ErrInvalid)
 		}
 	}

@@ -1132,7 +1132,7 @@ func snapshotJXRTileOptions(ctx context.Context, info Info, options EncodeOption
 	}
 	metadata := Raster{info: info}
 	main := PlaneOptions{Band: options.Band, Scaled: options.Scaled, Shift: options.Shift, Float: options.Float, Quantization: options.Quantization}
-	_, err = makeJXREncodePlane(ctx, &metadata, main, false, options.Alpha == nil, options.Lossy)
+	_, err = makeJXREncodePlane(ctx, &metadata, main, false, options.Alpha == nil, options.Lossy, options.Overlap)
 	if err != nil {
 		return options, 0, err
 	}
@@ -1163,7 +1163,7 @@ func snapshotJXRTileOptions(ctx context.Context, info Info, options EncodeOption
 	}
 	if options.Alpha != nil {
 		value := *options.Alpha
-		_, err := makeJXREncodePlane(ctx, &metadata, value, true, false, options.Lossy)
+		_, err := makeJXREncodePlane(ctx, &metadata, value, true, false, options.Lossy, options.Overlap)
 		if err != nil {
 			return options, 0, err
 		}
@@ -1262,13 +1262,33 @@ func planJXRRowImageFile(ctx context.Context, images []ImageInput, limits Limits
 	if state >= limits.MaxMemoryBytes {
 		return nil, 0, &LimitError{Resource: "row image snapshot planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, 1)}
 	}
+	quantMaximum, quantWork := (limits.MaxMemoryBytes-state)/2, uint64(0)
+	for _, input := range images {
+		if input.Raster != nil || input.Options != nil && input.Options.Uncompressed {
+			continue
+		}
+		var options EncodeOptions
+		if input.Options != nil {
+			options = *input.Options
+		}
+		amount, err := jxrTileOptionsQuantizationWork(ctx, options, quantMaximum-quantWork)
+		if err != nil {
+			return nil, 0, err
+		}
+		quantWork += amount
+	}
 	plans := make([]jxrTileImagePlan, len(images))
 	retained, pixels := uint64(0), uint64(0)
+	reserved := quantWork * 2
 	for index, input := range images {
 		if err := ctx.Err(); err != nil {
 			return nil, 0, err
 		}
-		options, err := jxrFileImageOptions(input.Options, limits, limits.MaxMemoryBytes-state-retained, maximum)
+		if reserved >= limits.MaxMemoryBytes-state-retained {
+			return nil, 0, &LimitError{Resource: "row image description and quantization memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, 1)))}
+		}
+		budget := limits.MaxMemoryBytes - state - retained - reserved
+		options, err := jxrFileImageOptions(input.Options, limits, budget, maximum)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1276,17 +1296,27 @@ func planJXRRowImageFile(ctx context.Context, images []ImageInput, limits Limits
 			return nil, 0, err
 		}
 		if input.Raster != nil {
-			work, err := jxrRasterWork(input.Raster, limits.MaxMemoryBytes-state-retained)
+			work, err := jxrRasterWork(input.Raster, budget)
 			if err != nil {
 				return nil, 0, err
 			}
-			if work > limits.MaxMemoryBytes-state-retained {
-				return nil, 0, &LimitError{Resource: "row image file combined inputs", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, work))}
+			if work > budget {
+				return nil, 0, &LimitError{Resource: "row image file combined inputs", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, work)))}
 			}
 			info := input.Raster.info
 			if options.SeparateAlpha && !info.Alpha {
 				return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
 			}
+			nextWork, required, ok := jxrContainerMetadataRetained(work, budget, info, &options)
+			if !ok {
+				return nil, 0, &LimitError{Resource: "row image file combined metadata", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, required)))}
+			}
+			work = nextWork
+			qAmount, err := jxrTileOptionsQuantizationWork(ctx, options, budget-work)
+			if err != nil {
+				return nil, 0, err
+			}
+			work += qAmount
 			width, height := uint64(input.Raster.Bounds().Dx()), uint64(input.Raster.Bounds().Dy())
 			if height == 0 {
 				return nil, 0, fmt.Errorf("%w: JPEG XR image dimensions", ErrInvalid)
@@ -1311,8 +1341,8 @@ func planJXRRowImageFile(ctx context.Context, images []ImageInput, limits Limits
 			return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
 		}
 		clearJXRMergedMetadata(&options)
-		if work > limits.MaxMemoryBytes-state-retained {
-			return nil, 0, &LimitError{Resource: "row image file descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, work))}
+		if work > budget {
+			return nil, 0, &LimitError{Resource: "row image file descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, work)))}
 		}
 		retained += work
 		width, height := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
@@ -1350,7 +1380,12 @@ func planJXRRowImageFile(ctx context.Context, images []ImageInput, limits Limits
 		if plan.raster != nil || plan.options.Uncompressed {
 			continue
 		}
-		options, work, err := snapshotJXRTileOptions(ctx, plan.info, plan.options, limits.MaxMemoryBytes-state-retained)
+		amount, err := jxrTileOptionsQuantizationWork(ctx, plan.options, quantWork)
+		if err != nil {
+			return nil, 0, err
+		}
+		quantWork -= amount
+		options, work, err := snapshotJXRTileOptions(ctx, plan.info, plan.options, limits.MaxMemoryBytes-state-retained-quantWork*2)
 		if err != nil {
 			return nil, 0, err
 		}

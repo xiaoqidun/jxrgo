@@ -557,9 +557,6 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 			}
 			for index, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
 				if plane != nil {
-					if err := checkJXRModelComponents(plane); err != nil {
-						return err
-					}
 					if err := checkJXRTileQuant(plane, &setting.quant[index]); err != nil {
 						return err
 					}

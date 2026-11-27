@@ -596,9 +596,6 @@ func encodeJXRRows(ctx context.Context, w io.WriteSeeker, info Info, read Raster
 	if err := normalizeRasterInfo(&input); err != nil {
 		return err
 	}
-	if err := checkJXRModelComponents(&jxrPlane{channels: input.Channels}); err != nil {
-		return err
-	}
 	formatInfo, err := rasterPixelFormat(input)
 	if err != nil {
 		return err
@@ -899,9 +896,6 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 	clean.Components = cloneComponentInfo(info.Components)
 	clean.ColorEncoding = cloneColorEncoding(merged.ColorEncoding)
 	if err := normalizeRasterInfo(&clean); err != nil {
-		return Info{}, 0, err
-	}
-	if err := checkJXRModelComponents(&jxrPlane{channels: clean.Channels}); err != nil {
 		return Info{}, 0, err
 	}
 	cloned, err := cloneJXRTileMetadata(ctx, clean, merged, settings)

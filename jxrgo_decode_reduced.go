@@ -211,19 +211,6 @@ func (d *Decoder) decodeReducedLocked(ctx context.Context, divisor int) (*Raster
 		return d.decodeUncompressedReducedLocked(ctx, divisor)
 	}
 	source := &d.source
-	for _, stream := range [2]*jxrStream{&source.primary, source.alpha} {
-		if stream == nil {
-			continue
-		}
-		for _, p := range [2]*jxrPlane{&stream.primary, stream.alpha} {
-			if p == nil {
-				continue
-			}
-			if err := checkJXRModelComponents(p); err != nil {
-				return nil, err
-			}
-		}
-	}
 	remaining := min(d.limits.MaxMemoryBytes, uint64(^uint(0)>>1))
 	for _, amount := range []uint64{d.inputWork(), d.retainedHeaderWork(), 4096 + uint64(len(d.info.Components))*128} {
 		if amount > remaining {
@@ -678,7 +665,7 @@ func (p *jxrLowFrequencyPlan) rowWork(tile int) uint64 {
 
 // newJXRLowFrequencyRows 在总额度内创建当前块的低频行状态，原始每块包数始终用于索引
 // 入参: ctx Context, data 可选切片, plan 低频操作计划, tile 原块序号, maximum 行状态及目标额度
-// 返回: *jxrLowFrequencyRows 连续读取器, error 参数、包、模型、资源或取消错误
+// 返回: *jxrLowFrequencyRows 连续读取器, error 包、资源或取消错误
 func newJXRLowFrequencyRows(ctx context.Context, data []byte, plan *jxrLowFrequencyPlan, tile int, maximum uint64) (*jxrLowFrequencyRows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -694,9 +681,6 @@ func newJXRLowFrequencyRows(ctx context.Context, data []byte, plan *jxrLowFreque
 	for index, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
 		if plane == nil {
 			continue
-		}
-		if err := checkJXRModelComponents(plane); err != nil {
-			return nil, err
 		}
 		current := jxrCoefficients{plane: *plane, longWord: s.header.longWord, low: make([]int64, r.width*plane.channels*16), info: make([]jxrMacroInfo, r.width)}
 		if index == 0 {
@@ -842,7 +826,7 @@ func (c *jxrCoefficients) lowGridViews(h *jxrHeader, divisor int, storage []jxrL
 		sx, sy, bw, bh := 1, 1, 4, 4
 		phaseX, phaseY := 0.0, 0.0
 		if i > 0 && (c.plane.color == 1 || c.plane.color == 2) {
-			chromaX, chromaY := c.plane.chromaPhase(i)
+			chromaX, chromaY := c.plane.chromaX, c.plane.chromaY
 			sx, bw, phaseX = 2, 2, 0.5
 			if chromaX <= 4 {
 				phaseX = float64(chromaX) / 4
@@ -1039,7 +1023,7 @@ func newJXRHalfReducedRows(ctx context.Context, data []byte, source *jxrStream, 
 			sx, sy := 1, 1
 			phaseX, phaseY := 0.0, 0.0
 			if c > 0 && (p.color == 1 || p.color == 2) {
-				chromaX, chromaY := p.chromaPhase(c)
+				chromaX, chromaY := p.chromaX, p.chromaY
 				sx, phaseX = 2, 0.5
 				if chromaX <= 4 {
 					phaseX = float64(chromaX) / 4
@@ -1141,7 +1125,7 @@ func jxrLowInverseRowWork(source *jxrStream, bands int) uint64 {
 
 // newJXRLowInverseRows 在读取前建立固定低频窗口，DC输出仍为反量化系数，LP输出为首级逆变换后的粗网格
 // 入参: ctx Context, data 可选原流切片, source 完整原始流, bands 一或二, maximum 读取和重建总额度
-// 返回: *jxrLowInverseRows 低频阶段游标, error 参数、资源、模型、能力或取消错误
+// 返回: *jxrLowInverseRows 低频阶段游标, error 索引、资源或取消错误
 func newJXRLowInverseRows(ctx context.Context, data []byte, source *jxrStream, bands int, maximum uint64) (*jxrLowInverseRows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1276,7 +1260,7 @@ func jxrLowSpatialRowWork(s *jxrStream, tile int) uint64 {
 
 // newJXRLowSpatialRows 建立空间交错低带读取器，保留真实主alpha频带声明与单独预测状态
 // 入参: ctx Context, data 原始切片, s 原始空间流, tile 原块序号, bands 一或二，选择DC或DC加LP, maximum 合计工作额度
-// 返回: *jxrLowSpatialRows 连续行读取器, error 参数、模型、容量、包或取消错误
+// 返回: *jxrLowSpatialRows 连续行读取器, error 参数、容量、包或取消错误
 func newJXRLowSpatialRows(ctx context.Context, data []byte, s *jxrStream, tile, bands int, maximum uint64) (*jxrLowSpatialRows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1300,9 +1284,6 @@ func newJXRLowSpatialRows(ctx context.Context, data []byte, s *jxrStream, tile, 
 	for index, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
 		if plane == nil {
 			continue
-		}
-		if err := checkJXRModelComponents(plane); err != nil {
-			return nil, err
 		}
 		current := jxrCoefficients{plane: *plane, longWord: s.header.longWord, low: make([]int64, r.width*plane.channels*16), info: make([]jxrMacroInfo, r.width)}
 		macro := newJXRCoefficients(plane, 1, s.header.longWord)
@@ -1461,20 +1442,13 @@ func jxrLowTileRowsWork(s *jxrStream, bands int) uint64 {
 
 // newJXRLowTileRows 读取前预检全宽额度，原始索引和当前低通目标分别保留而不创建整图系数
 // 入参: ctx Context, data 可选原流切片, source 完整原始流, bands 一或二, maximum 当前行总额度
-// 返回: *jxrLowTileRows 跨分块连续低通行, error 资源、模型、能力或取消错误
+// 返回: *jxrLowTileRows 跨分块连续低通行, error 索引、资源或取消错误
 func newJXRLowTileRows(ctx context.Context, data []byte, source *jxrStream, bands int, maximum uint64) (*jxrLowTileRows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if jxrLowTileRowsWork(source, bands) > min(maximum, uint64(^uint(0)>>1)) {
 		return nil, fmt.Errorf("%w: reduced tile row working budget", ErrLimit)
-	}
-	for _, plane := range [2]*jxrPlane{&source.primary, source.alpha} {
-		if plane != nil {
-			if err := checkJXRModelComponents(plane); err != nil {
-				return nil, err
-			}
-		}
 	}
 	columns := len(source.header.columns) - 1
 	r := &jxrLowTileRows{source: *source, data: data, maximum: maximum, bands: bands, activeRow: -1, readers: make([]jxrLowTileReader, columns)}

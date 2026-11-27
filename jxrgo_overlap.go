@@ -390,7 +390,7 @@ func (v *jxrComponentView) chromaCornerResidual(left, top, right, bottom int, di
 			if v.wordBits != 0 {
 				low, high := jxrWordBounds(v.wordBits == 32)
 				if value < low || value > high {
-					return checkJXRWords([]int64{value}, v.wordBits == 32)
+					return fmt.Errorf("%w: JPEG XR %d-bit coefficient range", ErrInvalid, v.wordBits)
 				}
 			}
 			if value < -jxrCoefficientLimit || value > jxrCoefficientLimit {
@@ -437,6 +437,10 @@ func (v *jxrComponentView) filterChromaPatch2x2(x, y int, pre bool) error {
 	if v.wordBits != 0 {
 		arithmetic = newJXRArithmetic(v.wordBits == 32)
 		check = &arithmetic
+		check.value(a)
+		check.value(b)
+		check.value(c)
+		check.value(d)
 	}
 	if pre {
 		a, b, c, d = jxrPrefilter2x2(a, b, c, d, check)
@@ -477,6 +481,8 @@ func (v *jxrComponentView) filterChromaPatch2(x, y, width, height int, pre bool)
 	if v.wordBits != 0 {
 		arithmetic = newJXRArithmetic(v.wordBits == 32)
 		check = &arithmetic
+		check.value(a)
+		check.value(b)
 	}
 	if pre {
 		a, b = jxrPrefilter2(a, b, check)
@@ -506,9 +512,6 @@ func (c *jxrCoefficients) filterGrid(ctx context.Context, h *jxrHeader, samples,
 	if samples {
 		values = c.high
 	}
-	if err := checkJXRWordsContext(ctx, values, h.longWord); err != nil {
-		return err
-	}
 	views := c.componentViews(h, samples)
 	if c.workers > 1 && len(values) >= 16384 {
 		if h.hardTiles {
@@ -528,7 +531,7 @@ func (c *jxrCoefficients) filterGrid(ctx context.Context, h *jxrHeader, samples,
 				}); err != nil {
 					return err
 				}
-				return checkJXRWordsContext(ctx, values, h.longWord)
+				return ctx.Err()
 			}
 		} else if len(views) > 1 {
 			workers := resolveJXRWorkers(c.workers, len(views))
@@ -540,7 +543,7 @@ func (c *jxrCoefficients) filterGrid(ctx context.Context, h *jxrHeader, samples,
 				}); err != nil {
 					return err
 				}
-				return checkJXRWordsContext(ctx, values, h.longWord)
+				return ctx.Err()
 			}
 		}
 	}
@@ -565,7 +568,7 @@ func (c *jxrCoefficients) filterGrid(ctx context.Context, h *jxrHeader, samples,
 			}
 		}
 	}
-	return checkJXRWordsContext(ctx, values, h.longWord)
+	return ctx.Err()
 }
 
 // filterComponentRegion 按当前级别的分量网格选择普通或子采样色度滤波
@@ -700,6 +703,9 @@ func (v *jxrComponentView) applyPatch4x4(values *[16]int64, pre bool) error {
 	if v.wordBits != 0 {
 		arithmetic = newJXRArithmetic(v.wordBits == 32)
 		check = &arithmetic
+		for _, value := range values {
+			check.value(value)
+		}
 	}
 	if pre {
 		jxrPrefilter4x4(values, check)
@@ -768,6 +774,10 @@ func (v *jxrComponentView) filterPatch4(x, y, width, height int, pre bool) error
 	if v.wordBits != 0 {
 		arithmetic = newJXRArithmetic(v.wordBits == 32)
 		check = &arithmetic
+		check.value(a)
+		check.value(b)
+		check.value(c)
+		check.value(d)
 	}
 	if pre {
 		a, b, c, d = jxrPrefilter4(a, b, c, d, check)

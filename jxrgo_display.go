@@ -1811,6 +1811,39 @@ func displayByte(value float64) byte {
 	return byte(math.Floor(colorClamp(value)*255 + 0.5))
 }
 
+// jxrWriteDirectCMYK8Row 在整数域将单行八位无符号CMYK统一展开为八位NRGBA或大端十六位NRGBA64字节
+// 入参: c0,m0,y0,k0,a0 源分量切片（无透明度时a0为空）, step 样本步长, width 行宽, out64 是否输出十六位大端字节, dst 目标字节切片
+func jxrWriteDirectCMYK8Row(c0, m0, y0, k0, a0 []uint16, step, width int, out64 bool, dst []byte) {
+	for x := range width {
+		si := x * step
+		c, m, yv, k := uint32(uint8(c0[si])), uint32(uint8(m0[si])), uint32(uint8(y0[si])), uint32(uint8(k0[si]))
+		w := (255 - k) * 257
+		r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
+		av := byte(0xff)
+		if a0 != nil {
+			av = byte(a0[si])
+		}
+		if out64 {
+			di := x * 8
+			dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(r>>8), byte(r), byte(g>>8), byte(g), byte(b>>8), byte(b), av, av
+		} else {
+			di := x * 4
+			dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(uint16(r)), jxrScale16To8(uint16(g)), jxrScale16To8(uint16(b)), av
+		}
+	}
+}
+
+// jxrDirectExpand16 将八位或十六位无符号样本转为大端十六位高低字节对
+// 入参: v 原始无符号样本, scale8 是否为八位输入
+// 返回: byte 高字节, byte 低字节
+func jxrDirectExpand16(v uint16, scale8 bool) (byte, byte) {
+	if scale8 {
+		b := byte(v)
+		return b, b
+	}
+	return byte(v >> 8), byte(v)
+}
+
 // displayJXRDirectCMYK8Row8 在整数域将单行八位无符号CMYK转换为紧凑八位NRGBA字节，与通用浮点路径逐位一致
 // 入参: raster 源图像, alpha 是否含透明度, interleaved 是否交织存储, row 零起点行号, width 行宽, dst 目标字节切片
 func displayJXRDirectCMYK8Row8(raster *Raster, alpha, interleaved bool, row, width int, dst []byte) {
@@ -1821,147 +1854,82 @@ func displayJXRDirectCMYK8Row8(raster *Raster, alpha, interleaved bool, row, wid
 			stride = 5
 		}
 		src := raster.native.values[rowBase*stride : (rowBase+width)*stride]
-		for x := range width {
-			si, di := x*stride, x*4
-			c, m, yv, k := uint32(uint8(src[si])), uint32(uint8(src[si+1])), uint32(uint8(src[si+2])), uint32(uint8(src[si+3]))
-			w := (255 - k) * 257
-			r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
-			av := byte(0xff)
-			if alpha {
-				av = byte(src[si+4])
-			}
-			dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(uint16(r)), jxrScale16To8(uint16(g)), jxrScale16To8(uint16(b)), av
+		var a0 []uint16
+		if alpha {
+			a0 = src[4:]
 		}
+		jxrWriteDirectCMYK8Row(src, src[1:], src[2:], src[3:], a0, stride, width, false, dst)
 		return
 	}
-	c0, m0, y0, k0 := raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width], raster.planes[3].values[rowBase:rowBase+width]
 	var a0 []uint16
 	if alpha {
 		a0 = raster.planes[4].values[rowBase : rowBase+width]
 	}
-	for x := range width {
-		c, m, yv, k := uint32(uint8(c0[x])), uint32(uint8(m0[x])), uint32(uint8(y0[x])), uint32(uint8(k0[x]))
-		w := (255 - k) * 257
-		r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
-		av := byte(0xff)
-		if alpha {
-			av = byte(a0[x])
-		}
-		di := x * 4
-		dst[di], dst[di+1], dst[di+2], dst[di+3] = jxrScale16To8(uint16(r)), jxrScale16To8(uint16(g)), jxrScale16To8(uint16(b)), av
-	}
+	jxrWriteDirectCMYK8Row(raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width], raster.planes[3].values[rowBase:rowBase+width], a0, 1, width, false, dst)
 }
 
 // displayJXRDirectRow64 用纯整数算术直接填充单行大端十六位非预乘RGBA字节缓冲
 // 入参: raster 源图像, info 图像元数据, precision 分量位深, interleaved 是否交织存储, row 零起点行号, width 行宽, dst 目标字节切片
 func displayJXRDirectRow64(raster *Raster, info Info, precision uint8, interleaved bool, row, width int, dst []byte) {
 	rowBase := row * width
+	scale8 := precision == 8
 	switch info.ColorSpace {
 	case ColorGray:
-		if !info.Alpha {
-			var src []uint16
-			if interleaved {
-				src = raster.native.values[rowBase : rowBase+width]
-			} else {
-				src = raster.planes[0].values[rowBase : rowBase+width]
-			}
-			if precision == 8 {
-				for x, v := range src {
-					b, di := byte(v), x*8
-					dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = b, b, b, b, b, b, 0xff, 0xff
-				}
-				return
-			}
-			for x, v := range src {
-				hi, lo, di := byte(v>>8), byte(v), x*8
-				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = hi, lo, hi, lo, hi, lo, 0xff, 0xff
-			}
-			return
-		}
+		var g0, a0 []uint16
+		step := 1
 		if interleaved {
-			src := raster.native.values[rowBase*2 : (rowBase+width)*2]
-			if precision == 8 {
-				for x := range width {
-					si, di := x*2, x*8
-					b, a := byte(src[si]), byte(src[si+1])
-					dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = b, b, b, b, b, b, a, a
-				}
-				return
+			if info.Alpha {
+				step = 2
 			}
-			for x := range width {
-				si, di := x*2, x*8
-				v, a := src[si], src[si+1]
-				hi, lo, ah, al := byte(v>>8), byte(v), byte(a>>8), byte(a)
-				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = hi, lo, hi, lo, hi, lo, ah, al
+			src := raster.native.values[rowBase*step : (rowBase+width)*step]
+			g0 = src
+			if info.Alpha {
+				a0 = src[1:]
 			}
-			return
-		}
-		g0, a0 := raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width]
-		if precision == 8 {
-			for x := range width {
-				b, a, di := byte(g0[x]), byte(a0[x]), x*8
-				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = b, b, b, b, b, b, a, a
+		} else {
+			g0 = raster.planes[0].values[rowBase : rowBase+width]
+			if info.Alpha {
+				a0 = raster.planes[1].values[rowBase : rowBase+width]
 			}
-			return
 		}
 		for x := range width {
-			v, a, di := g0[x], a0[x], x*8
-			hi, lo, ah, al := byte(v>>8), byte(v), byte(a>>8), byte(a)
+			si, di := x*step, x*8
+			hi, lo := jxrDirectExpand16(g0[si], scale8)
+			ah, al := byte(0xff), byte(0xff)
+			if a0 != nil {
+				ah, al = jxrDirectExpand16(a0[si], scale8)
+			}
 			dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = hi, lo, hi, lo, hi, lo, ah, al
 		}
 	case ColorRGB:
+		var r0, g0, b0, a0 []uint16
+		step := 1
 		if interleaved {
-			stride := 3
+			step = 3
 			if info.Alpha {
-				stride = 4
+				step = 4
 			}
-			src := raster.native.values[rowBase*stride : (rowBase+width)*stride]
-			if precision == 8 {
-				for x := range width {
-					si, di := x*stride, x*8
-					rv, gv, bv := byte(src[si]), byte(src[si+1]), byte(src[si+2])
-					av := byte(0xff)
-					if info.Alpha {
-						av = byte(src[si+3])
-					}
-					dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = rv, rv, gv, gv, bv, bv, av, av
-				}
-				return
+			src := raster.native.values[rowBase*step : (rowBase+width)*step]
+			r0, g0, b0 = src, src[1:], src[2:]
+			if info.Alpha {
+				a0 = src[3:]
 			}
-			for x := range width {
-				si, di := x*stride, x*8
-				rv, gv, bv := src[si], src[si+1], src[si+2]
-				av := uint16(0xffff)
-				if info.Alpha {
-					av = src[si+3]
-				}
-				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(rv>>8), byte(rv), byte(gv>>8), byte(gv), byte(bv>>8), byte(bv), byte(av>>8), byte(av)
+		} else {
+			r0, g0, b0 = raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width]
+			if info.Alpha {
+				a0 = raster.planes[3].values[rowBase : rowBase+width]
 			}
-			return
-		}
-		r0, g0, b0 := raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width]
-		var a0 []uint16
-		if info.Alpha {
-			a0 = raster.planes[3].values[rowBase : rowBase+width]
-		}
-		if precision == 8 {
-			for x := range width {
-				rv, gv, bv, di := byte(r0[x]), byte(g0[x]), byte(b0[x]), x*8
-				av := byte(0xff)
-				if info.Alpha {
-					av = byte(a0[x])
-				}
-				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = rv, rv, gv, gv, bv, bv, av, av
-			}
-			return
 		}
 		for x := range width {
-			rv, gv, bv, di := r0[x], g0[x], b0[x], x*8
-			av := uint16(0xffff)
-			if info.Alpha {
-				av = a0[x]
+			si, di := x*step, x*8
+			rh, rl := jxrDirectExpand16(r0[si], scale8)
+			gh, gl := jxrDirectExpand16(g0[si], scale8)
+			bh, bl := jxrDirectExpand16(b0[si], scale8)
+			ah, al := byte(0xff), byte(0xff)
+			if a0 != nil {
+				ah, al = jxrDirectExpand16(a0[si], scale8)
 			}
-			dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(rv>>8), byte(rv), byte(gv>>8), byte(gv), byte(bv>>8), byte(bv), byte(av>>8), byte(av)
+			dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = rh, rl, gh, gl, bh, bl, ah, al
 		}
 	default:
 		if interleaved {
@@ -1970,34 +1938,18 @@ func displayJXRDirectRow64(raster *Raster, info Info, precision uint8, interleav
 				stride = 5
 			}
 			src := raster.native.values[rowBase*stride : (rowBase+width)*stride]
-			for x := range width {
-				si, di := x*stride, x*8
-				c, m, yv, k := uint32(uint8(src[si])), uint32(uint8(src[si+1])), uint32(uint8(src[si+2])), uint32(uint8(src[si+3]))
-				w := (255 - k) * 257
-				r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
-				av := byte(0xff)
-				if info.Alpha {
-					av = byte(src[si+4])
-				}
-				dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(r>>8), byte(r), byte(g>>8), byte(g), byte(b>>8), byte(b), av, av
+			var a0 []uint16
+			if info.Alpha {
+				a0 = src[4:]
 			}
+			jxrWriteDirectCMYK8Row(src, src[1:], src[2:], src[3:], a0, stride, width, true, dst)
 			return
 		}
-		c0, m0, y0, k0 := raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width], raster.planes[3].values[rowBase:rowBase+width]
 		var a0 []uint16
 		if info.Alpha {
 			a0 = raster.planes[4].values[rowBase : rowBase+width]
 		}
-		for x := range width {
-			c, m, yv, k, di := uint32(uint8(c0[x])), uint32(uint8(m0[x])), uint32(uint8(y0[x])), uint32(uint8(k0[x])), x*8
-			w := (255 - k) * 257
-			r, g, b := (255-c)*w/255, (255-m)*w/255, (255-yv)*w/255
-			av := byte(0xff)
-			if info.Alpha {
-				av = byte(a0[x])
-			}
-			dst[di], dst[di+1], dst[di+2], dst[di+3], dst[di+4], dst[di+5], dst[di+6], dst[di+7] = byte(r>>8), byte(r), byte(g>>8), byte(g), byte(b>>8), byte(b), av, av
-		}
+		jxrWriteDirectCMYK8Row(raster.planes[0].values[rowBase:rowBase+width], raster.planes[1].values[rowBase:rowBase+width], raster.planes[2].values[rowBase:rowBase+width], raster.planes[3].values[rowBase:rowBase+width], a0, 1, width, true, dst)
 	}
 }
 

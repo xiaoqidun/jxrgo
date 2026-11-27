@@ -696,13 +696,6 @@ func (c *jxrCoefficients) filterWindow(ctx context.Context, h *jxrHeader, sample
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	values := c.low
-	if samples {
-		values = c.high
-	}
-	if err := checkJXRWordsContext(ctx, values, h.longWord); err != nil {
-		return err
-	}
 	var storage [len(jxrModelComponentWeight[0])]jxrComponentView
 	views := c.componentViewsStorage(h, samples, storage[:])
 	for index := range views {
@@ -732,7 +725,7 @@ func (c *jxrCoefficients) filterWindow(ctx context.Context, h *jxrHeader, sample
 			return err
 		}
 	}
-	return checkJXRWordsContext(ctx, values, h.longWord)
+	return ctx.Err()
 }
 
 // filterComponentWindow 在同一真实滤波分区内处理所需片，视图可保留原宏块行步幅而裁短水平范围

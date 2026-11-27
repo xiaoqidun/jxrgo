@@ -2117,7 +2117,7 @@ func (s *jxrRasterSource) componentInfo(index int) ComponentInfo {
 	ox, oy := 0.0, 0.0
 	knownX, knownY := true, true
 	if index > 0 && index < c.format.channels && (c.format.color == 1 || c.format.color == 2) {
-		chromaX, chromaY := p.chromaPhase(index)
+		chromaX, chromaY := p.chromaX, p.chromaY
 		sx = 2
 		knownX = chromaX <= 4
 		if knownX {

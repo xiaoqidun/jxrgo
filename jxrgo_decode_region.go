@@ -106,9 +106,6 @@ func (d *Decoder) decodeRegionLocked(ctx context.Context, region image.Rectangle
 	available := d.limits.MaxMemoryBytes - retained - outputWork
 	for pass := range passes {
 		source := &sources[pass]
-		if err := checkJXRModelComponents(&source.primary.primary); err != nil {
-			return nil, err
-		}
 		h := &source.primary.header
 		bounds := source.regionTileRange(region, uint8(d.source.container.transform))
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
@@ -534,6 +531,25 @@ func (output *jxrRegionRowOutput) copyNative(ctx context.Context, h *jxrHeader, 
 				sy = 2
 			}
 		}
+		isAlpha := index == source.container.format.channels
+		plane := &s.primary
+		color := h.color
+		if isAlpha {
+			if alpha == nil || s.alpha == nil {
+				return fmt.Errorf("%w: JPEG XR native row alpha plane", ErrInvalid)
+			}
+			plane, color = s.alpha, 0
+		}
+		if h.depth == 4 || h.depth == 7 || h.color == 8 && !isAlpha {
+			return fmt.Errorf("%w: JPEG XR non-integer output", ErrUnsupported)
+		}
+		outCount, err := jxrOutputCount(h, plane, isAlpha)
+		if err != nil {
+			return err
+		}
+		if max(plane.channels, outCount) > 3 {
+			return fmt.Errorf("%w: JPEG XR color output storage", ErrInvalid)
+		}
 		destination := index
 		if output.alphaOnly {
 			destination = len(target.info.Components) - 1
@@ -548,27 +564,21 @@ func (output *jxrRegionRowOutput) copyNative(ctx context.Context, h *jxrHeader, 
 				continue
 			}
 			for x := range int(s.header.width) / sx {
-				if x&1023 == 0 {
+				if x&1023 == 1023 {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
 				}
 				var values [3]int64
 				valueIndex := index
-				if index == source.container.format.channels {
-					if alpha == nil || s.alpha == nil {
-						return fmt.Errorf("%w: JPEG XR native row alpha plane", ErrInvalid)
-					}
+				if isAlpha {
 					values[0] = alpha.at(x+int(h.left), y+int(h.top))
-					if _, err := jxrIntegerOutputComponents(h, s.alpha, values[:], true); err != nil {
-						return err
-					}
 					valueIndex = 0
 				} else {
 					values[index] = views[index].at(x+int(h.left)/sx, y+int(h.top)/sy)
-					if _, err := jxrIntegerOutputComponents(h, &s.primary, values[:], false); err != nil {
-						return err
-					}
+				}
+				if err := jxrIntegerOutputChecked(h, plane, values[:], color, outCount); err != nil {
+					return err
 				}
 				px, py := jxrRasterPosition(x+output.origin.X/sx, visibleY+output.origin.Y/sy, output.width/sx, output.height/sy, output.transform)
 				px, py = px-output.region.Min.X/int(info.XStep), py-output.region.Min.Y/int(info.YStep)

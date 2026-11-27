@@ -650,7 +650,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 			} else {
 				values[0] = views[0].at(sx, sy)
 				for i := 1; i < len(views); i++ {
-					values[i] = sampleJXRChroma(&views[i], p, i, sx, sy)
+					values[i] = sampleJXRChroma(&views[i], p, sx, sy)
 				}
 			}
 			n, err := jxrRasterBitsComponents(h, p, c.format.number, values, false, components)
@@ -762,30 +762,9 @@ func (source *jxrRasterSource) decodeUnsignedFast(ctx context.Context, state *jx
 			return false, nil
 		}
 		_ = aData[aMaxIdx]
-		aBias := int64(128)
-		aHigh = 255
-		if alphaHeader.depth == 2 {
-			aBias, aHigh = 32768, 65535
-			if alphaPlane.plane.scaled {
-				aScale, aRound = 3, 4
-			}
-		} else if alphaPlane.plane.scaled {
-			aScale, aRound = 3, 3
-		}
-		aOff = aBias << aScale
+		aOff, _, aRound, aHigh, aScale = jxrUnsignedFastParams(alphaHeader.depth, alphaPlane.plane.scaled)
 	}
-	bias, high := int64(128), int64(255)
-	scale, round := uint8(0), int64(0)
-	if h.depth == 2 {
-		bias, high = 32768, 65535
-		if p.scaled {
-			scale, round = 3, 4
-		}
-	} else if p.scaled {
-		scale, round = 3, 3
-	}
-	off := bias << scale
-	halfOff := (bias >> 1) << scale
+	off, halfOff, round, high, scale := jxrUnsignedFastParams(h.depth, p.scaled)
 	ch := c.format.channels
 	dst := pixels.values
 	_ = data[maxIdx]
@@ -802,8 +781,10 @@ func (source *jxrRasterSource) decodeUnsignedFast(ctx context.Context, state *jx
 		}
 		outRow := dst[y*w*stride : (y+1)*w*stride]
 		for start := 0; start < w; start += 1024 {
-			if err := ctx.Err(); err != nil {
-				return true, err
+			if start > 0 {
+				if err := ctx.Err(); err != nil {
+					return true, err
+				}
 			}
 			end := min(start+1024, w)
 			n := end - start
@@ -814,100 +795,66 @@ func (source *jxrRasterSource) decodeUnsignedFast(ctx context.Context, state *jx
 			case 0:
 				for i := range n {
 					sx := xBase + i
-					v0 := data[rowBase+(sx>>4)*vStride+(sx&12)<<2+(sx&3)]
-					y0 := v0 + off
-					if ((uint64(v0)+jxrInt32Bias)|(uint64(y0)+jxrInt32Bias))>>32 != 0 {
+					v, ok := jxrFastUnsignedGray1(data[rowBase+(sx>>4)*vStride+(sx&12)<<2+(sx&3)], off, round, high, scale)
+					if !ok {
 						return true, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 					}
-					out[i*stride] = uint16(min(high, max(0, (y0+round)>>scale)))
+					out[i*stride] = v
 				}
 			case 7:
 				for i := range n {
 					sx := xBase + i
 					idx := rowBase + (sx>>4)*vStride + (sx&12)<<2 + (sx & 3)
-					v0, v1, v2 := data[idx], data[idx+256], data[idx+512]
-					t := -v1
-					g := v0 - (t >> 1)
-					r := t + g - ((v2 + 1) >> 1)
-					b := v2 + r
-					r0, g0, b0 := r+off, g+off, b+off
-					ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) |
-						(uint64(t) + jxrInt32Bias) | (uint64(g) + jxrInt32Bias) | (uint64(r) + jxrInt32Bias) | (uint64(b) + jxrInt32Bias) |
-						(uint64(r0) + jxrInt32Bias) | (uint64(g0) + jxrInt32Bias) | (uint64(b0) + jxrInt32Bias)
-					if ov>>32 != 0 {
+					r, g, b, ok := jxrFastUnsignedRGB3(data[idx], data[idx+256], data[idx+512], off, round, high, scale)
+					if !ok {
 						return true, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 					}
 					o := i * stride
-					out[o] = uint16(min(high, max(0, (r0+round)>>scale)))
-					out[o+1] = uint16(min(high, max(0, (g0+round)>>scale)))
-					out[o+2] = uint16(min(high, max(0, (b0+round)>>scale)))
+					out[o], out[o+1], out[o+2] = r, g, b
 				}
 			case 3:
 				for i := range n {
 					sx := xBase + i
 					idx := rowBase + (sx>>4)*vStride + (sx&12)<<2 + (sx & 3)
-					v0, v1, v2 := data[idx], data[idx+256], data[idx+512]
-					y0, u0, w0 := v0+off, v1+off, v2+off
-					ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) |
-						(uint64(y0) + jxrInt32Bias) | (uint64(u0) + jxrInt32Bias) | (uint64(w0) + jxrInt32Bias)
-					if ov>>32 != 0 {
+					y0, u0, w0, ok := jxrFastUnsignedYCC3(data[idx], data[idx+256], data[idx+512], off, round, high, scale)
+					if !ok {
 						return true, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 					}
 					o := i * stride
-					out[o] = uint16(min(high, max(0, (y0+round)>>scale)))
-					out[o+1] = uint16(min(high, max(0, (u0+round)>>scale)))
-					out[o+2] = uint16(min(high, max(0, (w0+round)>>scale)))
+					out[o], out[o+1], out[o+2] = y0, u0, w0
 				}
 			case 4:
 				for i := range n {
 					sx := xBase + i
 					idx := rowBase + (sx>>4)*vStride + (sx&12)<<2 + (sx & 3)
-					v0, v1, v2, v3 := data[idx], data[idx+256], data[idx+512], data[idx+768]
-					k := v3 + (v0 >> 1)
-					m := k - v0 - (v1 >> 1)
-					cv := v1 + m + (v2 >> 1)
-					yv := cv - v2
-					c0, m0, y0, k0 := cv+halfOff, m+halfOff, yv+halfOff, k-halfOff
-					ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) | (uint64(v3) + jxrInt32Bias) |
-						(uint64(k) + jxrInt32Bias) | (uint64(m) + jxrInt32Bias) | (uint64(cv) + jxrInt32Bias) | (uint64(yv) + jxrInt32Bias) |
-						(uint64(c0) + jxrInt32Bias) | (uint64(m0) + jxrInt32Bias) | (uint64(y0) + jxrInt32Bias) | (uint64(k0) + jxrInt32Bias)
-					if ov>>32 != 0 {
+					cv, mv, yv, kv, ok := jxrFastUnsignedCMYK4(data[idx], data[idx+256], data[idx+512], data[idx+768], halfOff, round, high, scale)
+					if !ok {
 						return true, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 					}
 					o := i * stride
-					out[o] = uint16(min(high, max(0, (c0+round)>>scale)))
-					out[o+1] = uint16(min(high, max(0, (m0+round)>>scale)))
-					out[o+2] = uint16(min(high, max(0, (y0+round)>>scale)))
-					out[o+3] = uint16(min(high, max(0, (k0+round)>>scale)))
+					out[o], out[o+1], out[o+2], out[o+3] = cv, mv, yv, kv
 				}
 			case 5:
 				for i := range n {
 					sx := xBase + i
 					idx := rowBase + (sx>>4)*vStride + (sx&12)<<2 + (sx & 3)
-					v0, v1, v2, v3 := data[idx], data[idx+256], data[idx+512], data[idx+768]
-					c0, m0, y0, k0 := v1+off, v2+off, v3+off, v0+off
-					ov := (uint64(v0) + jxrInt32Bias) | (uint64(v1) + jxrInt32Bias) | (uint64(v2) + jxrInt32Bias) | (uint64(v3) + jxrInt32Bias) |
-						(uint64(c0) + jxrInt32Bias) | (uint64(m0) + jxrInt32Bias) | (uint64(y0) + jxrInt32Bias) | (uint64(k0) + jxrInt32Bias)
-					if ov>>32 != 0 {
+					cv, mv, yv, kv, ok := jxrFastUnsignedCMYKDirect4(data[idx], data[idx+256], data[idx+512], data[idx+768], off, round, high, scale)
+					if !ok {
 						return true, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 					}
 					o := i * stride
-					out[o] = uint16(min(high, max(0, (c0+round)>>scale)))
-					out[o+1] = uint16(min(high, max(0, (m0+round)>>scale)))
-					out[o+2] = uint16(min(high, max(0, (y0+round)>>scale)))
-					out[o+3] = uint16(min(high, max(0, (k0+round)>>scale)))
+					out[o], out[o+1], out[o+2], out[o+3] = cv, mv, yv, kv
 				}
 			}
 			if alphaView != nil {
 				axBase := start + aLeft
 				for i := range n {
 					ax := axBase + i
-					av := aData[aRowBase+(ax>>4)*aStride+(ax&12)<<2+(ax&3)]
-					a0 := av + aOff
-					if ((uint64(av)+jxrInt32Bias)|(uint64(a0)+jxrInt32Bias))>>32 != 0 {
+					av, ok := jxrFastUnsignedGray1(aData[aRowBase+(ax>>4)*aStride+(ax&12)<<2+(ax&3)], aOff, aRound, aHigh, aScale)
+					if !ok {
 						return true, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 					}
-					out[i*stride+ch] = uint16(min(aHigh, max(0, (a0+aRound)>>aScale)))
+					out[i*stride+ch] = av
 				}
 			}
 		}
@@ -962,7 +909,7 @@ func jxrRasterSampleComponents(views []jxrComponentView, h *jxrHeader, p *jxrPla
 	}
 	values[0] = views[0].at(x, y)
 	for i := 1; i < len(views); i++ {
-		values[i] = sampleJXRChroma(&views[i], p, i, x, y)
+		values[i] = sampleJXRChroma(&views[i], p, x, y)
 	}
 	return nil
 }

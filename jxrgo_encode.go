@@ -1131,7 +1131,7 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 		}
 	}
 	main := PlaneOptions{Band: o.Band, Scaled: o.Scaled, Shift: o.Shift, Float: o.Float, Quantization: o.Quantization}
-	p, err := makeJXREncodePlane(ctx, raster, main, false, o.Alpha == nil, o.Lossy)
+	p, err := makeJXREncodePlane(ctx, raster, main, false, o.Alpha == nil, o.Lossy, o.Overlap)
 	if err != nil {
 		return layout, output, err
 	}
@@ -1173,7 +1173,7 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 		if !raster.info.Alpha {
 			return layout, output, fmt.Errorf("%w: alpha options without alpha", ErrInvalid)
 		}
-		alpha, err := makeJXREncodePlane(ctx, raster, *o.Alpha, true, false, o.Lossy)
+		alpha, err := makeJXREncodePlane(ctx, raster, *o.Alpha, true, false, o.Lossy, o.Overlap)
 		if err != nil {
 			return layout, output, err
 		}
@@ -1185,32 +1185,16 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 		return layout, output, err
 	}
 	if o.TileSize.X != 0 || o.TileSize.Y != 0 {
-		for axis, target := range []*[]uint32{&s.header.columns, &s.header.rows} {
-			extent, size := s.header.columns[len(s.header.columns)-1], uint32(o.TileSize.X/16)
-			if axis == 1 {
-				extent, size = s.header.rows[len(s.header.rows)-1], uint32(o.TileSize.Y/16)
-			}
-			count := (uint64(extent) + uint64(size) - 1) / uint64(size)
-			if count > 4096 {
-				return layout, output, &LimitError{Resource: "encode tile partition count", Limit: 4096, Required: count}
-			}
-			if count*4 > available {
-				return layout, output, &LimitError{Resource: "encode tile partition memory", Limit: available, Required: count * 4}
-			}
-			boundary := make([]uint32, int(count)+1)
-			for n := uint64(1); n <= count; n++ {
-				boundary[n] = uint32(min(n*uint64(size), uint64(extent)))
-			}
-			if axis == 0 && s.header.hardTiles && s.header.overlap == 2 && (s.primary.color == 1 || s.primary.color == 2) && count >= 2 && extent-boundary[count-1] < 2 {
-				if size >= 3 {
-					boundary[count-1]--
-				} else if size == 2 {
-					boundary[count-1] = extent
-					boundary = boundary[:count]
-				}
-			}
-			*target = boundary
+		adjustCols := s.header.hardTiles && s.header.overlap == 2 && (s.primary.color == 1 || s.primary.color == 2)
+		columns, err := jxrTileColumnBoundaries(s.header.columns[len(s.header.columns)-1], uint32(o.TileSize.X/16), adjustCols, available)
+		if err != nil {
+			return layout, output, err
 		}
+		rows, err := jxrTileColumnBoundaries(s.header.rows[len(s.header.rows)-1], uint32(o.TileSize.Y/16), false, available)
+		if err != nil {
+			return layout, output, err
+		}
+		s.header.columns, s.header.rows = columns, rows
 		s.header.short = false
 		s, err = newJXRInputHeader(ctx, raster.info, s, limits.MaxPixels, available)
 		if err != nil {
@@ -1293,10 +1277,158 @@ func checkJXREncodeOptions(o EncodeOptions) error {
 	return nil
 }
 
-// makeJXREncodePlane 按原生数值编码建立图像级共用参数，量化切片只读取不共享
-// 入参: ctx Context, raster 原生图像, o 平面选项, alpha 透明度平面, includeAlpha 自动浮点偏置是否同时覆盖透明度, lossy 是否允许精度损失
+// jxrTileColumnBoundaries 构建分块列或行宏块边界，并在子采样二级重叠硬分块下同步调整尾列宽度
+// 入参: extent 轴向总宏块数, size 单块宏块尺寸, adjustChromaTail 是否执行子采样尾列调整, available 可用内存预算
+// 返回: []uint32 单调递增分块边界, error 分块数量或内存预算错误
+func jxrTileColumnBoundaries(extent, size uint32, adjustChromaTail bool, available uint64) ([]uint32, error) {
+	count := (uint64(extent) + uint64(size) - 1) / uint64(size)
+	if count == 0 || count > 4096 {
+		return nil, &LimitError{Resource: "encode tile partition count", Limit: 4096, Required: count}
+	}
+	if count*4 > available {
+		return nil, &LimitError{Resource: "encode tile partition memory", Limit: available, Required: count * 4}
+	}
+	boundary := make([]uint32, int(count)+1)
+	for n := uint64(1); n <= count; n++ {
+		boundary[n] = uint32(min(n*uint64(size), uint64(extent)))
+	}
+	if adjustChromaTail && count >= 2 && extent-boundary[count-1] < 2 {
+		if size >= 3 {
+			boundary[count-1]--
+		} else if size == 2 {
+			boundary[count-1] = extent
+			boundary = boundary[:count]
+		}
+	}
+	return boundary, nil
+}
+
+// jxrFloatGainBits 按平面通道、缩放与重叠滤波计算单精度浮点变换域增益位数
+// 入参: channels 当前平面通道数, scaled 是否启用预缩放, overlap 重叠滤波级别, lossy 是否允许精度损失
+// 返回: int 变换域最大增益位数
+func jxrFloatGainBits(channels int, scaled bool, overlap Overlap, lossy bool) int {
+	gain := 4
+	if scaled {
+		gain += 3
+	}
+	if channels == 3 && (lossy || !scaled) {
+		gain++
+	}
+	if lossy {
+		gain += int(overlap)
+	} else if overlap != OverlapNone {
+		gain++
+	}
+	return gain
+}
+
+// jxrFloatSampleBound 计算非负单精度浮点位模式在指定偏置下的无损整数映射幅值
+// 入参: raw 清除符号位后的IEEE754单精度位模式, bias 候选指数偏置
+// 返回: int64 整数映射幅值，超出范围时返回最大整数
+func jxrFloatSampleBound(raw uint32, bias int8) int64 {
+	value, err := jxrFloatInputBits(raw, 7, 23, bias, false)
+	if err != nil {
+		return math.MaxInt64
+	}
+	return value
+}
+
+// jxrVerifyFloatLosslessCapacity 在极端跨指数区间按宏块核验实际无损单精度像素是否超出三十二位变换字长
+// 入参: ctx Context, raster 原生图像, base 首分量下标, count 需覆盖的分量数, isRGB 前三通道是否执行RGB正向色彩变换, scaled 是否启用预缩放, overlap 重叠滤波级别, bias 候选指数偏置
+// 返回: error 无法无损容纳或取消错误
+func jxrVerifyFloatLosslessCapacity(ctx context.Context, raster *Raster, base, count int, isRGB, scaled bool, overlap Overlap, bias int8) error {
+	var comps [4]Component
+	for index := range count {
+		component, err := raster.Component(base + index)
+		if err != nil {
+			return err
+		}
+		comps[index] = component
+	}
+	src := comps[0].source
+	stride := src.channels
+	if src.alpha {
+		stride++
+	}
+	w, h := src.bounds.Dx(), src.bounds.Dy()
+	words := src.words
+	mbW, mbH := (w+15)/16, (h+15)/16
+	ovNum, ovDen := int64(1), int64(1)
+	if overlap == OverlapOne {
+		ovNum, ovDen = 5, 4
+	} else if overlap == OverlapTwo {
+		ovNum, ovDen = 3, 2
+	}
+	for my := range mbH {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for mx := range mbW {
+			if mx&15 == 15 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			var sums [4]int64
+			var maxAbs [4]int64
+			for dy := range 16 {
+				cy := min(my*16+dy, h-1)
+				rowOff := cy * w * stride
+				for dx := range 16 {
+					cx := min(mx*16+dx, w-1)
+					pixOff := rowOff + cx*stride
+					var vals [4]int64
+					for i := range count {
+						v, err := jxrFloatInputBits(words[pixOff+comps[i].index], 7, 23, bias, false)
+						if err != nil {
+							return fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
+						}
+						if scaled {
+							v <<= 3
+							if v < jxrLongWordMin || v > jxrLongWordMax {
+								return fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
+							}
+						}
+						vals[i] = v
+					}
+					if isRGB {
+						v := vals[2] - vals[0]
+						t := vals[0] - vals[1] + ((v + 1) >> 1)
+						yv := vals[1] + (t >> 1)
+						vals[0], vals[1], vals[2] = yv, -t, v
+					}
+					for i := range count {
+						val := vals[i]
+						if val < jxrLongWordMin || val > jxrLongWordMax {
+							return fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
+						}
+						sums[i] += val
+						if a := jxrAbs(val); a > maxAbs[i] {
+							maxAbs[i] = a
+						}
+					}
+				}
+			}
+			for i := range count {
+				dcShift := uint(4)
+				if scaled && isRGB && (i == 1 || i == 2) {
+					dcShift = 5
+				}
+				dcEst := (jxrAbs(sums[i]) >> dcShift) * ovNum / ovDen
+				acEst := (maxAbs[i] << 2) * ovNum / ovDen
+				if dcEst > jxrLongWordMax || acEst > jxrLongWordMax {
+					return fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
+				}
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// makeJXREncodePlane 按完整变换增益建立图像级共用参数，量化切片只读取不共享
+// 入参: ctx Context, raster 原生图像, o 平面选项, alpha 透明度平面, includeAlpha 自动浮点偏置是否同时覆盖透明度, lossy 是否允许精度损失, overlap 重叠滤波级别
 // 返回: jxrPlane 平面参数, error 选项、精度或取消错误
-func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alpha, includeAlpha, lossy bool) (jxrPlane, error) {
+func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alpha, includeAlpha, lossy bool, overlap Overlap) (jxrPlane, error) {
 	p := jxrPlane{bands: uint8(o.Band), scaled: o.Scaled, shift: o.Shift, dcUniform: true, lpUniform: true, hpUniform: true}
 	if o.Band > BandDC {
 		return p, fmt.Errorf("%w: encode plane bands", ErrInvalid)
@@ -1307,9 +1439,6 @@ func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alp
 	}
 	if count < 1 || count > rasterMaxComponents {
 		return p, fmt.Errorf("%w: encode component count", ErrInvalid)
-	}
-	if err := checkJXRModelComponents(&jxrPlane{channels: count}); err != nil {
-		return p, err
 	}
 	first := raster.info.Components[base]
 	p.dcQuant, p.lpQuant, p.hpQuant = make([]uint8, count), make([]uint8, count), make([]uint8, count)
@@ -1323,10 +1452,11 @@ func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alp
 			if err := ctx.Err(); err != nil {
 				return p, err
 			}
-			p.mantissa, p.exponent = 16, 127
+			gainBits := jxrFloatGainBits(count, p.scaled, overlap, true)
+			p.mantissa, p.exponent = uint8(min(16, max(1, 23-gainBits))), 127
 		} else {
 			hasNormal, hasSubnormal := false, false
-			maxExp := uint32(0)
+			maxExp, maxRaw := uint32(0), uint32(0)
 			needBias := -128
 			n := count
 			if includeAlpha && raster.info.Alpha {
@@ -1359,6 +1489,7 @@ func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alp
 						if raw == 0 {
 							continue
 						}
+						maxRaw = max(maxRaw, raw)
 						exp := raw >> 23
 						if exp == 0 {
 							hasSubnormal = true
@@ -1373,17 +1504,44 @@ func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alp
 				}
 			}
 			p.mantissa = 23
-			safeTop := 15
-			if p.scaled {
-				safeTop = 1
-			}
-			var bias int
-			if !hasNormal && !hasSubnormal || hasSubnormal && int(maxExp) <= safeTop {
-				bias = 127
+			if !hasNormal && !hasSubnormal {
+				p.exponent = 127
 			} else {
-				bias = min(127+255-int(maxExp), max(128-int(maxExp), needBias))
+				if needBias > 127 {
+					return p, fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
+				}
+				gainBits := jxrFloatGainBits(count, p.scaled, overlap, false)
+				safeLimit := (int64(1) << 31) >> gainBits
+				hardGain := 2
+				if p.scaled {
+					hardGain += 3
+				}
+				needVal := jxrFloatSampleBound(maxRaw, int8(needBias))
+				if needVal > int64(jxrLongWordMax)>>hardGain {
+					return p, fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
+				}
+				bias := needBias
+				if needVal <= safeLimit {
+					candidate := needBias
+					if hasNormal {
+						candidate = max(128-int(maxExp), needBias)
+					}
+					candidate = min(127, max(-128, candidate))
+					if jxrFloatSampleBound(maxRaw, int8(candidate)) <= safeLimit {
+						bias = candidate
+					} else {
+						for b := candidate - 1; b >= needBias; b-- {
+							if jxrFloatSampleBound(maxRaw, int8(b)) <= safeLimit {
+								bias = b
+								break
+							}
+						}
+					}
+				} else if err := jxrVerifyFloatLosslessCapacity(ctx, raster, base, n, !alpha && count == 3, p.scaled, overlap, int8(needBias)); err != nil {
+					return p, err
+				}
+				p.exponent = int8(bias)
 			}
-			p.exponent = int8(min(127, max(-128, bias)))
 		}
 	}
 	if o.Quantization != nil {
@@ -1842,6 +2000,12 @@ func checkJXRQuantizationGeometry(ctx context.Context, info Info, options Encode
 	if jxrInputTransform(info, format.color, uint8(options.Orientation))&4 != 0 {
 		width, height = height, width
 	}
+	internalColor := format.color
+	if options.Subsampling == Subsampling420 {
+		internalColor = 1
+	} else if options.Subsampling == Subsampling422 {
+		internalColor = 2
+	}
 	if options.Window != nil {
 		width += uint64(options.Window.Left) + uint64(options.Window.Right)
 		height += uint64(options.Window.Top) + uint64(options.Window.Bottom)
@@ -1851,12 +2015,6 @@ func checkJXRQuantizationGeometry(ctx context.Context, info Info, options Encode
 		width, height = width/16, height/16
 	} else {
 		width, height = (width+15)/16, (height+15)/16
-		internalColor := format.color
-		if options.Subsampling == Subsampling420 {
-			internalColor = 1
-		} else if options.Subsampling == Subsampling422 {
-			internalColor = 2
-		}
 		if (internalColor == 1 || internalColor == 2) && options.Overlap == OverlapTwo && width < 2 {
 			width = 2
 		}
@@ -1865,17 +2023,27 @@ func checkJXRQuantizationGeometry(ctx context.Context, info Info, options Encode
 	if sx == 0 || sy == 0 {
 		return fmt.Errorf("%w: adaptive tile macroblock geometry", ErrInvalid)
 	}
-	columns, rows := (width+sx-1)/sx, (height+sy-1)/sy
-	if columns == 0 || rows == 0 || columns > 4096 || rows > 4096 {
+	if width > math.MaxUint32 || height > math.MaxUint32 || sx > math.MaxUint32 || sy > math.MaxUint32 {
 		return fmt.Errorf("%w: adaptive tile partition geometry", ErrLimit)
 	}
+	adjustCols := options.HardTiles && options.Overlap == OverlapTwo && (internalColor == 1 || internalColor == 2)
+	colEdges, err := jxrTileColumnBoundaries(uint32(width), uint32(sx), adjustCols, ^uint64(0))
+	if err != nil {
+		return fmt.Errorf("%w: adaptive tile partition geometry", ErrLimit)
+	}
+	rowEdges, err := jxrTileColumnBoundaries(uint32(height), uint32(sy), false, ^uint64(0))
+	if err != nil {
+		return fmt.Errorf("%w: adaptive tile partition geometry", ErrLimit)
+	}
+	columns, rows := uint64(len(colEdges)-1), uint64(len(rowEdges)-1)
 	for _, q := range configuration {
 		if q != nil && len(q.Tiles) != 0 && uint64(len(q.Tiles)) != columns*rows {
 			return fmt.Errorf("%w: adaptive quantization tile count", ErrInvalid)
 		}
 	}
 	for tile := uint64(0); tile < columns*rows; tile++ {
-		w, h := min(sx, width-tile%columns*sx), min(sy, height-tile/columns*sy)
+		col, row := tile%columns, tile/columns
+		w, h := uint64(colEdges[col+1]-colEdges[col]), uint64(rowEdges[row+1]-rowEdges[row])
 		for index, q := range configuration {
 			if q == nil || len(q.Tiles) == 0 {
 				continue

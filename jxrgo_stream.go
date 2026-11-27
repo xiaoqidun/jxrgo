@@ -15,6 +15,7 @@
 package jxrgo
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -116,8 +117,6 @@ type jxrPlane struct {
 	chromaY                  uint8
 	explicitChromaX          bool
 	explicitChromaY          bool
-	itemChroma               [2][2]uint8
-	hasItemChroma            bool
 	shift                    uint8
 	mantissa                 uint8
 	exponent                 int8
@@ -133,6 +132,12 @@ type jxrPlane struct {
 type jxrWriteCode struct {
 	value uint8
 	bits  uint8
+}
+
+// jxrPacketEntry 保存乱序频率包归一化排序用的偏移与逻辑索引
+type jxrPacketEntry struct {
+	offset uint64
+	index  int
 }
 
 // headerWork 计算已解析头部、索引及量化参数容量，不包含输入字节或系数图像
@@ -304,9 +309,9 @@ func jxrNormalizeEmptyFlexPackets(parser *jxrParser, s *jxrStream, length uint64
 	if !hasFlex {
 		return parser.check()
 	}
+	totalLen := length - s.dataStart
 	if bandOrdered {
 		cur := [3]int{0, 1, 2}
-		prevFlex, seenFlex := uint64(0), false
 		nextFlex := 3
 		for index := 3; index < len(s.packets); index += 4 {
 			if index&4095 == 3 {
@@ -318,22 +323,19 @@ func jxrNormalizeEmptyFlexPackets(parser *jxrParser, s *jxrStream, length uint64
 			if offset == jxrPacketEscape {
 				continue
 			}
-			if length-s.dataStart-offset < 4 {
+			if totalLen-offset < 4 {
 				s.packets[index] = jxrPacketEscape
-				prevFlex, seenFlex = offset, true
 				continue
 			}
-			empty := seenFlex && offset == prevFlex
-			if !empty {
-				if nextFlex <= index {
-					nextFlex = index + 4
-				}
-				for nextFlex < len(s.packets) && s.packets[nextFlex] == jxrPacketEscape {
-					nextFlex += 4
-				}
-				if nextFlex < len(s.packets) && s.packets[nextFlex]-offset < 4 {
-					empty = true
-				}
+			empty := false
+			if nextFlex <= index {
+				nextFlex = index + 4
+			}
+			for nextFlex < len(s.packets) && s.packets[nextFlex] == jxrPacketEscape {
+				nextFlex += 4
+			}
+			if nextFlex < len(s.packets) && s.packets[nextFlex]-offset < 4 {
+				empty = true
 			}
 			for b := range 3 {
 				for cur[b] < len(s.packets) && (s.packets[cur[b]] == jxrPacketEscape || s.packets[cur[b]] < offset) {
@@ -346,14 +348,13 @@ func jxrNormalizeEmptyFlexPackets(parser *jxrParser, s *jxrStream, length uint64
 			if empty {
 				s.packets[index] = jxrPacketEscape
 			}
-			prevFlex, seenFlex = offset, true
 		}
 		return parser.check()
 	}
-	var stack [64]uint64
-	sorted := stack[:0]
+	var stack [32]jxrPacketEntry
+	entries := stack[:0]
 	if validCount > len(stack) {
-		work := uint64(validCount) * 8
+		work := uint64(validCount) * 16
 		if err := parser.reserve(work); err != nil {
 			return err
 		}
@@ -362,7 +363,7 @@ func jxrNormalizeEmptyFlexPackets(parser *jxrParser, s *jxrStream, length uint64
 				parser.used -= work
 			}
 		}()
-		sorted = make([]uint64, 0, validCount)
+		entries = make([]jxrPacketEntry, 0, validCount)
 	}
 	for index, offset := range s.packets {
 		if index&1023 == 0 {
@@ -371,28 +372,49 @@ func jxrNormalizeEmptyFlexPackets(parser *jxrParser, s *jxrStream, length uint64
 			}
 		}
 		if offset != jxrPacketEscape {
-			sorted = append(sorted, offset)
+			entries = append(entries, jxrPacketEntry{offset: offset, index: index})
 		}
 	}
-	slices.Sort(sorted)
-	for index := 3; index < len(s.packets); index += 4 {
-		if index&4095 == 3 {
+	slices.SortFunc(entries, func(a, b jxrPacketEntry) int {
+		if c := cmp.Compare(a.offset, b.offset); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.index, b.index)
+	})
+	for start := 0; start < len(entries); {
+		if start&4095 == 0 {
 			if err := parser.check(); err != nil {
 				return err
 			}
 		}
-		offset := s.packets[index]
-		if offset == jxrPacketEscape {
-			continue
+		offset := entries[start].offset
+		end := start + 1
+		for end < len(entries) && entries[end].offset == offset {
+			end++
 		}
-		if length-s.dataStart-offset < 4 {
-			s.packets[index] = jxrPacketEscape
-			continue
+		nextOffset := totalLen
+		if end < len(entries) {
+			nextOffset = entries[end].offset
 		}
-		lo, _ := slices.BinarySearch(sorted, offset)
-		if lo+1 < len(sorted) && sorted[lo+1]-offset < 4 {
-			s.packets[index] = jxrPacketEscape
+		hasNonFlex := false
+		for i := start; i < end; i++ {
+			if entries[i].index&3 != 3 {
+				hasNonFlex = true
+				break
+			}
 		}
+		if hasNonFlex || nextOffset-offset < 4 {
+			for i := start; i < end; i++ {
+				if entries[i].index&3 == 3 {
+					s.packets[entries[i].index] = jxrPacketEscape
+				}
+			}
+		} else {
+			for i := start; i < end-1; i++ {
+				s.packets[entries[i].index] = jxrPacketEscape
+			}
+		}
+		start = end
 	}
 	return parser.check()
 }
@@ -624,27 +646,6 @@ func checkJXRImageHeaders(s *jxrStream, maxPixels uint64) error {
 	return nil
 }
 
-// writeJXRHeader 写入规范图像头及必要窗口字段，保留字段采用标准规定值
-// 入参: b 位写入器, h 图像头, maxPixels 输出像素上限
-func writeJXRHeader(b *jxrBitWriter, h *jxrHeader, maxPixels uint64) {
-	if b.err != nil {
-		return
-	}
-	if err := b.ctx.Err(); err != nil {
-		b.err = err
-		return
-	}
-	if err := checkJXRHeader(h, maxPixels); err != nil {
-		b.err = err
-		return
-	}
-	if b.bit%8 != 0 {
-		b.err = fmt.Errorf("%w: JPEG XR output header alignment", ErrInvalid)
-		return
-	}
-	writeJXRHeaderChecked(b, h)
-}
-
 // writeJXRHeaderChecked 在图像头已校验且写入器字节对齐前提下直接写入图像头比特
 // 入参: b 字节对齐位写入器, h 已校验图像头
 func writeJXRHeaderChecked(b *jxrBitWriter, h *jxrHeader) {
@@ -744,24 +745,6 @@ func checkJXRHeader(h *jxrHeader, maxPixels uint64) error {
 		}
 	}
 	return nil
-}
-
-// writeJXRStreamHeader 写入图像、主平面、透明度、包索引及档次级别声明，不写入像素包
-// 入参: b 位写入器, s 完整头部及相对包偏移, maxPixels 输出像素上限, wideIndex 是否采用固定六十四位索引表示
-// 返回: uint64 首个索引字节的位置，无索引或失败时为零
-func writeJXRStreamHeader(b *jxrBitWriter, s *jxrStream, maxPixels uint64, wideIndex bool) uint64 {
-	if b.err != nil {
-		return 0
-	}
-	if err := b.ctx.Err(); err != nil {
-		b.err = err
-		return 0
-	}
-	if err := checkJXRStreamOutput(s, maxPixels); err != nil {
-		b.err = err
-		return 0
-	}
-	return writeJXRStreamHeaderChecked(b, s, wideIndex)
 }
 
 // writeJXRStreamHeaderChecked 在调用方已校验完整码流头的前提下直接序列化码流头、包索引与档次级别声明
@@ -866,17 +849,6 @@ func checkJXRProfileDeclarations(profiles []jxrProfileLevel) error {
 		seen[key/64] |= mask
 	}
 	return nil
-}
-
-// chromaPhase 返回指定色度分量的四分之一样本相位，优先采用项目中已核实的相位
-// 入参: component 色度分量索引
-// 返回: uint8 水平色度相位, uint8 垂直色度相位
-func (p *jxrPlane) chromaPhase(component int) (uint8, uint8) {
-	if p.hasItemChroma {
-		phase := p.itemChroma[component-1]
-		return phase[0], phase[1]
-	}
-	return p.chromaX, p.chromaY
 }
 
 // readJXRPlane 读取有界图像平面头，透明度平面独立校验而不沿用主平面的颜色参数
@@ -1125,23 +1097,6 @@ func (p *jxrPlane) quantWork() uint64 {
 	return work
 }
 
-// writeJXRPlane 写入内部颜色、采样、数值格式及图像级量化字段
-// 入参: b 位写入器, h 图像头, p 平面参数, alpha 是否为透明度平面
-func writeJXRPlane(b *jxrBitWriter, h *jxrHeader, p *jxrPlane, alpha bool) {
-	if b.err != nil {
-		return
-	}
-	if err := b.ctx.Err(); err != nil {
-		b.err = err
-		return
-	}
-	if err := checkJXRPlaneHeader(h, p, alpha); err != nil {
-		b.err = err
-		return
-	}
-	writeJXRPlaneChecked(b, h, p)
-}
-
 // writeJXRPlaneChecked 在平面头已校验前提下直接写入平面头比特
 // 入参: b 位写入器, h 已校验图像头, p 已校验平面参数
 func writeJXRPlaneChecked(b *jxrBitWriter, h *jxrHeader, p *jxrPlane) {
@@ -1359,16 +1314,10 @@ func jxrAbs(value int64) int64 {
 	return value
 }
 
-// quantJXRValue 将有界系数量化为整数，非精确模式采用中点取偶舍入并校验重建值不越界
-// 入参: value 原始系数, factor 正量化倍率, longWord 是否使用三十二位范围, exact 是否要求精确恢复
-// 返回: int64 量化系数, error 参数、范围或精度错误
-func quantJXRValue(value, factor int64, longWord, exact bool) (int64, error) {
-	if factor < 1 {
-		return 0, fmt.Errorf("%w: JPEG XR quantization factor", ErrInvalid)
-	}
-	if err := checkJXRWords([]int64{value}, longWord); err != nil {
-		return 0, err
-	}
+// quantJXRValueChecked 在系数与正量化倍率已校验前提下量化为整数，消除逐系数切片分配并保留重建值越界检查
+// 入参: value 已校验原始系数, factor 已校验正量化倍率, longWord 是否使用三十二位范围, exact 是否要求精确恢复
+// 返回: int64 量化系数, error 范围或精度错误
+func quantJXRValueChecked(value, factor int64, longWord, exact bool) (int64, error) {
 	if factor == 1 {
 		return value, nil
 	}
@@ -1435,7 +1384,7 @@ func quantJXRLow(ctx context.Context, p *jxrPlane, values []int64, dc, lp []uint
 			if factor == 1 {
 				continue
 			}
-			value, err := quantJXRValue(values[index*16+at], factor, longWord, exact)
+			value, err := quantJXRValueChecked(values[index*16+at], factor, longWord, exact)
 			if err != nil {
 				return err
 			}
@@ -1475,7 +1424,7 @@ func quantJXRHigh(ctx context.Context, p *jxrPlane, values []int64, hp []uint8, 
 		for block := range blocks {
 			for at := 1; at < 16; at++ {
 				position := index*256 + block*16 + at
-				value, err := quantJXRValue(values[position], factor, longWord, exact)
+				value, err := quantJXRValueChecked(values[position], factor, longWord, exact)
 				if err != nil {
 					return err
 				}

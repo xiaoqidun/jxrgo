@@ -758,16 +758,6 @@ func (v *jxrMultiVLC) adapt(maximum uint8) {
 	}
 }
 
-// checkJXRModelComponents 检查归一化模型的分量支持范围
-// 入参: p 已通过分量布局校验的平面
-// 返回: error 越界分量数量错误
-func checkJXRModelComponents(p *jxrPlane) error {
-	if p.channels < 1 || p.channels > rasterMaxComponents {
-		return fmt.Errorf("%w: JPEG XR component normalization model", ErrInvalid)
-	}
-	return nil
-}
-
 // newJXRModel 初始化频带归一化状态
 // 入参: band 已校验的DC、低通或高通频带索引
 // 返回: jxrModel 初始状态

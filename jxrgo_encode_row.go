@@ -600,9 +600,6 @@ func newRowEncoder(ctx context.Context, w io.Writer, info Info, opts *EncodeOpti
 	if err := normalizeRasterInfo(&cleanInfo); err != nil {
 		return nil, err
 	}
-	if err := checkJXRModelComponents(&jxrPlane{channels: cleanInfo.Channels}); err != nil {
-		return nil, err
-	}
 	formatInfo, err := rasterPixelFormat(cleanInfo)
 	if err != nil {
 		return nil, err
@@ -1286,7 +1283,7 @@ func (e *RowEncoder) finish(ctx context.Context) error {
 	if e.uncompressed {
 		if e.uncTransform&4 != 0 {
 			dst := io.Writer(e.stageWriter)
-			if e.memStage != nil {
+			if e.stageReader != nil {
 				dst = e.finalWriter
 			}
 			if err := writeEncoderOutput(ctx, dst, e.uncHeader); err != nil {
@@ -1305,8 +1302,8 @@ func (e *RowEncoder) finish(ctx context.Context) error {
 					return err
 				}
 			}
-			if e.memStage != nil {
-				return ctx.Err()
+			if e.stageReader != nil {
+				return nil
 			}
 		} else if e.uncNeedSeek {
 			if err := seekJXRImageOutput(ctx, e.stageWriter, e.uncTotal); err != nil {
@@ -1355,6 +1352,11 @@ func (e *RowEncoder) finishSeparateAlpha(ctx context.Context) error {
 	if mainEnd < 0 || uint64(mainEnd) < e.mainStart || uint64(mainEnd) > e.fileMaxBytes {
 		return fmt.Errorf("%w: incremental separate alpha main extent", ErrInvalid)
 	}
+	e.local = nil
+	e.planes = [2]*jxrCoefficients{}
+	for band := range e.packets {
+		e.packets[band].data = nil
+	}
 	mainSize := uint64(mainEnd) - e.mainStart
 	cursor := uint64(mainEnd)
 	if cursor&1 != 0 {
@@ -1379,11 +1381,6 @@ func (e *RowEncoder) finishSeparateAlpha(ctx context.Context) error {
 		}
 	}
 	e.alphaStorage.position = 0
-	e.local = nil
-	e.planes = [2]*jxrCoefficients{}
-	for band := range e.packets {
-		e.packets[band].data = nil
-	}
 	alphaSource := jxrRowInput{
 		info:   e.ring.info,
 		cache:  e.ring,

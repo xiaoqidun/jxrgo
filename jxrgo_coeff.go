@@ -217,14 +217,6 @@ func (s *jxrStream) coefficientsContext(ctx context.Context, data []byte, maxWor
 	if s.decodeBand > BandDC {
 		return nil, fmt.Errorf("%w: JPEG XR decode band", ErrInvalid)
 	}
-	if err := checkJXRModelComponents(&s.primary); err != nil {
-		return nil, err
-	}
-	if s.alpha != nil {
-		if err := checkJXRModelComponents(s.alpha); err != nil {
-			return nil, err
-		}
-	}
 	limit := min(maxWork, uint64(^uint(0)>>1))
 	baseWork := s.coefficientWork()
 	if baseWork > limit {
@@ -268,8 +260,8 @@ func newJXRCoefficients(plane *jxrPlane, count int, longWord bool) jxrCoefficien
 	return jxrCoefficients{plane: *plane, longWord: longWord, low: make([]int64, count*plane.channels*16), high: make([]int64, count*plane.channels*256), info: make([]jxrMacroInfo, count)}
 }
 
-// jxrEmptyFlexPacket 判断频率模式精细位包是否因逃逸值或不足四字节而为空包
-// 入参: s 已校验码流头, data 独立码流, index 逻辑包编号
+// jxrEmptyFlexPacket 判断频率模式精细位包是否因逃逸值或尾余不足四字节而为空包
+// 入参: s 已校验并完成空包归一化的码流头, data 独立码流, index 逻辑包编号
 // 返回: bool 为空精细位包时为真
 func jxrEmptyFlexPacket(s *jxrStream, data []byte, index int) bool {
 	offset := s.packets[index]
@@ -280,13 +272,7 @@ func jxrEmptyFlexPacket(s *jxrStream, data []byte, index int) bool {
 	if s.input != nil {
 		length = s.input.size
 	}
-	if s.dataStart > length || offset > length-s.dataStart || length-s.dataStart-offset < 4 {
-		return true
-	}
-	if index+1 < len(s.packets) && s.packets[index+1] != jxrPacketEscape && s.packets[index+1] >= offset && s.packets[index+1]-offset < 4 {
-		return true
-	}
-	return false
+	return s.dataStart > length || offset > length-s.dataStart || length-s.dataStart-offset < 4
 }
 
 // jxrPacketReader 按已校验的包偏移定位并返回码流位读取器
@@ -353,13 +339,7 @@ func (c *jxrCoefficients) finishHighComponents(at int, q *jxrTileQuant, low [][1
 		return fmt.Errorf("%w: JPEG XR highpass direction storage", ErrInvalid)
 	}
 	values := c.highMacro(at)
-	if err := checkJXRWords(values, c.longWord); err != nil {
-		return err
-	}
 	if err := dequantJXRHigh(&c.plane, values, q, int(c.info[at].hpIndex), c.longWord); err != nil {
-		return err
-	}
-	if err := checkJXRWords(values, c.longWord); err != nil {
 		return err
 	}
 	mode := c.info[at].scanMode
@@ -369,15 +349,18 @@ func (c *jxrCoefficients) finishHighComponents(at int, q *jxrTileQuant, low [][1
 			copy(low[i][:], view[i*16:(i+1)*16])
 		}
 		var err error
-		mode, err = jxrHighpassMode(&c.plane, low[:c.plane.channels])
+		mode, err = jxrHighpassModeChecked(&c.plane, low[:c.plane.channels])
 		if err != nil {
 			return err
 		}
 	}
-	if err := applyJXRHighPrediction(&c.plane, values, mode, false); err != nil {
+	if err := applyJXRHighPredictionChecked(&c.plane, values, mode, false); err != nil {
 		return err
 	}
-	return checkJXRWords(values, c.longWord)
+	if !c.longWord && mode != 2 {
+		return checkJXRWords(values, false)
+	}
+	return nil
 }
 
 // readSpatial 按宏块及平面顺序解析空间模式系数，状态不跨越分块
@@ -959,9 +942,6 @@ func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, til
 			return offsets, fmt.Errorf("%w: JPEG XR output residual capacity", ErrInvalid)
 		}
 		if !output.validated {
-			if err := checkJXRModelComponents(&p.plane); err != nil {
-				return offsets, err
-			}
 			if err := checkJXRTileQuant(&p.plane, &output.quant[n]); err != nil {
 				return offsets, err
 			}
