@@ -365,9 +365,9 @@ func jxrIntegerInputSample(h *jxrHeader, color uint8, bias int64, precision, shi
 }
 
 // jxrFloatBits 将输出缩放后的整数值恢复为浮点位模式，保留符号、非规格化数及非有限数编码
-// 入参: value 输出缩放后的整数值, depth 浮点位深, mantissa 有效尾数位数, bias 码流指数偏置
+// 入参: value 输出缩放后的整数值, depth 浮点位深, mantissa 有效尾数位数, bias 码流无符号指数偏置
 // 返回: uint32 浮点位模式, error 参数或数值范围错误
-func jxrFloatBits(value int64, depth, mantissa uint8, bias int8) (uint32, error) {
+func jxrFloatBits(value int64, depth, mantissa, bias uint8) (uint32, error) {
 	if value < -1<<31 || value > 1<<31-1 {
 		return 0, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 	}
@@ -384,6 +384,9 @@ func jxrFloatBits(value int64, depth, mantissa uint8, bias int8) (uint32, error)
 	if value > 1<<31-1 {
 		return 0, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 	}
+	if value == 0 {
+		return sign << 31, nil
+	}
 	unit := int64(1) << mantissa
 	exponent, fraction := value>>mantissa, value&(unit-1)|unit
 	if exponent == 0 {
@@ -391,19 +394,27 @@ func jxrFloatBits(value int64, depth, mantissa uint8, bias int8) (uint32, error)
 		exponent = 1
 	}
 	exponent += 127 - int64(bias)
-	for fraction < unit && exponent > 1 && fraction > 0 {
+	for fraction < unit && exponent > 1 {
 		exponent--
 		fraction <<= 1
 	}
-	if fraction < unit {
+	sig := fraction << (23 - mantissa)
+	if exponent < 1 {
+		if shift := 1 - exponent; shift >= 24 {
+			sig = 0
+		} else {
+			sig >>= uint64(shift)
+		}
+		exponent = 0
+	} else if fraction < unit {
 		exponent = 0
 	} else {
-		fraction ^= unit
+		sig ^= 1 << 23
 	}
-	if exponent < 0 || exponent > 255 {
+	if exponent > 255 {
 		return 0, fmt.Errorf("%w: JPEG XR floating-point exponent", ErrInvalid)
 	}
-	return sign<<31 | uint32(exponent)<<23 | uint32(fraction)<<(23-mantissa), nil
+	return sign<<31 | uint32(exponent)<<23 | uint32(sig), nil
 }
 
 // float64HalfBits 直接将双精度值舍入为IEEE半精度位模式，保留符号零与非有限数并避免二次舍入
@@ -480,9 +491,9 @@ func jxrFloatInput(h *jxrHeader, p *jxrPlane, bits []uint32, values []int64, alp
 }
 
 // jxrFloatInputBits 将浮点位模式逆映射为编码侧整数样本，舍入取最近偶数编码且精确模式拒绝位模式变化
-// 入参: bits 浮点位模式, depth 浮点位深, mantissa 尾数长度, bias 指数偏置, exact 是否要求位模式精确恢复
+// 入参: bits 浮点位模式, depth 浮点位深, mantissa 尾数长度, bias 无符号指数偏置, exact 是否要求位模式精确恢复
 // 返回: int64 编码样本, error 格式、精度或数值范围错误
-func jxrFloatInputBits(bits uint32, depth, mantissa uint8, bias int8, exact bool) (int64, error) {
+func jxrFloatInputBits(bits uint32, depth, mantissa, bias uint8, exact bool) (int64, error) {
 	if depth == 4 {
 		if bits > 65535 {
 			return 0, fmt.Errorf("%w: JPEG XR half input bit width", ErrInvalid)
@@ -501,26 +512,30 @@ func jxrFloatInputBits(bits uint32, depth, mantissa uint8, bias int8, exact bool
 	}
 	negative := bits>>31 != 0
 	absolute := bits & 0x7fffffff
-	exponent := int64(absolute >> 23)
-	fraction := int64(absolute&0x7fffff) | 1<<23
-	if exponent == 0 {
-		fraction ^= 1 << 23
-		exponent = 1
-	}
-	exponent += int64(bias) - 127
-	if exponent <= 1 {
-		if exponent < 1 {
-			fraction >>= uint64(1 - exponent)
-		}
-		exponent = 1
-		if fraction&(1<<23) == 0 {
-			exponent = 0
-		}
-	}
-	value := exponent<<mantissa | (fraction&0x7fffff)>>(23-mantissa)
 	maximum := min(int64(1<<31-1), (int64(bias)+129)<<mantissa-1)
-	if value > maximum {
-		return 0, fmt.Errorf("%w: JPEG XR floating input working range", ErrInvalid)
+	value := int64(0)
+	if absolute != 0 {
+		exponent := int64(absolute >> 23)
+		fraction := int64(absolute & 0x7fffff)
+		if exponent == 0 {
+			exponent = 1
+			for fraction < 1<<23 {
+				fraction <<= 1
+				exponent--
+			}
+		} else {
+			fraction |= 1 << 23
+		}
+		exponent += int64(bias) - 127
+		if exponent <= 0 {
+			fraction >>= uint64(1 - exponent)
+			value = fraction >> (23 - mantissa)
+		} else {
+			value = exponent<<mantissa | (fraction&0x7fffff)>>(23-mantissa)
+		}
+		if value > maximum {
+			value = maximum
+		}
 	}
 	lower, err := jxrFloatBits(value, 7, mantissa, bias)
 	if err != nil {

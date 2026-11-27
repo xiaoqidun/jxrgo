@@ -372,20 +372,6 @@ func (parser *jxrParser) container(data []byte, maxPixels uint64) (jxrContainer,
 // 入参: d 已校验的原始目录视图, maxPixels 图像像素上限
 // 返回: jxrContainer 当前图像容器, error 元数据、数据或资源错误
 func (parser *jxrParser) directoryContainer(d *jxrDirectory, maxPixels uint64) (jxrContainer, error) {
-	c, err := parser.directoryFields(d, maxPixels)
-	if err != nil {
-		return c, err
-	}
-	if c.uncompressed {
-		return c, nil
-	}
-	return c, c.checkProfile(parser, maxPixels)
-}
-
-// directoryFields 读取容器目录标签与码流位置，供已解析码流的入口共用
-// 入参: d 已校验原始目录视图, maxPixels 图像像素上限
-// 返回: jxrContainer 解析得到的容器元数据, error 标签、格式或资源错误
-func (parser *jxrParser) directoryFields(d *jxrDirectory, maxPixels uint64) (jxrContainer, error) {
 	c := jxrContainer{dpi: Resolution{96, 96}, missingBandTags: jxrMissingImageBandTag | jxrMissingAlphaBandTag}
 	d.parser = parser
 	if err := parser.reserve(512); err != nil {
@@ -1575,18 +1561,7 @@ func checkJXRContainer(b *jxrBitWriter, c *jxrContainer, maxPixels uint64) (*jxr
 		return nil, nil, err
 	}
 	parser := jxrParser{ctx: b.ctx, limit: available}
-	source, err := parser.containerSource(c, maxPixels)
-	if err != nil {
-		return nil, nil, err
-	}
-	if c.uncompressed {
-		return exifNode, gpsNode, nil
-	}
-	channels := c.format.channels
-	if c.format.alpha {
-		channels++
-	}
-	if err := source.primary.checkProfileList(c.profiles, c.format.alpha, channels); err != nil {
+	if _, err := parser.containerSource(c, maxPixels); err != nil {
 		return nil, nil, err
 	}
 	return exifNode, gpsNode, nil
@@ -2398,6 +2373,9 @@ func (s *jxrStream) checkLevel(level uint8, channels int) error {
 					size *= 2
 				}
 			}
+			if h.color == 8 {
+				size = width * height * 4
+			}
 			if size >= limit.buffer {
 				return fmt.Errorf("%w: JPEG XR level image buffer", ErrInvalid)
 			}
@@ -2405,24 +2383,4 @@ func (s *jxrStream) checkLevel(level uint8, channels int) error {
 		return nil
 	}
 	return nil
-}
-
-// checkProfile 校验容器声明，缓冲分量数按像素格式计算而非沿用主码流分量数
-// 入参: parser 共享解析预算, maxPixels 输出像素预算
-// 返回: error 档次、级别或图像头错误
-func (c *jxrContainer) checkProfile(parser *jxrParser, maxPixels uint64) error {
-	if len(c.profiles) == 0 {
-		return nil
-	}
-	retained := parser.used
-	defer func() { parser.used = retained }()
-	s, err := parser.streamView(c.image, c.imageInput, maxPixels)
-	if err != nil {
-		return err
-	}
-	count := c.format.channels
-	if c.format.alpha {
-		count++
-	}
-	return s.checkProfileList(c.profiles, c.format.alpha, count)
 }

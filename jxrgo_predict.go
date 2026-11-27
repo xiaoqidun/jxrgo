@@ -219,12 +219,12 @@ func jxrHighpassModeChecked(p *jxrPlane, values [][16]int64) (uint8, error) {
 	return 2, nil
 }
 
-// dequantJXRHigh 按高通量化集合缩放有效块的非DC系数
-// 入参: p 图像平面, values 分量步长为256的高通系数缓冲, q 分块量化参数, index 当前量化集合索引, longWord 是否使用三十二位范围
-// 返回: error 索引、缓冲或数值范围错误
-func dequantJXRHigh(p *jxrPlane, values []int64, q *jxrTileQuant, index int, longWord bool) error {
-	if p == nil || q == nil || p.channels < 1 || p.channels > rasterMaxComponents || index < 0 || index >= q.hpCount || index >= len(q.hp) || len(values) < p.channels*256 || len(q.hp[index]) != p.channels {
-		return fmt.Errorf("%w: JPEG XR highpass quantization buffer or index", ErrInvalid)
+// dequantJXRHighChecked 在平面与分块量化存储已由分块入口静态校验前提下按高通量化集合缩放有效块的非DC系数，保留动态索引与字长保护
+// 入参: p 已校验图像平面, values 分量步长为256的高通系数缓冲, q 已校验分块量化参数, index 当前量化集合索引, longWord 是否使用三十二位范围
+// 返回: error 动态索引或数值范围错误
+func dequantJXRHighChecked(p *jxrPlane, values []int64, q *jxrTileQuant, index int, longWord bool) error {
+	if index < 0 || index >= q.hpCount {
+		return fmt.Errorf("%w: JPEG XR highpass quantization index", ErrInvalid)
 	}
 	for i := range p.channels {
 		blocks := 16
@@ -378,11 +378,11 @@ func (r *jxrTileRow) reset() {
 // 入参: x 当前列, current 当前宏块缓存
 // 返回: error 缓存容量或列序号错误
 func (r *jxrTileRow) advance(x int, current *jxrTileNeighbor) error {
-	if x < 0 || x >= len(r.top) || current == nil || len(current.low.values) != len(r.left.low.values) || len(r.top[x].low.values) != len(r.left.low.values) || len(r.corner.low.values) != len(r.left.low.values) {
+	count := len(r.left.low.values)
+	if x < 0 || x >= len(r.top) || current == nil || len(current.low.values) != count {
 		return fmt.Errorf("%w: JPEG XR prediction row update", ErrInvalid)
 	}
-	count := len(r.left.low.values)
-	if len(r.left.pattern) != count || len(r.top[x].pattern) != count || len(r.corner.pattern) != count || current.pattern != nil && len(current.pattern) != count {
+	if current.pattern != nil && len(current.pattern) != count {
 		return fmt.Errorf("%w: JPEG XR prediction row pattern storage", ErrInvalid)
 	}
 	copy(r.left.low.values, current.low.values)
@@ -510,7 +510,7 @@ func (c *jxrCoefficients) prepareHighpass(ctx context.Context, q *jxrTileQuant, 
 		}
 		return c.checkQuantizedHighResidual(ctx, output.high, hp)
 	}
-	if err := dequantJXRLowComponents(p, output.dc, output.lp, q, lpIndex, c.longWord, output.decoded); err != nil {
+	if err := dequantJXRLowComponentsChecked(p, output.dc, output.lp, q, lpIndex, c.longWord, output.decoded); err != nil {
 		return err
 	}
 	mode, err = jxrHighpassModeChecked(p, output.decoded)

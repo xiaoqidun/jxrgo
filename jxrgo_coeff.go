@@ -232,18 +232,39 @@ func (s *jxrStream) coefficientsContext(ctx context.Context, data []byte, maxWor
 	}
 	tiles := (len(s.header.columns) - 1) * (len(s.header.rows) - 1)
 	workers := 1
-	if tiles > 1 && s.workers > 1 && s.input == nil && s.header.index {
+	if tiles > 1 && s.workers > 1 && s.header.index {
 		perWorker := s.tileScratchWork()
+		if perWorker != ^uint64(0) && s.input != nil {
+			if jxrReaderAtWork > ^uint64(0)-perWorker {
+				perWorker = ^uint64(0)
+			} else {
+				perWorker += jxrReaderAtWork
+			}
+		}
 		if perWorker != ^uint64(0) {
 			workers = resolveJXRWorkers(s.workers, tiles)
 			workers = budgetJXRWorkers(workers, jxrSaturatedAdd(limit-baseWork, perWorker), perWorker)
 		}
 	}
-	if err := runJXRWorkers(ctx, workers, tiles, func(runCtx context.Context, tile int) error {
-		if s.header.frequency {
-			return img.readFrequency(runCtx, data, s, tile)
+	var slotStreams []jxrStream
+	if workers > 1 && s.input != nil {
+		slotStreams = make([]jxrStream, workers)
+		for slot := range workers {
+			slotStreams[slot] = *s
+			slotStreams[slot].input = cloneJXRReaderAt(s.input)
 		}
-		return img.readSpatial(runCtx, data, s, tile)
+	}
+	if err := runJXRWorkerSlots(ctx, workers, tiles, func(runCtx context.Context, slot, tile int) error {
+		stream := s
+		if slotStreams != nil {
+			stream = &slotStreams[slot]
+			stream.input.ctx = runCtx
+			defer func() { stream.input.ctx = nil }()
+		}
+		if stream.header.frequency {
+			return img.readFrequency(runCtx, data, stream, tile)
+		}
+		return img.readSpatial(runCtx, data, stream, tile)
 	}); err != nil {
 		return nil, err
 	}
@@ -339,7 +360,7 @@ func (c *jxrCoefficients) finishHighComponents(at int, q *jxrTileQuant, low [][1
 		return fmt.Errorf("%w: JPEG XR highpass direction storage", ErrInvalid)
 	}
 	values := c.highMacro(at)
-	if err := dequantJXRHigh(&c.plane, values, q, int(c.info[at].hpIndex), c.longWord); err != nil {
+	if err := dequantJXRHighChecked(&c.plane, values, q, int(c.info[at].hpIndex), c.longWord); err != nil {
 		return err
 	}
 	mode := c.info[at].scanMode
@@ -676,7 +697,7 @@ func (c *jxrCoefficients) readDC(b *jxrBits, decoder *jxrDC, q *jxrTileQuant, m 
 	storeJXRLowChecked(&c.plane, dc[:c.plane.channels], nil, 0, cache)
 	if c.plane.bands == 3 {
 		values := scratch.low
-		if err := dequantJXRLowComponents(&c.plane, dc, nil, q, 0, c.longWord, values); err != nil {
+		if err := dequantJXRLowComponentsChecked(&c.plane, dc, nil, q, 0, c.longWord, values); err != nil {
 			return err
 		}
 		if err := c.storeLowComponents(m.at, values); err != nil {
@@ -721,7 +742,7 @@ func (c *jxrCoefficients) readLP(b *jxrBits, decoder *jxrLP, q *jxrTileQuant, m 
 		return err
 	}
 	info.scanMode = mode
-	if err := dequantJXRLowComponents(&c.plane, dc[:], values[:], q, int(info.lpIndex), c.longWord, values[:]); err != nil {
+	if err := dequantJXRLowComponentsChecked(&c.plane, dc[:], values[:], q, int(info.lpIndex), c.longWord, values[:]); err != nil {
 		return err
 	}
 	return c.storeLowComponents(m.at, values)

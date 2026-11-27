@@ -274,7 +274,7 @@ func (source *jxrRasterSource) copyRegionTile(ctx context.Context, target *Raste
 		start = len(tile.info.Components) - 1
 	}
 	for index := start; index < len(tile.info.Components); index++ {
-		component, err := tile.Component(index)
+		component, err := tile.component(index)
 		if err != nil {
 			return err
 		}
@@ -286,26 +286,103 @@ func (source *jxrRasterSource) copyRegionTile(ctx context.Context, target *Raste
 		info := target.info.Components[destination]
 		sx, sy := int(component.info.XStep), int(component.info.YStep)
 		x0, y0 := region.Min.X/int(info.XStep), region.Min.Y/int(info.YStep)
-		for y := range component.Bounds().Dy() {
-			if err := ctx.Err(); err != nil {
-				return err
+		src := component.source
+		srcStride := src.channels
+		if src.alpha {
+			srcStride++
+		}
+		srcW, srcH := src.bounds.Dx(), src.bounds.Dy()
+		outW, outH := out.bounds.Dx(), out.bounds.Dy()
+		orgX, orgY := origin.X/sx, origin.Y/sy
+		if transform == 0 {
+			dstX0, dstY0 := orgX-x0, orgY-y0
+			sx0, sy0 := max(0, -dstX0), max(0, -dstY0)
+			sx1, sy1 := min(srcW, outW-dstX0), min(srcH, outH-dstY0)
+			copyW := sx1 - sx0
+			if copyW <= 0 || sy0 >= sy1 {
+				continue
 			}
-			for x := range component.Bounds().Dx() {
-				if x&1023 == 0 {
+			if src.words != nil {
+				srcWords, dstWords := src.words, out.words
+				if srcStride == 1 {
+					for y := sy0; y < sy1; y++ {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+						from := y*srcW + sx0
+						to := (y+dstY0)*outW + sx0 + dstX0
+						copy(dstWords[to:to+copyW], srcWords[from:from+copyW])
+					}
+					continue
+				}
+				for y := sy0; y < sy1; y++ {
 					if err := ctx.Err(); err != nil {
 						return err
 					}
+					from := (y*srcW+sx0)*srcStride + component.index
+					to := (y+dstY0)*outW + sx0 + dstX0
+					for x := range copyW {
+						dstWords[to+x] = srcWords[from+x*srcStride]
+					}
 				}
-				px, py := jxrRasterPosition(x+origin.X/sx, y+origin.Y/sy, width/sx, height/sy, transform)
-				px, py = px-x0, py-y0
-				if !image.Pt(px, py).In(out.bounds) {
-					continue
+				continue
+			}
+			srcVals, dstVals := src.values, out.values
+			if srcStride == 1 {
+				for y := sy0; y < sy1; y++ {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					from := y*srcW + sx0
+					to := (y+dstY0)*outW + sx0 + dstX0
+					copy(dstVals[to:to+copyW], srcVals[from:from+copyW])
 				}
-				bits, err := component.SampleBits(x, y)
-				if err != nil {
+				continue
+			}
+			for y := sy0; y < sy1; y++ {
+				if err := ctx.Err(); err != nil {
 					return err
 				}
-				out.storeBits(py*out.bounds.Dx()+px, bits)
+				from := (y*srcW+sx0)*srcStride + component.index
+				to := (y+dstY0)*outW + sx0 + dstX0
+				for x := range copyW {
+					dstVals[to+x] = srcVals[from+x*srcStride]
+				}
+			}
+			continue
+		}
+		cw, ch := width/sx, height/sy
+		if src.words != nil {
+			srcWords, dstWords := src.words, out.words
+			for y := range srcH {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				rowOff := y*srcW*srcStride + component.index
+				for x := range srcW {
+					px, py := jxrRasterPosition(x+orgX, y+orgY, cw, ch, transform)
+					px, py = px-x0, py-y0
+					if uint(px) >= uint(outW) || uint(py) >= uint(outH) {
+						continue
+					}
+					dstWords[py*outW+px] = srcWords[rowOff+x*srcStride]
+				}
+			}
+			continue
+		}
+		srcVals, dstVals := src.values, out.values
+		for y := range srcH {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			rowOff := y*srcW*srcStride + component.index
+			for x := range srcW {
+				px, py := jxrRasterPosition(x+orgX, y+orgY, cw, ch, transform)
+				px, py = px-x0, py-y0
+				if uint(px) >= uint(outW) || uint(py) >= uint(outH) {
+					continue
+				}
+				dstVals[py*outW+px] = srcVals[rowOff+x*srcStride]
 			}
 		}
 	}

@@ -17,6 +17,7 @@ package jxrgo
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -792,7 +793,7 @@ func jxrQualityQuantization(quality int) *Quantization {
 	return &Quantization{DC: []uint8{dc}, Lowpass: []uint8{qp}, Highpass: []uint8{qp}}
 }
 
-// jxrResolveEncodeOptions 展开EncodeOptions中的Quality质量预设至标准量化表与有损标志，不修改调用方原配置
+// jxrResolveEncodeOptions 展开EncodeOptions中的主平面与透明度Quality质量预设至标准量化表与有损标志，不修改调用方原配置
 // 入参: o 已校验的编码选项值副本
 // 返回: EncodeOptions 展开质量预设后的选项副本
 func jxrResolveEncodeOptions(o EncodeOptions) EncodeOptions {
@@ -803,20 +804,41 @@ func jxrResolveEncodeOptions(o EncodeOptions) EncodeOptions {
 		o.Lossy = true
 	}
 	o.Quality = 0
+	if o.Alpha != nil {
+		alpha := *o.Alpha
+		if alpha.Quality > 0 && alpha.Quality < 100 {
+			if alpha.Quantization == nil {
+				alpha.Quantization = jxrQualityQuantization(alpha.Quality)
+			}
+			if !o.SeparateAlpha {
+				o.Lossy = true
+			}
+		}
+		if !o.SeparateAlpha {
+			alpha.Quality = 0
+		}
+		o.Alpha = &alpha
+	}
 	return o
 }
 
-// jxrInputTransform 按原生四二二采样方向确定编码网格的转置位，其他颜色保留明确请求的方向
+// jxrInputTransform 按原生四二二采样方向校验并确定编码网格转置位，未指定方向时自动补齐垂直子采样转置，显式冲突方向返回无效错误
 // 入参: info 已校验原生描述, color 编码输出颜色, transform 请求的标准方向
-// 返回: uint8 实际编码网格到原生显示网格的方向
-func jxrInputTransform(info Info, color, transform uint8) uint8 {
+// 返回: uint8 实际编码网格到原生显示网格的方向, error 方向冲突错误
+func jxrInputTransform(info Info, color, transform uint8) (uint8, error) {
 	if color == 2 {
-		transform &^= 4
-		if info.Components[1].XStep == 1 && info.Components[1].YStep == 2 {
-			transform |= 4
+		vertical := info.Components[1].XStep == 1 && info.Components[1].YStep == 2
+		if transform == uint8(OrientationNone) {
+			if vertical {
+				return uint8(OrientationRotate90), nil
+			}
+			return 0, nil
+		}
+		if (transform&4 != 0) != vertical {
+			return 0, fmt.Errorf("%w: YCC422 orientation conflicts with native subsampling axis", ErrInvalid)
 		}
 	}
-	return transform
+	return transform, nil
 }
 
 // newJXRInputStream 从原生图像及布局建立编码头部与包索引空间，未指定的内部颜色采用对应可逆格式
@@ -852,6 +874,13 @@ func newJXRInputStream(ctx context.Context, raster *Raster, layout jxrStream, ma
 // 入参: ctx 已规范化Context, info 原生元数据, layout 编码布局, maxPixels 像素上限, maxMemory 新头部内存上限
 // 返回: jxrStream 独立头部及包目录, error 元数据、布局、资源或取消错误
 func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixels, maxMemory uint64) (jxrStream, error) {
+	return newJXRInputHeaderWithTiles(ctx, info, layout, image.Point{}, maxPixels, maxMemory)
+}
+
+// newJXRInputHeaderWithTiles 按原生元数据与可选分块尺寸一次建立编码头与包目录，消除二次建表
+// 入参: ctx 已规范化Context, info 原生元数据, layout 编码布局, tileSize 可选十六对齐分块尺寸, maxPixels 像素上限, maxMemory 新头部内存上限
+// 返回: jxrStream 独立头部及包目录, error 元数据、布局、资源或取消错误
+func newJXRInputHeaderWithTiles(ctx context.Context, info Info, layout jxrStream, tileSize image.Point, maxPixels, maxMemory uint64) (jxrStream, error) {
 	if err := ctx.Err(); err != nil {
 		return jxrStream{}, err
 	}
@@ -874,7 +903,11 @@ func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixe
 	}
 	s := layout
 	h := &s.header
-	h.transform = jxrInputTransform(info, f.color, h.transform)
+	transform, err := jxrInputTransform(info, f.color, h.transform)
+	if err != nil {
+		return jxrStream{}, err
+	}
+	h.transform = transform
 	h.width, h.height = uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
 	if h.transform&4 != 0 {
 		h.width, h.height = h.height, h.width
@@ -901,17 +934,34 @@ func newJXRInputHeader(ctx context.Context, info Info, layout jxrStream, maxPixe
 		}
 	}
 	if h.columns == nil {
-		extent := (h.width + uint64(h.left) + uint64(h.right)) / 16
-		h.columns = []uint32{0, uint32(extent)}
-		if extent == jxrDimensionLimit/16 {
-			h.columns = []uint32{0, 1, uint32(extent)}
+		totalW := h.width + uint64(h.left) + uint64(h.right)
+		extent := totalW / 16
+		if tileSize.X != 0 && h.left <= 63 && h.right <= 63 && totalW%16 == 0 && extent > 0 && extent <= jxrDimensionLimit/16 {
+			adjustCols := h.hardTiles && h.overlap == 2 && (internalColor == 1 || internalColor == 2)
+			h.columns, err = jxrTileColumnBoundaries(uint32(extent), uint32(tileSize.X/16), adjustCols, maxMemory)
+			if err != nil {
+				return jxrStream{}, err
+			}
+		} else {
+			h.columns = []uint32{0, uint32(extent)}
+			if extent == jxrDimensionLimit/16 {
+				h.columns = []uint32{0, 1, uint32(extent)}
+			}
 		}
 	}
 	if h.rows == nil {
-		extent := (h.height + uint64(h.top) + uint64(h.bottom)) / 16
-		h.rows = []uint32{0, uint32(extent)}
-		if extent == jxrDimensionLimit/16 {
-			h.rows = []uint32{0, 1, uint32(extent)}
+		totalH := h.height + uint64(h.top) + uint64(h.bottom)
+		extent := totalH / 16
+		if tileSize.Y != 0 && h.top <= 63 && h.bottom <= 63 && totalH%16 == 0 && extent > 0 && extent <= jxrDimensionLimit/16 {
+			h.rows, err = jxrTileColumnBoundaries(uint32(extent), uint32(tileSize.Y/16), false, maxMemory)
+			if err != nil {
+				return jxrStream{}, err
+			}
+		} else {
+			h.rows = []uint32{0, uint32(extent)}
+			if extent == jxrDimensionLimit/16 {
+				h.rows = []uint32{0, 1, uint32(extent)}
+			}
 		}
 	}
 	h.index = h.index || h.frequency || len(h.columns) > 2 || len(h.rows) > 2
@@ -1083,7 +1133,9 @@ func makeJXREncodingPlan(ctx context.Context, raster *Raster, opts *EncodeOption
 // 返回: jxrStream 编码头部, jxrNativeOutput 输出参数, error 选项、资源或取消错误
 func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *EncodeOptions, retained uint64) (jxrStream, jxrNativeOutput, error) {
 	var o EncodeOptions
+	alphaExplicitLossless := false
 	if opts != nil {
+		alphaExplicitLossless = opts.Alpha != nil && opts.Alpha.Quality == 100
 		o = jxrResolveEncodeOptions(*opts)
 	}
 	limits := o.Limits.normalized()
@@ -1173,33 +1225,16 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 		if !raster.info.Alpha {
 			return layout, output, fmt.Errorf("%w: alpha options without alpha", ErrInvalid)
 		}
-		alpha, err := makeJXREncodePlane(ctx, raster, *o.Alpha, true, false, o.Lossy, o.Overlap)
+		alpha, err := makeJXREncodePlane(ctx, raster, *o.Alpha, true, false, o.Lossy && !alphaExplicitLossless, o.Overlap)
 		if err != nil {
 			return layout, output, err
 		}
 		alpha.legacyHighpassPrediction = o.LegacyHighpassPrediction
 		layout.alpha = &alpha
 	}
-	s, err := newJXRInputHeader(ctx, raster.info, layout, limits.MaxPixels, available)
+	s, err := newJXRInputHeaderWithTiles(ctx, raster.info, layout, o.TileSize, limits.MaxPixels, available)
 	if err != nil {
 		return layout, output, err
-	}
-	if o.TileSize.X != 0 || o.TileSize.Y != 0 {
-		adjustCols := s.header.hardTiles && s.header.overlap == 2 && (s.primary.color == 1 || s.primary.color == 2)
-		columns, err := jxrTileColumnBoundaries(s.header.columns[len(s.header.columns)-1], uint32(o.TileSize.X/16), adjustCols, available)
-		if err != nil {
-			return layout, output, err
-		}
-		rows, err := jxrTileColumnBoundaries(s.header.rows[len(s.header.rows)-1], uint32(o.TileSize.Y/16), false, available)
-		if err != nil {
-			return layout, output, err
-		}
-		s.header.columns, s.header.rows = columns, rows
-		s.header.short = false
-		s, err = newJXRInputHeader(ctx, raster.info, s, limits.MaxPixels, available)
-		if err != nil {
-			return layout, output, err
-		}
 	}
 	output.stream.tiles, output.stream.quantWork, err = planJXRQuantization(ctx, &s, o, available)
 	if err != nil {
@@ -1218,6 +1253,14 @@ func checkJXREncodeOptions(o EncodeOptions) error {
 	}
 	if o.Quality < 0 || o.Quality > 100 {
 		return fmt.Errorf("%w: encode quality", ErrInvalid)
+	}
+	if o.Alpha != nil {
+		if o.Alpha.Quality < 0 || o.Alpha.Quality > 100 {
+			return fmt.Errorf("%w: encode alpha quality", ErrInvalid)
+		}
+		if o.Alpha.Quality != 0 && o.Alpha.Quantization != nil {
+			return fmt.Errorf("%w: encode alpha quality conflicts with quantization", ErrInvalid)
+		}
 	}
 	if o.Resolution != nil {
 		for _, resolution := range [2]float64{o.Resolution.X, o.Resolution.Y} {
@@ -1322,24 +1365,24 @@ func jxrFloatGainBits(channels int, scaled bool, overlap Overlap, lossy bool) in
 	return gain
 }
 
-// jxrFloatSampleBound 计算非负单精度浮点位模式在指定偏置下的无损整数映射幅值
-// 入参: raw 清除符号位后的IEEE754单精度位模式, bias 候选指数偏置
+// jxrFloatSampleBound 计算非负单精度浮点位模式在指定尾数长度与偏置下的无损整数映射幅值
+// 入参: raw 清除符号位后的IEEE754单精度位模式, mantissa 尾数位数, bias 候选无符号指数偏置
 // 返回: int64 整数映射幅值，超出范围时返回最大整数
-func jxrFloatSampleBound(raw uint32, bias int8) int64 {
-	value, err := jxrFloatInputBits(raw, 7, 23, bias, false)
+func jxrFloatSampleBound(raw uint32, mantissa, bias uint8) int64 {
+	value, err := jxrFloatInputBits(raw, 7, mantissa, bias, false)
 	if err != nil {
 		return math.MaxInt64
 	}
 	return value
 }
 
-// jxrVerifyFloatLosslessCapacity 在极端跨指数区间按宏块核验实际无损单精度像素是否超出三十二位变换字长
-// 入参: ctx Context, raster 原生图像, base 首分量下标, count 需覆盖的分量数, isRGB 前三通道是否执行RGB正向色彩变换, scaled 是否启用预缩放, overlap 重叠滤波级别, bias 候选指数偏置
+// jxrVerifyFloatLosslessCapacity 在极端跨指数区间按宏块核验实际无损单精度像素是否超出三十二位变换与高通字长
+// 入参: ctx Context, raster 原生图像, base 首分量下标, count 需覆盖的分量数, isRGB 前三通道是否执行RGB正向色彩变换, scaled 是否启用预缩放, overlap 重叠滤波级别, mantissa 候选尾数位数, bias 候选无符号指数偏置
 // 返回: error 无法无损容纳或取消错误
-func jxrVerifyFloatLosslessCapacity(ctx context.Context, raster *Raster, base, count int, isRGB, scaled bool, overlap Overlap, bias int8) error {
+func jxrVerifyFloatLosslessCapacity(ctx context.Context, raster *Raster, base, count int, isRGB, scaled bool, overlap Overlap, mantissa, bias uint8) error {
 	var comps [4]Component
 	for index := range count {
-		component, err := raster.Component(base + index)
+		component, err := raster.component(base + index)
 		if err != nil {
 			return err
 		}
@@ -1379,7 +1422,7 @@ func jxrVerifyFloatLosslessCapacity(ctx context.Context, raster *Raster, base, c
 					pixOff := rowOff + cx*stride
 					var vals [4]int64
 					for i := range count {
-						v, err := jxrFloatInputBits(words[pixOff+comps[i].index], 7, 23, bias, false)
+						v, err := jxrFloatInputBits(words[pixOff+comps[i].index], 7, mantissa, bias, false)
 						if err != nil {
 							return fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
 						}
@@ -1416,7 +1459,7 @@ func jxrVerifyFloatLosslessCapacity(ctx context.Context, raster *Raster, base, c
 				}
 				dcEst := (jxrAbs(sums[i]) >> dcShift) * ovNum / ovDen
 				acEst := (maxAbs[i] << 2) * ovNum / ovDen
-				if dcEst > jxrLongWordMax || acEst > jxrLongWordMax {
+				if dcEst > jxrLongWordMax || acEst > 1<<30+1 {
 					return fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
 				}
 			}
@@ -1457,13 +1500,13 @@ func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alp
 		} else {
 			hasNormal, hasSubnormal := false, false
 			maxExp, maxRaw := uint32(0), uint32(0)
-			needBias := -128
+			minMantissa, needSum := 0, 0
 			n := count
 			if includeAlpha && raster.info.Alpha {
 				n++
 			}
 			for index := range n {
-				component, err := raster.Component(base + index)
+				component, err := raster.component(base + index)
 				if err != nil {
 					return p, err
 				}
@@ -1493,54 +1536,83 @@ func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alp
 						exp := raw >> 23
 						if exp == 0 {
 							hasSubnormal = true
-							needBias = max(needBias, 127-bits.TrailingZeros32(raw))
+							msb := 31 - bits.LeadingZeros32(raw)
+							lsb := bits.TrailingZeros32(raw)
+							minMantissa = max(minMantissa, msb-lsb)
+							needSum = max(needSum, 150-lsb)
 							continue
 						}
 						hasNormal = true
 						maxExp = max(maxExp, exp)
 						tz := min(23, bits.TrailingZeros32(raw&0x7fffff))
-						needBias = max(needBias, 128-int(exp)-tz)
+						minMantissa = max(minMantissa, 23-tz)
+						needSum = max(needSum, 151-int(exp)-tz)
 					}
 				}
 			}
-			p.mantissa = 23
 			if !hasNormal && !hasSubnormal {
-				p.exponent = 127
+				p.mantissa, p.exponent = 23, 127
 			} else {
-				if needBias > 127 {
-					return p, fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
-				}
 				gainBits := jxrFloatGainBits(count, p.scaled, overlap, false)
 				safeLimit := (int64(1) << 31) >> gainBits
 				hardGain := 2
 				if p.scaled {
 					hardGain += 3
 				}
-				needVal := jxrFloatSampleBound(maxRaw, int8(needBias))
-				if needVal > int64(jxrLongWordMax)>>hardGain {
-					return p, fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
-				}
-				bias := needBias
-				if needVal <= safeLimit {
-					candidate := needBias
-					if hasNormal {
-						candidate = max(128-int(maxExp), needBias)
+				found := false
+				for m := 23; m >= minMantissa; m-- {
+					needBias := max(0, needSum-m)
+					if needBias > 255 {
+						break
 					}
-					candidate = min(127, max(-128, candidate))
-					if jxrFloatSampleBound(maxRaw, int8(candidate)) <= safeLimit {
-						bias = candidate
-					} else {
-						for b := candidate - 1; b >= needBias; b-- {
-							if jxrFloatSampleBound(maxRaw, int8(b)) <= safeLimit {
-								bias = b
-								break
+					targetLimit := safeLimit
+					if m < 23 {
+						targetLimit >>= 1
+					}
+					if jxrFloatSampleBound(maxRaw, uint8(m), uint8(needBias)) <= targetLimit {
+						bias := needBias
+						candidate := needBias
+						if hasNormal {
+							candidate = max(128-int(maxExp), needBias)
+						}
+						candidate = min(255, candidate)
+						if jxrFloatSampleBound(maxRaw, uint8(m), uint8(candidate)) <= targetLimit {
+							bias = candidate
+						} else {
+							for b := candidate - 1; b >= needBias; b-- {
+								if jxrFloatSampleBound(maxRaw, uint8(m), uint8(b)) <= targetLimit {
+									bias = b
+									break
+								}
 							}
 						}
+						p.mantissa, p.exponent = uint8(m), uint8(bias)
+						found = true
+						break
 					}
-				} else if err := jxrVerifyFloatLosslessCapacity(ctx, raster, base, n, !alpha && count == 3, p.scaled, overlap, int8(needBias)); err != nil {
-					return p, err
 				}
-				p.exponent = int8(bias)
+				if !found {
+					for m := 23; m >= minMantissa; m-- {
+						needBias := max(0, needSum-m)
+						if needBias > 255 {
+							break
+						}
+						needVal := jxrFloatSampleBound(maxRaw, uint8(m), uint8(needBias))
+						if needVal > int64(jxrLongWordMax)>>hardGain {
+							continue
+						}
+						if err := jxrVerifyFloatLosslessCapacity(ctx, raster, base, n, !alpha && count == 3, p.scaled, overlap, uint8(m), uint8(needBias)); err == nil {
+							p.mantissa, p.exponent = uint8(m), uint8(needBias)
+							found = true
+							break
+						} else if !errors.Is(err, ErrUnsupported) {
+							return p, err
+						}
+					}
+				}
+				if !found {
+					return p, fmt.Errorf("%w: JPEG XR lossless float32 dynamic range", ErrUnsupported)
+				}
 			}
 		}
 	}
@@ -1997,7 +2069,11 @@ func checkJXRQuantizationGeometry(ctx context.Context, info Info, options Encode
 		return err
 	}
 	width, height := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
-	if jxrInputTransform(info, format.color, uint8(options.Orientation))&4 != 0 {
+	transform, err := jxrInputTransform(info, format.color, uint8(options.Orientation))
+	if err != nil {
+		return err
+	}
+	if transform&4 != 0 {
 		width, height = height, width
 	}
 	internalColor := format.color
@@ -2194,17 +2270,19 @@ func forwardJXRNativeWindowStorage(ctx context.Context, raster *Raster, s *jxrSt
 	if working >= limit {
 		return jxrCoefficientImage{}, &LimitError{Resource: "JPEG XR native coefficient memory", Limit: limit, Required: jxrSaturatedAdd(working, 1)}
 	}
-	for _, setting := range options.tiles {
-		if err := ctx.Err(); err != nil {
-			return jxrCoefficientImage{}, err
-		}
-		if setting.trim > 15 || !s.header.trim && setting.trim != 0 {
-			return jxrCoefficientImage{}, fmt.Errorf("%w: JPEG XR native trim", ErrInvalid)
-		}
-		for n, p := range [2]*jxrPlane{&s.primary, s.alpha} {
-			if p != nil {
-				if err := checkJXRTileQuant(p, &setting.quant[n]); err != nil {
-					return jxrCoefficientImage{}, err
+	if !options.validated {
+		for _, setting := range options.tiles {
+			if err := ctx.Err(); err != nil {
+				return jxrCoefficientImage{}, err
+			}
+			if setting.trim > 15 || !s.header.trim && setting.trim != 0 {
+				return jxrCoefficientImage{}, fmt.Errorf("%w: JPEG XR native trim", ErrInvalid)
+			}
+			for n, p := range [2]*jxrPlane{&s.primary, s.alpha} {
+				if p != nil {
+					if err := checkJXRTileQuant(p, &setting.quant[n]); err != nil {
+						return jxrCoefficientImage{}, err
+					}
 				}
 			}
 		}
@@ -2215,26 +2293,17 @@ func forwardJXRNativeWindowStorage(ctx context.Context, raster *Raster, s *jxrSt
 		if plane == nil || storage == nil {
 			continue
 		}
-		if plane.channels < 1 || !storage.plane.equal(*plane) || storage.longWord != s.header.longWord {
-			return jxrCoefficientImage{}, fmt.Errorf("%w: reused JPEG XR transform plane", ErrInvalid)
+		needLow := count * uint64(plane.channels) * 16
+		needHigh := count * uint64(plane.channels) * 256
+		capLow, capHigh, capInfo := uint64(cap(storage.low)), uint64(cap(storage.high)), uint64(cap(storage.info))
+		if capLow < needLow || capHigh < needHigh || capInfo < count {
+			return jxrCoefficientImage{}, &LimitError{Resource: "reused JPEG XR transform capacity", Limit: capHigh, Required: needHigh}
 		}
-		for _, term := range [3][3]uint64{
-			{uint64(cap(storage.low)), count * uint64(plane.channels) * 16, 8},
-			{uint64(cap(storage.high)), count * uint64(plane.channels) * 256, 8},
-			{uint64(cap(storage.info)), count, 6},
-		} {
-			if term[0] < term[1] {
-				return jxrCoefficientImage{}, &LimitError{Resource: "reused JPEG XR transform capacity", Limit: term[0], Required: term[1]}
-			}
-			extra := term[0] - term[1]
-			if extra > (limit-working)/term[2] {
-				return jxrCoefficientImage{}, &LimitError{Resource: "retained JPEG XR transform capacity", Limit: limit, Required: jxrSaturatedAdd(working, jxrSaturatedMul(extra, term[2]))}
-			}
-			working += extra * term[2]
-			if working >= limit {
-				return jxrCoefficientImage{}, &LimitError{Resource: "retained JPEG XR transform capacity", Limit: limit, Required: jxrSaturatedAdd(working, 1)}
-			}
+		extra := (capLow-needLow)*8 + (capHigh-needHigh)*8 + (capInfo-count)*6
+		if extra >= limit-working {
+			return jxrCoefficientImage{}, &LimitError{Resource: "retained JPEG XR transform capacity", Limit: limit, Required: jxrSaturatedAdd(working, extra)}
 		}
+		working += extra
 	}
 	allocated := uint64(0)
 	for n, p := range [2]*jxrPlane{&s.primary, s.alpha} {
@@ -2653,7 +2722,10 @@ func encodeUncompressedJXR(ctx context.Context, raster *Raster, options EncodeOp
 	if err != nil {
 		return nil, err
 	}
-	transform := jxrInputTransform(raster.info, format.color, uint8(options.Orientation))
+	transform, err := jxrInputTransform(raster.info, format.color, uint8(options.Orientation))
+	if err != nil {
+		return nil, err
+	}
 	codedW, codedH := uint64(raster.Bounds().Dx()), uint64(raster.Bounds().Dy())
 	if transform&4 != 0 {
 		codedW, codedH = codedH, codedW

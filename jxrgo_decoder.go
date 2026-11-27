@@ -477,6 +477,15 @@ func (parser *jxrParser) bindContainerSource(source jxrRasterSource, maxPixels u
 	if c.format.channels > 8 {
 		return source, fmt.Errorf("%w: JPEG XR raster color format", ErrUnsupported)
 	}
+	if len(c.profiles) != 0 {
+		profileChannels := c.format.channels
+		if c.format.alpha {
+			profileChannels++
+		}
+		if err := s.checkProfileList(c.profiles, c.format.alpha, profileChannels); err != nil {
+			return source, err
+		}
+	}
 	return source, nil
 }
 

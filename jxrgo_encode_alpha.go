@@ -186,25 +186,27 @@ func newJXRAlphaRaster(ctx context.Context, raster *Raster, mirror bool, maxMemo
 	if err != nil {
 		return nil, err
 	}
-	for y := range info.Bounds.Dy() {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		for x := range info.Bounds.Dx() {
-			if x&1023 == 0 {
-				if err := ctx.Err(); err != nil {
-					return nil, err
+	if err := copyJXRComponentRect(ctx, &output.planes[info.Channels], component, component.info.Bounds.Min.X, component.info.Bounds.Min.Y, info.Bounds.Dx(), info.Bounds.Dy()); err != nil {
+		return nil, err
+	}
+	if mirror {
+		srcPlane := &output.planes[info.Channels]
+		width, height := info.Bounds.Dx(), info.Bounds.Dy()
+		for index := range info.Channels {
+			dstPlane := &output.planes[index]
+			if srcPlane.words != nil {
+				for y := range height {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					copy(dstPlane.words[y*width:(y+1)*width], srcPlane.words[y*width:(y+1)*width])
 				}
-			}
-			bits, err := component.sampleBitsAt(x, y)
-			if err != nil {
-				return nil, err
-			}
-			at := y*info.Bounds.Dx() + x
-			output.planes[info.Channels].storeBits(at, bits)
-			if mirror {
-				for index := range info.Channels {
-					output.planes[index].storeBits(at, bits)
+			} else {
+				for y := range height {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					copy(dstPlane.values[y*width:(y+1)*width], srcPlane.values[y*width:(y+1)*width])
 				}
 			}
 		}
@@ -231,15 +233,31 @@ func jxrHeaderWindow(h *jxrHeader) *WindowMargins {
 	return &WindowMargins{Top: uint8(h.top), Left: uint8(h.left), Bottom: uint8(h.bottom), Right: uint8(h.right)}
 }
 
-// jxrSeparateAlphaOptions 在预算内快照独立透明度，默认逐组继承主平面首分量及完整宏块索引
+// jxrSeparateAlphaOptions 在预算内快照独立透明度，同步展开质量预设，默认逐组继承主平面首分量及完整宏块索引
 // 入参: ctx Context, o 原始文件编码选项, maximum 原配置与独占副本的共同容量上限
 // 返回: EncodeOptions 独立透明度选项, uint64 原配置与副本的保守常驻容量, error 资源或取消错误
 func jxrSeparateAlphaOptions(ctx context.Context, o EncodeOptions, maximum uint64) (EncodeOptions, uint64, error) {
+	alphaLossy := o.Lossy || o.Quality > 0 && o.Quality < 100
 	p := PlaneOptions{Band: o.Band, Scaled: o.Scaled, Shift: o.Shift, Float: o.Float}
-	q, first := o.Quantization, true
+	var q *Quantization
+	first := true
 	if o.Alpha != nil {
 		p = *o.Alpha
+		if p.Quality > 0 && p.Quality < 100 {
+			if p.Quantization == nil {
+				p.Quantization = jxrQualityQuantization(p.Quality)
+			}
+			alphaLossy = true
+		} else if p.Quality == 100 {
+			alphaLossy = false
+		}
+		p.Quality = 0
 		q, first = p.Quantization, false
+	} else {
+		q = o.Quantization
+		if q == nil && o.Quality > 0 && o.Quality < 100 {
+			q = jxrQualityQuantization(o.Quality)
+		}
 	}
 	retained, err := jxrQuantizationWork(ctx, q, maximum)
 	if err != nil {
@@ -260,7 +278,7 @@ func jxrSeparateAlphaOptions(ctx context.Context, o EncodeOptions, maximum uint6
 		window = &value
 	}
 	return EncodeOptions{Format: FormatCodestream, Layout: o.Layout, Overlap: o.Overlap, Orientation: o.Orientation, TileSize: o.TileSize,
-		HardTiles: o.HardTiles, Lossy: o.Lossy, LegacyHighpassPrediction: o.LegacyHighpassPrediction, Workers: o.Workers,
+		HardTiles: o.HardTiles, Lossy: alphaLossy, LegacyHighpassPrediction: o.LegacyHighpassPrediction, Workers: o.Workers,
 		Band: p.Band, Trim: o.Trim, Scaled: p.Scaled, Shift: p.Shift, Float: p.Float, Alpha: &p, Window: window, MaxOutputBytes: o.MaxOutputBytes}, retained + owned, ctx.Err()
 }
 

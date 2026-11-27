@@ -49,6 +49,20 @@ type jxrStreamOutput struct {
 	quantWork uint64
 }
 
+// jxrPacketStream 管理可定位码流输出的头部写出、包偏移记录、前向摘要校验与索引表回填
+type jxrPacketStream struct {
+	stream   jxrStream
+	options  jxrStreamOutput
+	position int64
+	indexAt  uint64
+	prefix   uint64
+	total    uint64
+	maximum  uint64
+	bands    int
+	tiles    int
+	budget   jxrWriteBudget
+}
+
 // writeStream 编码完整系数图像并生成实际包索引，不修改输入头部、量化参数或系数
 // 入参: ctx 已规范化Context, source 图像及平面头部, options 分块参数及系数、临时缓冲、输出容量预算
 // 返回: []byte 完整独立码流, error 参数、资源、精度或取消错误
@@ -507,23 +521,65 @@ func (state *jxrCoefficientImage) writeStreamTo(ctx context.Context, w io.WriteS
 			return err
 		}
 	}
-	return writeJXRPacketsTo(ctx, w, source, options, state.outputWork(source), func(tile int, output *jxrTileOutput) error {
-		_, err := state.writeTile(ctx, source, tile, output)
+	ps, cleanup, err := beginJXRPacketStream(ctx, w, source, options, state.outputWork(source))
+	if err != nil {
 		return err
-	})
+	}
+	defer cleanup()
+	var packets [4]jxrBitWriter
+	output := jxrTileOutput{exact: options.exact, validated: true, maxMemory: options.maxMemory}
+	for band := range ps.bands {
+		packets[band] = newJXRBitWriter(ctx, ps.maximum-ps.total, ps.budget.limit)
+		packets[band].budget = &ps.budget
+		if packets[band].err != nil {
+			return packets[band].err
+		}
+		output.packet[band] = &packets[band]
+	}
+	for index, plane := range [2]*jxrPlane{&ps.stream.primary, ps.stream.alpha} {
+		if plane != nil {
+			output.macro[index].high = make([]int64, plane.channels*256)
+		}
+	}
+	for ordinal := range ps.tiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		tile := ordinal
+		if options.rowOrder && ps.stream.header.transform&5 != 0 {
+			tile = jxrDisplayTileIndex(&ps.stream.header, ordinal)
+		}
+		setting := &options.tiles[0]
+		if len(options.tiles) != 1 {
+			setting = &options.tiles[tile]
+		}
+		output.quant, output.trim = setting.quant, setting.trim
+		for band := range ps.bands {
+			packet := &packets[band]
+			clear(packet.data)
+			packet.data, packet.bit, packet.maxBytes = packet.data[:0], 0, ps.maximum-ps.total
+		}
+		if _, err := state.writeTile(ctx, source, tile, &output); err != nil {
+			return err
+		}
+		if err := ps.commitTile(ctx, w, tile, &packets); err != nil {
+			return err
+		}
+	}
+	return ps.finish(ctx, w)
 }
 
-// writeJXRPacketsTo 共用空间及频率包提交和索引回填，分块提供器负责在给定容量内准备原生系数
-// 入参: ctx 已规范化Context, w 可定位输出, source 完整头部, options 输出限制, working 不含设置和输出缓冲的活动容量, encode 分块包编码器
-// 返回: error 预检、分块提供、取消或I/O错误
-func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream, options jxrStreamOutput, working uint64, encode func(int, *jxrTileOutput) error) error {
-	if source == nil || w == nil || options.budget != nil || encode == nil {
-		return fmt.Errorf("%w: incremental stream parameters", ErrInvalid)
+// beginJXRPacketStream 校验预算并写出码流头与占位索引表，返回可复用的增量包提交状态
+// 入参: ctx 已规范化Context, w 可定位输出, source 完整头部, options 输出限制, working 不含设置和输出缓冲的活动容量
+// 返回: *jxrPacketStream 增量包提交状态, func() 退出清理函数, error 预检、预算、取消或I/O错误
+func beginJXRPacketStream(ctx context.Context, w io.WriteSeeker, source *jxrStream, options jxrStreamOutput, working uint64) (*jxrPacketStream, func(), error) {
+	if source == nil || w == nil || options.budget != nil {
+		return nil, nil, fmt.Errorf("%w: incremental stream parameters", ErrInvalid)
 	}
 	s := *source
 	if !options.validated {
 		if err := checkJXRStreamOutput(&s, options.maxPixels); err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
 	tiles := (len(s.header.columns) - 1) * (len(s.header.rows) - 1)
@@ -533,76 +589,92 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 	}
 	count := tiles * bands
 	if options.forward != nil && len(options.forward.packets) != count {
-		return fmt.Errorf("%w: sequential planned packet count", ErrInvalid)
+		return nil, nil, fmt.Errorf("%w: sequential planned packet count", ErrInvalid)
 	}
 	if len(options.tiles) != 1 && len(options.tiles) != tiles {
-		return fmt.Errorf("%w: incremental tile settings", ErrInvalid)
+		return nil, nil, fmt.Errorf("%w: incremental tile settings", ErrInvalid)
 	}
 	settingsWork, err := options.tileWork(ctx, options.maxMemory)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	work := working
 	if settingsWork > ^uint64(0)-uint64(count)*8 {
-		return fmt.Errorf("%w: incremental settings capacity", ErrLimit)
+		return nil, nil, fmt.Errorf("%w: incremental settings capacity", ErrLimit)
 	}
 	extra := settingsWork + uint64(count)*8
-	if work >= options.maxMemory || extra >= options.maxMemory-work {
-		return fmt.Errorf("%w: incremental output working memory", ErrLimit)
+	if working >= options.maxMemory || extra >= options.maxMemory-working {
+		return nil, nil, fmt.Errorf("%w: incremental output working memory", ErrLimit)
 	}
 	if !options.validated {
 		for _, setting := range options.tiles {
 			if setting.trim > 15 || !s.header.trim && setting.trim != 0 {
-				return fmt.Errorf("%w: incremental trim", ErrInvalid)
+				return nil, nil, fmt.Errorf("%w: incremental trim", ErrInvalid)
 			}
 			for index, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
 				if plane != nil {
 					if err := checkJXRTileQuant(plane, &setting.quant[index]); err != nil {
-						return err
+						return nil, nil, err
 					}
 				}
 			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, nil, err
 	}
 	position, err := w.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if position < 0 {
-		return fmt.Errorf("%w: incremental output position", ErrInvalid)
+		return nil, nil, fmt.Errorf("%w: incremental output position", ErrInvalid)
 	}
 	maximum := min(options.maxBytes, uint64(math.MaxInt64-position))
 	if maximum == 0 {
-		return fmt.Errorf("%w: incremental output address capacity", ErrLimit)
+		return nil, nil, fmt.Errorf("%w: incremental output address capacity", ErrLimit)
 	}
-	budget := jxrWriteBudget{limit: options.maxMemory - work - extra}
+	ps := &jxrPacketStream{
+		stream:   s,
+		options:  options,
+		position: position,
+		maximum:  maximum,
+		bands:    bands,
+		tiles:    tiles,
+		budget:   jxrWriteBudget{limit: options.maxMemory - working - extra},
+	}
+	cleanup := func() {}
 	if mem, ok := w.(*jxrMemWriteSeeker); ok {
 		prevBudget, prevMax := mem.budget, mem.maxMemory
-		mem.budget = &budget
-		mem.maxMemory = min(prevMax, jxrSaturatedAdd(uint64(cap(mem.data)), budget.limit))
-		defer func() {
+		memCap := uint64(cap(mem.data))
+		if memCap >= ps.budget.limit {
+			return nil, nil, &LimitError{Resource: "max memory bytes", Limit: ps.budget.limit, Required: jxrSaturatedAdd(memCap, 1), Detail: "incremental output stage memory"}
+		}
+		ps.budget.used = memCap
+		mem.budget = &ps.budget
+		mem.maxMemory = min(prevMax, ps.budget.limit)
+		cleanup = func() {
 			mem.budget, mem.maxMemory = prevBudget, prevMax
-		}()
+		}
 	}
-	s.packets = make([]uint64, count)
-	header := newJXRBitWriter(ctx, maximum, budget.limit)
-	header.budget = &budget
-	indexAt := writeJXRStreamHeaderChecked(&header, &s, true)
+	ps.stream.packets = make([]uint64, count)
+	header := newJXRBitWriter(ctx, maximum, ps.budget.limit)
+	header.budget = &ps.budget
+	indexAt := writeJXRStreamHeaderChecked(&header, &ps.stream, true)
 	if header.err != nil {
-		return header.err
+		cleanup()
+		return nil, nil, header.err
 	}
 	if plan := options.forward; plan != nil {
 		identity := sha256.Sum256(header.data)
 		if plan.ready {
 			if plan.prefix != identity || plan.prefixBytes != uint64(len(header.data)) {
-				return fmt.Errorf("%w: sequential header changed", ErrInvalid)
+				cleanup()
+				return nil, nil, fmt.Errorf("%w: sequential header changed", ErrInvalid)
 			}
-			if s.header.index {
+			if ps.stream.header.index {
 				if indexAt > uint64(len(header.data)) || uint64(count)*9 > uint64(len(header.data))-indexAt {
-					return fmt.Errorf("%w: sequential index header capacity", ErrInvalid)
+					cleanup()
+					return nil, nil, fmt.Errorf("%w: sequential index header capacity", ErrInvalid)
 				}
 				for index, packet := range plan.packets {
 					at := indexAt + uint64(index)*9
@@ -614,84 +686,65 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 			plan.prefix, plan.prefixBytes = identity, uint64(len(header.data))
 		}
 	}
-	total, prefix := uint64(len(header.data)), uint64(len(header.data))
+	ps.indexAt = indexAt
+	ps.total, ps.prefix = uint64(len(header.data)), uint64(len(header.data))
 	if err := writeEncoderOutput(ctx, w, header.data); err != nil {
-		return err
+		cleanup()
+		return nil, nil, err
 	}
-	budget.used -= uint64(cap(header.data))
+	if ps.budget.used >= uint64(cap(header.data)) {
+		ps.budget.used -= uint64(cap(header.data))
+	}
 	header.data = nil
-	var packets [4]jxrBitWriter
-	output := jxrTileOutput{exact: options.exact, validated: true, maxMemory: options.maxMemory}
-	for band := range bands {
-		packets[band] = newJXRBitWriter(ctx, maximum-total, budget.limit)
-		packets[band].budget = &budget
-		if packets[band].err != nil {
-			return packets[band].err
+	return ps, cleanup, nil
+}
+
+// commitTile 校验联合包预算、记录偏移及可选前向摘要并按频带顺序写出单块包字节
+// 入参: ctx 已规范化Context, w 可定位输出, tile 编码分块序号, packets 单块已编码频带包
+// 返回: error 容量、一致性、取消或I/O错误
+func (ps *jxrPacketStream) commitTile(ctx context.Context, w io.WriteSeeker, tile int, packets *[4]jxrBitWriter) error {
+	encoded := uint64(0)
+	for band := range ps.bands {
+		length := uint64(len(packets[band].data))
+		if length > ps.maximum-ps.total-encoded {
+			return fmt.Errorf("%w: incremental combined packet byte budget", ErrLimit)
 		}
-		output.packet[band] = &packets[band]
+		encoded += length
 	}
-	for index, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
-		if plane != nil {
-			output.macro[index].high = make([]int64, plane.channels*256)
-		}
-	}
-	for ordinal := range tiles {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		tile := ordinal
-		if options.rowOrder && s.header.transform&5 != 0 {
-			tile = jxrDisplayTileIndex(&s.header, ordinal)
-		}
-		setting := &options.tiles[0]
-		if len(options.tiles) != 1 {
-			setting = &options.tiles[tile]
-		}
-		output.quant, output.trim = setting.quant, setting.trim
-		for band := range bands {
-			packet := &packets[band]
-			clear(packet.data)
-			packet.data, packet.bit, packet.maxBytes = packet.data[:0], 0, maximum-total
-		}
-		if err := encode(tile, &output); err != nil {
-			return err
-		}
-		encoded := uint64(0)
-		for band := range bands {
-			length := uint64(len(packets[band].data))
-			if length > maximum-total-encoded {
-				return fmt.Errorf("%w: incremental combined packet byte budget", ErrLimit)
-			}
-			encoded += length
-		}
-		for band := range bands {
-			s.packets[tile*bands+band] = total - prefix
-			if plan := options.forward; plan != nil {
-				current := jxrForwardPacket{offset: total - prefix, length: uint64(len(packets[band].data)), digest: sha256.Sum256(packets[band].data)}
-				if plan.ready {
-					if plan.packets[tile*bands+band] != current {
-						return fmt.Errorf("%w: sequential encoded packet changed", ErrInvalid)
-					}
-				} else {
-					plan.packets[tile*bands+band] = current
+	for band := range ps.bands {
+		ps.stream.packets[tile*ps.bands+band] = ps.total - ps.prefix
+		if plan := ps.options.forward; plan != nil {
+			current := jxrForwardPacket{offset: ps.total - ps.prefix, length: uint64(len(packets[band].data)), digest: sha256.Sum256(packets[band].data)}
+			if plan.ready {
+				if plan.packets[tile*ps.bands+band] != current {
+					return fmt.Errorf("%w: sequential encoded packet changed", ErrInvalid)
 				}
+			} else {
+				plan.packets[tile*ps.bands+band] = current
 			}
-			if err := writeEncoderOutput(ctx, w, packets[band].data); err != nil {
-				return err
-			}
-			total += uint64(len(packets[band].data))
 		}
+		if err := writeEncoderOutput(ctx, w, packets[band].data); err != nil {
+			return err
+		}
+		ps.total += uint64(len(packets[band].data))
 	}
-	if plan := options.forward; plan != nil {
-		if plan.ready && plan.total != total {
+	return nil
+}
+
+// finish 校验前向计划总长度并在需要时回填码流包偏移索引表
+// 入参: ctx 已规范化Context, w 可定位输出
+// 返回: error 一致性、定位、写入或取消错误
+func (ps *jxrPacketStream) finish(ctx context.Context, w io.WriteSeeker) error {
+	if plan := ps.options.forward; plan != nil {
+		if plan.ready && plan.total != ps.total {
 			return fmt.Errorf("%w: sequential encoded size changed", ErrInvalid)
 		}
 		if !plan.ready {
-			plan.total = total
+			plan.total = ps.total
 		}
 	}
-	if s.header.index && (options.forward == nil || !options.forward.ready) {
-		if err := patchJXRStreamIndexTable(ctx, w, position, indexAt, total, s.packets); err != nil {
+	if ps.stream.header.index && (ps.options.forward == nil || !ps.options.forward.ready) {
+		if err := patchJXRStreamIndexTable(ctx, w, ps.position, ps.indexAt, ps.total, ps.stream.packets); err != nil {
 			return err
 		}
 	}

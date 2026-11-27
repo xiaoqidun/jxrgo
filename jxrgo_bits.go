@@ -330,11 +330,11 @@ func (b *jxrBitWriter) reset() {
 	b.maxBytesExceeded = false
 }
 
-// withinFastBudget 检查所需长度与当前容量是否同时满足输出上限、内存上限与共享预算
-// 入参: needed 目标长度字节数, capacity 当前切片容量字节数
+// withinFastBudget 检查所需长度是否不超过当前已分配容量与输出字节上限
+// 入参: needed 目标长度字节数
 // 返回: bool 是否可直接走无扩容快路径
-func (b *jxrBitWriter) withinFastBudget(needed, capacity uint64) bool {
-	return needed <= capacity && needed <= b.maxBytes && capacity <= b.maxMemory && (b.budget == nil || b.budget.used <= b.budget.limit && capacity <= b.budget.used)
+func (b *jxrBitWriter) withinFastBudget(needed uint64) bool {
+	return needed <= uint64(cap(b.data)) && needed <= b.maxBytes
 }
 
 // write 写入不超过三十二位的无符号值，不静默截断超出字段宽度的有效位
@@ -344,7 +344,7 @@ func (b *jxrBitWriter) write(value uint32, count uint) {
 		pos := b.bit
 		if pos <= ^uint64(0)-39 {
 			needed := (pos + uint64(count) + 7) >> 3
-			if b.withinFastBudget(needed, uint64(cap(b.data))) {
+			if b.withinFastBudget(needed) {
 				if !b.noCancel {
 					b.checks++
 				}
@@ -436,7 +436,7 @@ func (b *jxrBitWriter) flag(value bool) {
 		pos := b.bit
 		if pos <= ^uint64(0)-8 {
 			needed := (pos + 8) >> 3
-			if b.withinFastBudget(needed, uint64(cap(b.data))) {
+			if b.withinFastBudget(needed) {
 				if !b.noCancel {
 					b.checks++
 				}
@@ -475,7 +475,7 @@ func (b *jxrBitWriter) align() {
 		return
 	}
 	needed := (pos + uint64(count) + 7) >> 3
-	if b.withinFastBudget(needed, uint64(cap(b.data))) {
+	if b.withinFastBudget(needed) {
 		b.data = b.data[:needed]
 	} else if !b.reserve(needed) {
 		return

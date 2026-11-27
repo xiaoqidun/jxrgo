@@ -27,7 +27,7 @@ import (
 const jxrTileImagePlanWork uint64 = 4096
 
 // ImageInput 指定多图文件中的一幅原生图像及其编码选项，Options为nil采用无损JXR
-// Raster、Tiles与Rows三选一；Tiles不可与Raster或Rows混用，Rows可与Raster组合流式编码多页或主图与预览图
+// Raster、Tiles与Rows三选一，可自由混排流式编码多页或主图与预览图
 // Info或Raster.Info中的ImageType控制预览及页序列语义
 type ImageInput struct {
 	Raster  *Raster
@@ -39,10 +39,11 @@ type ImageInput struct {
 
 // FileEncodeOptions 限制整个多图文件的输出及活动工作存储，零值采用默认上限
 // MaxPixels限制所有图像可见像素之和；MaxMemoryBytes包括全部输入及当前图像编码工作
-// 每图显式设置的资源上限可以进一步收紧，不扩大文件上限
+// Scratch提供写入普通顺序io.Writer时的可选外部可定位暂存，须支持从零点随机读写与扩展；每图显式设置的资源上限可以进一步收紧，不扩大文件上限
 type FileEncodeOptions struct {
 	Limits         Limits
 	MaxOutputBytes uint64
+	Scratch        io.ReadWriteSeeker
 }
 
 // jxrFileImagePlan 保存逐图原生存储容量及预览格式校验所需的固定标识，不缓存编码图像
@@ -513,11 +514,11 @@ func cloneJXRReaderAt(src *jxrReaderAt) *jxrReaderAt {
 	return &jxrReaderAt{source: src.source, base: src.base, size: src.size}
 }
 
-// EncodeImages 逐图流式编码并写入JXR多图容器文件，支持整图Raster、有界分块Tiles或单遍顺序行源Rows，每图写完后才链接前一目录
-// w须位于文件起点且支持绝对定位，不关闭或截断输出，失败可能残留部分数据；调用期间不得并发修改输入图像及选项
-// 入参: ctx Context，nil采用Background, w 可定位输出, images 按目录顺序排列的图像, opts 全文件资源上限
+// EncodeImages 逐图流式编码并写入JXR多图容器文件，支持整图Raster、有界分块Tiles与单遍顺序行源Rows自由混排，每图写完后才链接前一目录
+// w实现io.WriteSeeker时原地零拷贝直写且须位于文件起点；普通顺序io.Writer优先借用opts.Scratch或有界内存暂存回填后流式拷贝，不关闭或截断输出
+// 入参: ctx Context，nil采用Background, w 目标输出流, images 按目录顺序排列的图像, opts 全文件资源上限与可选暂存
 // 返回: error 容器关系、格式、精度、资源、取消、定位或写入错误
-func EncodeImages(ctx context.Context, w io.WriteSeeker, images []ImageInput, opts *FileEncodeOptions) error {
+func EncodeImages(ctx context.Context, w io.Writer, images []ImageInput, opts *FileEncodeOptions) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -528,54 +529,80 @@ func EncodeImages(ctx context.Context, w io.WriteSeeker, images []ImageInput, op
 		return &FormatError{Op: "EncodeImages", Detail: "JPEG XR image file input"}
 	}
 	limits, maximum := DefaultLimits(), uint64(64<<20)
+	var scratch io.ReadWriteSeeker
 	if opts != nil {
 		limits = opts.Limits.normalized()
 		if opts.MaxOutputBytes != 0 {
 			maximum = opts.MaxOutputBytes
 		}
+		scratch = opts.Scratch
 	}
 	maximum = min(maximum, uint64(math.MaxUint32))
+	if ws, ok := w.(io.WriteSeeker); ok {
+		return wrapJXRError("EncodeImages", encodeJXRImagesSeeker(ctx, ws, images, limits, maximum))
+	}
+	if scratch != nil {
+		if sameInterfaceTarget(w, scratch) {
+			return wrapJXRError("EncodeImages", fmt.Errorf("%w: multi-image scratch aliases output", ErrInvalid))
+		}
+		if limits.MaxMemoryBytes <= jxrRowStageCopyBytes {
+			return wrapJXRError("EncodeImages", &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrRowStageCopyBytes + 1, Detail: "multi-image sequential copy buffer"})
+		}
+		if err := seekJXRImageOutput(ctx, scratch, 0); err != nil {
+			return wrapJXRError("EncodeImages", err)
+		}
+		limits.MaxMemoryBytes -= jxrRowStageCopyBytes
+		if err := encodeJXRImagesSeeker(ctx, scratch, images, limits, maximum); err != nil {
+			return wrapJXRError("EncodeImages", err)
+		}
+		endPos, err := scratch.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return wrapJXRError("EncodeImages", err)
+		}
+		return wrapJXRError("EncodeImages", copyJXRStageToWriter(ctx, w, scratch, endPos))
+	}
+	mem := &jxrMemWriteSeeker{ctx: ctx, maxBytes: maximum, maxMemory: limits.MaxMemoryBytes}
+	if err := encodeJXRImagesSeeker(ctx, mem, images, limits, maximum); err != nil {
+		return wrapJXRError("EncodeImages", err)
+	}
+	return wrapJXRError("EncodeImages", writeEncoderOutput(ctx, w, mem.data))
+}
+
+// encodeJXRImagesSeeker 在可定位输出上校验多图源类型并分派纯整图或自由混排多图编码流程
+// 入参: ctx 已规范化Context, w 可定位输出, images 按目录顺序排列的图像, limits 全文件资源上限, maximum 全文件输出上限
+// 返回: error 容器关系、格式、精度、资源、取消、定位或写入错误
+func encodeJXRImagesSeeker(ctx context.Context, w io.WriteSeeker, images []ImageInput, limits Limits, maximum uint64) error {
 	hasTiles, hasRows := false, false
 	for _, item := range images {
+		sources := 0
+		if item.Raster != nil {
+			sources++
+		}
 		if item.Tiles != nil {
+			sources++
 			hasTiles = true
 		}
 		if item.Rows != nil {
+			sources++
 			hasRows = true
 		}
+		if sources != 1 {
+			return fmt.Errorf("%w: image input must set exactly one of Raster, Tiles or Rows", ErrInvalid)
+		}
 	}
-	if hasTiles {
-		if maximum < 8 {
-			return &LimitError{Resource: "JPEG XR tiled image file output bytes", Limit: maximum, Required: 8}
-		}
-		if limits.MaxMemoryBytes < 4096 || uint64(len(images)) > (limits.MaxMemoryBytes-4096)/jxrTileImagePlanWork || uint64(len(images)) > uint64(^uint(0)>>1)/jxrTileImagePlanWork {
-			return &LimitError{Resource: "JPEG XR tiled image file planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(4096, jxrSaturatedMul(uint64(len(images)), jxrTileImagePlanWork))}
-		}
-		for _, item := range images {
-			if item.Raster != nil || item.Rows != nil || item.Tiles == nil {
-				return &FormatError{Op: "EncodeImages", Detail: "mixed raster and tiled image inputs"}
-			}
-		}
-		return wrapJXRError("EncodeImages", encodeJXRImagesTiles(ctx, w, images, limits, maximum))
+	if !hasTiles && !hasRows {
+		return encodeJXRImages(ctx, w, images, limits, maximum)
 	}
-	if hasRows {
-		if maximum < 8 {
-			return &LimitError{Resource: "JPEG XR row image file output bytes", Limit: maximum, Required: 8}
-		}
-		if limits.MaxMemoryBytes < 4096 || uint64(len(images)) > (limits.MaxMemoryBytes-4096)/jxrTileImagePlanWork || uint64(len(images)) > uint64(^uint(0)>>1)/jxrTileImagePlanWork {
-			return &LimitError{Resource: "JPEG XR row image file planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(4096, jxrSaturatedMul(uint64(len(images)), jxrTileImagePlanWork))}
-		}
-		for _, item := range images {
-			if (item.Raster == nil) == (item.Rows == nil) {
-				return &FormatError{Op: "EncodeImages", Detail: "invalid row or raster image input"}
-			}
-		}
-		return wrapJXRError("EncodeImages", encodeJXRImagesRows(ctx, w, images, limits, maximum))
+	if maximum < 8 {
+		return &LimitError{Resource: "JPEG XR image file output bytes", Limit: maximum, Required: 8}
 	}
-	return wrapJXRError("EncodeImages", encodeJXRImages(ctx, w, images, limits, maximum))
+	if limits.MaxMemoryBytes < 4096 || uint64(len(images)) > (limits.MaxMemoryBytes-4096)/jxrTileImagePlanWork || uint64(len(images)) > uint64(^uint(0)>>1)/jxrTileImagePlanWork {
+		return &LimitError{Resource: "JPEG XR image file planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(4096, jxrSaturatedMul(uint64(len(images)), jxrTileImagePlanWork))}
+	}
+	return encodeJXRImagesMixed(ctx, w, images, limits, maximum)
 }
 
-// encodeJXRImages 执行多图预检、资源合并与逐包增量写出，不保留单幅完整压缩缓冲
+// encodeJXRImages 执行纯整图多图预检、资源合并与逐包增量写出，不保留单幅完整压缩缓冲
 // 入参: ctx 已规范化Context, w 可定位输出, images 按目录顺序的输入, limits 全文件资源上限, maximum 全文件输出上限
 // 返回: error 元数据、关系、能力、精度、资源、取消或I/O错误
 func encodeJXRImages(ctx context.Context, w io.WriteSeeker, images []ImageInput, limits Limits, maximum uint64) error {
@@ -597,6 +624,7 @@ func encodeJXRImages(ctx context.Context, w io.WriteSeeker, images []ImageInput,
 	if position != 0 {
 		return fmt.Errorf("%w: JPEG XR image file output position", ErrInvalid)
 	}
+	memStage, _ := w.(*jxrMemWriteSeeker)
 	end, previous := uint64(8), uint64(0)
 	for index, input := range images {
 		if err := ctx.Err(); err != nil {
@@ -605,7 +633,16 @@ func encodeJXRImages(ctx context.Context, w io.WriteSeeker, images []ImageInput,
 		if end > maximum {
 			return &LimitError{Resource: "JPEG XR image file output size", Limit: maximum, Required: end}
 		}
-		memory := limits.MaxMemoryBytes - state - (inputs - plans[index].work)
+		avail := limits.MaxMemoryBytes - state - (inputs - plans[index].work)
+		memory := avail
+		if memStage != nil {
+			staged := uint64(cap(memStage.data))
+			if staged >= avail {
+				return &LimitError{Resource: "max memory bytes", Limit: avail, Required: jxrSaturatedAdd(staged, 1), Detail: "multi-image sequential stage memory"}
+			}
+			memory = avail - staged
+			memStage.maxMemory = avail
+		}
 		options, err := jxrFileImageOptions(input.Options, limits, memory, maximum-end+8)
 		if err != nil {
 			return err
@@ -618,7 +655,7 @@ func encodeJXRImages(ctx context.Context, w io.WriteSeeker, images []ImageInput,
 	return ctx.Err()
 }
 
-// planJXRImageFile 预检全部原生存储、累计像素及预览和页序列约束
+// planJXRImageFile 预检全部原生存储、编码选项、累计像素及预览和页序列约束
 // 入参: ctx Context, images 图像输入, limits 全文件资源, state 计划及固定工作容量, maximum 全文件字节上限
 // 返回: []jxrFileImagePlan 固定计划, uint64 全部输入容量, error 元数据、关系、资源或取消错误
 func planJXRImageFile(ctx context.Context, images []ImageInput, limits Limits, state, maximum uint64) ([]jxrFileImagePlan, uint64, error) {
@@ -640,17 +677,17 @@ func planJXRImageFile(ctx context.Context, images []ImageInput, limits Limits, s
 		if err != nil {
 			return nil, 0, err
 		}
+		if err := checkJXREncodeOptions(options); err != nil {
+			return nil, 0, err
+		}
 		info := input.Raster.info
 		if options.SeparateAlpha && !info.Alpha {
 			return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
 		}
-		if info.ImageType&^3 != 0 || options.Orientation > OrientationRotate90FlipXY {
-			return nil, 0, fmt.Errorf("%w: JPEG XR image type or orientation", ErrInvalid)
+		if info.ImageType&^3 != 0 {
+			return nil, 0, fmt.Errorf("%w: JPEG XR image type", ErrInvalid)
 		}
 		width, height := uint64(input.Raster.Bounds().Dx()), uint64(input.Raster.Bounds().Dy())
-		if height == 0 {
-			return nil, 0, fmt.Errorf("%w: JPEG XR image dimensions", ErrInvalid)
-		}
 		if width > (limits.MaxPixels-pixels)/height {
 			return nil, 0, &LimitError{Resource: "JPEG XR combined image pixels", Limit: limits.MaxPixels, Required: jxrSaturatedAdd(pixels, jxrSaturatedMul(width, height))}
 		}
@@ -732,29 +769,31 @@ func writeJXRFileImageTo(ctx context.Context, w io.WriteSeeker, raster *Raster, 
 	if options.Uncompressed {
 		selected := *options
 		selected.MaxOutputBytes = min(selected.MaxOutputBytes, maximum-start+8)
-		data, packErr := encodeUncompressedJXR(ctx, raster, selected)
-		if packErr != nil {
-			return 0, 0, packErr
+		limits := selected.Limits.normalized()
+		rasterWork, workErr := jxrRasterWork(raster, limits.MaxMemoryBytes)
+		if workErr != nil {
+			return 0, 0, workErr
 		}
-		link, err = relocateJXRImageDirectory(data, start)
-		if err == nil {
-			position, seekErr := w.Seek(0, io.SeekCurrent)
-			if seekErr != nil {
-				return 0, 0, seekErr
-			}
-			wanted, payload := int64(start), data
-			if start == 8 {
-				wanted = 0
-			} else {
-				payload = data[8:]
-			}
-			if position != wanted {
-				return 0, 0, fmt.Errorf("%w: incremental uncompressed file output position", ErrInvalid)
-			}
-			if err = writeEncoderOutput(ctx, w, payload); err == nil {
-				end = uint64(wanted) + uint64(len(payload))
-			}
+		meta := jxrWithContainerMetadata(raster.info, &selected)
+		retained, required, ok := jxrContainerMetadataRetained(rasterWork, limits.MaxMemoryBytes, raster.info, &selected)
+		if !ok {
+			return 0, 0, &LimitError{Resource: "uncompressed container metadata memory", Limit: limits.MaxMemoryBytes, Required: required}
 		}
+		reader := func(cbCtx context.Context, y int, target *Raster) error {
+			for idx, comp := range target.info.Components {
+				srcComp, cErr := raster.component(idx)
+				if cErr != nil {
+					return cErr
+				}
+				srcX0 := srcComp.info.Bounds.Min.X
+				srcY0 := srcComp.info.Bounds.Min.Y + y/int(comp.YStep)
+				if cErr := copyJXRComponentRect(cbCtx, &target.planes[idx], srcComp, srcX0, srcY0, comp.Bounds.Dx(), comp.Bounds.Dy()); cErr != nil {
+					return cErr
+				}
+			}
+			return nil
+		}
+		end, link, err = encodeJXRRowsUncompressedPreparedAt(ctx, w, meta, retained, reader, selected, start)
 	} else if options.SeparateAlpha {
 		selected := *options
 		selected.MaxOutputBytes = min(selected.MaxOutputBytes, maximum-start+8)
@@ -906,8 +945,12 @@ func checkJXRImageSequence(ctx context.Context, count int, describe func(int) (I
 			if err != nil {
 				return err
 			}
+			transform, err := jxrInputTransform(info, format.color, uint8(orientation))
+			if err != nil {
+				return err
+			}
 			shape := info.Bounds.Size()
-			if jxrInputTransform(info, format.color, uint8(orientation))&4 != 0 {
+			if transform&4 != 0 {
 				shape.X, shape.Y = shape.Y, shape.X
 			}
 			group := int(info.ImageType & ImageTypePreview)
@@ -948,12 +991,12 @@ func checkJXRImageSequence(ctx context.Context, count int, describe func(int) (I
 	return ctx.Err()
 }
 
-// encodeJXRImagesTiles 从有界原生提供器逐图逐包写JXR容器文件，预检并复制全部描述、ICC及完整量化配置
-// 入参: ctx 已规范化Context, w 可定位输出, images 按目录顺序的原生逐块源, limits 全文件资源上限, maximum 全文件输出上限
+// encodeJXRImagesMixed 逐图流式编码自由混排的整图Raster、有界分块Tiles与单遍行源Rows多图JXR容器，每图写完后才链接前一目录
+// 入参: ctx 已规范化Context, w 可定位输出, images 按目录顺序排列的多图输入, limits 全文件资源上限, maximum 全文件输出上限
 // 返回: error 参数、描述、对应关系、能力、精度、资源、提供器、取消或I/O错误
-func encodeJXRImagesTiles(ctx context.Context, w io.WriteSeeker, images []ImageInput, limits Limits, maximum uint64) error {
+func encodeJXRImagesMixed(ctx context.Context, w io.WriteSeeker, images []ImageInput, limits Limits, maximum uint64) error {
 	state := uint64(4096) + uint64(len(images))*jxrTileImagePlanWork
-	plans, retained, err := planJXRTileImageFile(ctx, images, limits, state, maximum)
+	plans, retained, err := planJXRMixedImageFile(ctx, images, limits, state, maximum)
 	if err != nil {
 		return err
 	}
@@ -962,23 +1005,39 @@ func encodeJXRImagesTiles(ctx context.Context, w io.WriteSeeker, images []ImageI
 		return err
 	}
 	if position != 0 {
-		return fmt.Errorf("%w: JPEG XR tiled image file output position", ErrInvalid)
+		return fmt.Errorf("%w: JPEG XR image file output position", ErrInvalid)
 	}
+	memStage, _ := w.(*jxrMemWriteSeeker)
 	end, previous := uint64(8), uint64(0)
 	for index := range plans {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if end > maximum {
-			return &LimitError{Resource: "JPEG XR tiled image file output size", Limit: maximum, Required: end}
+			return &LimitError{Resource: "JPEG XR image file output size", Limit: maximum, Required: end}
 		}
 		plan := &plans[index]
-		memory := limits.MaxMemoryBytes - state - (retained - plan.retained)
+		avail := limits.MaxMemoryBytes - state - (retained - plan.retained)
+		memory := avail
+		if memStage != nil {
+			staged := uint64(cap(memStage.data))
+			if staged >= avail {
+				return &LimitError{Resource: "max memory bytes", Limit: avail, Required: jxrSaturatedAdd(staged, 1), Detail: "multi-image sequential stage memory"}
+			}
+			memory = avail - staged
+			memStage.maxMemory = avail
+		}
 		options, err := jxrFileImageOptions(&plan.options, limits, memory, maximum-end+8)
 		if err != nil {
 			return err
 		}
-		end, previous, err = writeJXRTileFileImageTo(ctx, w, plan, options, end, previous, maximum, index == len(plans)-1)
+		if plan.raster != nil {
+			end, previous, err = writeJXRFileImageTo(ctx, w, plan.raster, &options, end, previous, maximum, index == len(plans)-1)
+		} else if plan.read != nil {
+			end, previous, err = writeJXRTileFileImageTo(ctx, w, plan, options, end, previous, maximum, index == len(plans)-1)
+		} else {
+			end, previous, err = writeJXRRowFileImageTo(ctx, w, plan, options, end, previous, maximum, index == len(plans)-1)
+		}
 		if err != nil {
 			return err
 		}
@@ -986,15 +1045,18 @@ func encodeJXRImagesTiles(ctx context.Context, w io.WriteSeeker, images []ImageI
 	return ctx.Err()
 }
 
-// planJXRTileImageFile 在任何回调及输出前快照全部描述和量化索引，先为共存的原配置及副本预检容量
-// 入参: ctx Context, images 原始逐块源, limits 全文件上限, state 固定描述容量, maximum 全文件输出上限
-// 返回: []jxrTileImagePlan 独占快照, uint64 全部快照的额外常驻容量, error 描述、选项、关系、资源或取消错误
-func planJXRTileImageFile(ctx context.Context, images []ImageInput, limits Limits, state, maximum uint64) ([]jxrTileImagePlan, uint64, error) {
+// planJXRMixedImageFile 统一预检Raster、Tiles与Rows混排多图的元数据、像素总量、页序列关系与独占量化快照
+// 入参: ctx Context, images 多图输入, limits 全文件上限, state 计划固定内存, maximum 全文件输出上限
+// 返回: []jxrTileImagePlan 独占快照, uint64 全部常驻额外内存, error 元数据、选项、关系、资源或取消错误
+func planJXRMixedImageFile(ctx context.Context, images []ImageInput, limits Limits, state, maximum uint64) ([]jxrTileImagePlan, uint64, error) {
 	if state >= limits.MaxMemoryBytes {
-		return nil, 0, &LimitError{Resource: "tiled image snapshot planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, 1)}
+		return nil, 0, &LimitError{Resource: "mixed image snapshot planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, 1)}
 	}
 	quantMaximum, quantWork := (limits.MaxMemoryBytes-state)/2, uint64(0)
 	for _, input := range images {
+		if input.Raster != nil || input.Options != nil && input.Options.Uncompressed {
+			continue
+		}
 		var options EncodeOptions
 		if input.Options != nil {
 			options = *input.Options
@@ -1012,20 +1074,50 @@ func planJXRTileImageFile(ctx context.Context, images []ImageInput, limits Limit
 		if err := ctx.Err(); err != nil {
 			return nil, 0, err
 		}
-		if input.Tiles == nil {
-			return nil, 0, fmt.Errorf("%w: nil tiled image reader", ErrInvalid)
-		}
 		if reserved >= limits.MaxMemoryBytes-state-retained {
-			return nil, 0, &LimitError{Resource: "tiled image description and quantization memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, 1)))}
+			return nil, 0, &LimitError{Resource: "mixed image description and quantization memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, 1)))}
 		}
-		options, err := jxrFileImageOptions(input.Options, limits, limits.MaxMemoryBytes-state-retained-reserved, maximum)
+		budget := limits.MaxMemoryBytes - state - retained - reserved
+		options, err := jxrFileImageOptions(input.Options, limits, budget, maximum)
 		if err != nil {
 			return nil, 0, err
 		}
 		if err := checkJXREncodeOptions(options); err != nil {
 			return nil, 0, err
 		}
-		if options.TileSize.X == 0 || options.TileSize.Y == 0 {
+		if input.Raster != nil {
+			work, err := jxrRasterWork(input.Raster, budget)
+			if err != nil {
+				return nil, 0, err
+			}
+			info := input.Raster.info
+			if options.SeparateAlpha && !info.Alpha {
+				return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
+			}
+			nextWork, required, ok := jxrContainerMetadataRetained(work, budget, info, &options)
+			if !ok {
+				return nil, 0, &LimitError{Resource: "mixed image file combined metadata", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, required)))}
+			}
+			work = nextWork
+			qAmount, err := jxrTileOptionsQuantizationWork(ctx, options, budget-work)
+			if err != nil {
+				return nil, 0, err
+			}
+			work += qAmount
+			width, height := uint64(input.Raster.Bounds().Dx()), uint64(input.Raster.Bounds().Dy())
+			if width > (limits.MaxPixels-pixels)/height {
+				return nil, 0, &LimitError{Resource: "JPEG XR combined image pixels", Limit: limits.MaxPixels, Required: jxrSaturatedAdd(pixels, jxrSaturatedMul(width, height))}
+			}
+			pixels += width * height
+			identifier, _, err := jxrRasterIdentifier(info, [16]byte{})
+			if err != nil {
+				return nil, 0, err
+			}
+			retained += work
+			plans[index] = jxrTileImagePlan{info: info, raster: input.Raster, options: options, retained: work, identifier: identifier}
+			continue
+		}
+		if input.Tiles != nil && (options.TileSize.X == 0 || options.TileSize.Y == 0) {
 			return nil, 0, fmt.Errorf("%w: tiled images require explicit tiles", ErrUnsupported)
 		}
 		info, work, err := prepareJXRTileInfo(ctx, input.Info, options)
@@ -1036,27 +1128,49 @@ func planJXRTileImageFile(ctx context.Context, images []ImageInput, limits Limit
 			return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
 		}
 		clearJXRMergedMetadata(&options)
-		if work > limits.MaxMemoryBytes-state-retained-reserved {
-			return nil, 0, &LimitError{Resource: "tiled image descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, work)))}
+		if work > budget {
+			return nil, 0, &LimitError{Resource: "mixed image descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, work)))}
 		}
 		retained += work
 		width, height := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
 		if width > (limits.MaxPixels-pixels)/height {
-			return nil, 0, &LimitError{Resource: "combined tiled image pixels", Limit: limits.MaxPixels, Required: jxrSaturatedAdd(pixels, jxrSaturatedMul(width, height))}
+			return nil, 0, &LimitError{Resource: "combined image pixels", Limit: limits.MaxPixels, Required: jxrSaturatedAdd(pixels, jxrSaturatedMul(width, height))}
 		}
 		pixels += width * height
-		identifier, _, err := jxrRasterIdentifier(info, [16]byte{})
+		identifier, format, err := jxrRasterIdentifier(info, [16]byte{})
 		if err != nil {
 			return nil, 0, err
 		}
-		reader := input.Tiles
-		wrapped := func(ctx context.Context, region image.Rectangle, target *Raster) error {
-			if err := reader(ctx, region, target); err != nil {
+		if input.Tiles != nil {
+			reader := input.Tiles
+			wrapped := func(ctx context.Context, region image.Rectangle, target *Raster) error {
+				if err := reader(ctx, region, target); err != nil {
+					return jxrCallbackError{err: err}
+				}
+				return nil
+			}
+			plans[index] = jxrTileImagePlan{info: info, read: wrapped, options: options, retained: work, identifier: identifier}
+			continue
+		}
+		if !options.Uncompressed {
+			resolved := jxrResolveEncodeOptions(options)
+			if resolved.TileSize == (image.Point{}) {
+				tileSize, err := jxrDefaultRowTileSize(info, format, resolved)
+				if err != nil {
+					return nil, 0, err
+				}
+				resolved.TileSize = tileSize
+			}
+			options = resolved
+		}
+		reader := input.Rows
+		wrapped := func(ctx context.Context, y int, target *Raster) error {
+			if err := reader(ctx, y, target); err != nil {
 				return jxrCallbackError{err: err}
 			}
 			return nil
 		}
-		plans[index] = jxrTileImagePlan{info: info, read: wrapped, options: options, retained: work, identifier: identifier}
+		plans[index] = jxrTileImagePlan{info: info, rows: wrapped, options: options, retained: work, identifier: identifier}
 	}
 	if err := checkJXRImageSequence(ctx, len(plans), func(index int) (Info, [16]byte, Orientation) {
 		return plans[index].info, plans[index].identifier, plans[index].options.Orientation
@@ -1065,6 +1179,9 @@ func planJXRTileImageFile(ctx context.Context, images []ImageInput, limits Limit
 	}
 	for index := range plans {
 		plan := &plans[index]
+		if plan.raster != nil || plan.options.Uncompressed {
+			continue
+		}
 		amount, err := jxrTileOptionsQuantizationWork(ctx, plan.options, quantWork)
 		if err != nil {
 			return nil, 0, err
@@ -1213,188 +1330,6 @@ func writeJXRTileFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTil
 	return finishJXRImageOutput(ctx, w, start, end, previous, link, maximum, last, "tiled image file")
 }
 
-// encodeJXRImagesRows 逐图流式编码单遍行源与可选整图组合的多图JXR容器，每图写完后才链接前一目录
-// 入参: ctx 已规范化Context, w 可定位输出, images 按目录顺序排列的图像输入, limits 全文件资源上限, maximum 全文件输出上限
-// 返回: error 元数据、关系、能力、精度、资源、提供器、取消或I/O错误
-func encodeJXRImagesRows(ctx context.Context, w io.WriteSeeker, images []ImageInput, limits Limits, maximum uint64) error {
-	state := uint64(4096) + uint64(len(images))*jxrTileImagePlanWork
-	plans, retained, err := planJXRRowImageFile(ctx, images, limits, state, maximum)
-	if err != nil {
-		return err
-	}
-	position, err := w.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	if position != 0 {
-		return fmt.Errorf("%w: JPEG XR row image file output position", ErrInvalid)
-	}
-	end, previous := uint64(8), uint64(0)
-	for index := range plans {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if end > maximum {
-			return &LimitError{Resource: "JPEG XR row image file output size", Limit: maximum, Required: end}
-		}
-		plan := &plans[index]
-		memory := limits.MaxMemoryBytes - state - (retained - plan.retained)
-		options, err := jxrFileImageOptions(&plan.options, limits, memory, maximum-end+8)
-		if err != nil {
-			return err
-		}
-		if plan.raster != nil {
-			end, previous, err = writeJXRFileImageTo(ctx, w, plan.raster, &options, end, previous, maximum, index == len(plans)-1)
-		} else {
-			end, previous, err = writeJXRRowFileImageTo(ctx, w, plan, options, end, previous, maximum, index == len(plans)-1)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return ctx.Err()
-}
-
-// planJXRRowImageFile 预检多图行源与整图条目的元数据、像素总量、页序列关系与独占选项快照
-// 入参: ctx Context, images 多图输入, limits 全文件上限, state 计划固定内存, maximum 全文件输出上限
-// 返回: []jxrTileImagePlan 独占快照, uint64 全部常驻额外内存, error 元数据、选项、关系、资源或取消错误
-func planJXRRowImageFile(ctx context.Context, images []ImageInput, limits Limits, state, maximum uint64) ([]jxrTileImagePlan, uint64, error) {
-	if state >= limits.MaxMemoryBytes {
-		return nil, 0, &LimitError{Resource: "row image snapshot planning memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, 1)}
-	}
-	quantMaximum, quantWork := (limits.MaxMemoryBytes-state)/2, uint64(0)
-	for _, input := range images {
-		if input.Raster != nil || input.Options != nil && input.Options.Uncompressed {
-			continue
-		}
-		var options EncodeOptions
-		if input.Options != nil {
-			options = *input.Options
-		}
-		amount, err := jxrTileOptionsQuantizationWork(ctx, options, quantMaximum-quantWork)
-		if err != nil {
-			return nil, 0, err
-		}
-		quantWork += amount
-	}
-	plans := make([]jxrTileImagePlan, len(images))
-	retained, pixels := uint64(0), uint64(0)
-	reserved := quantWork * 2
-	for index, input := range images {
-		if err := ctx.Err(); err != nil {
-			return nil, 0, err
-		}
-		if reserved >= limits.MaxMemoryBytes-state-retained {
-			return nil, 0, &LimitError{Resource: "row image description and quantization memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, 1)))}
-		}
-		budget := limits.MaxMemoryBytes - state - retained - reserved
-		options, err := jxrFileImageOptions(input.Options, limits, budget, maximum)
-		if err != nil {
-			return nil, 0, err
-		}
-		if err := checkJXREncodeOptions(options); err != nil {
-			return nil, 0, err
-		}
-		if input.Raster != nil {
-			work, err := jxrRasterWork(input.Raster, budget)
-			if err != nil {
-				return nil, 0, err
-			}
-			if work > budget {
-				return nil, 0, &LimitError{Resource: "row image file combined inputs", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, work)))}
-			}
-			info := input.Raster.info
-			if options.SeparateAlpha && !info.Alpha {
-				return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
-			}
-			nextWork, required, ok := jxrContainerMetadataRetained(work, budget, info, &options)
-			if !ok {
-				return nil, 0, &LimitError{Resource: "row image file combined metadata", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, required)))}
-			}
-			work = nextWork
-			qAmount, err := jxrTileOptionsQuantizationWork(ctx, options, budget-work)
-			if err != nil {
-				return nil, 0, err
-			}
-			work += qAmount
-			width, height := uint64(input.Raster.Bounds().Dx()), uint64(input.Raster.Bounds().Dy())
-			if height == 0 {
-				return nil, 0, fmt.Errorf("%w: JPEG XR image dimensions", ErrInvalid)
-			}
-			if width > (limits.MaxPixels-pixels)/height {
-				return nil, 0, &LimitError{Resource: "JPEG XR combined image pixels", Limit: limits.MaxPixels, Required: jxrSaturatedAdd(pixels, jxrSaturatedMul(width, height))}
-			}
-			pixels += width * height
-			identifier, _, err := jxrRasterIdentifier(info, [16]byte{})
-			if err != nil {
-				return nil, 0, err
-			}
-			retained += work
-			plans[index] = jxrTileImagePlan{info: info, raster: input.Raster, options: options, retained: work, identifier: identifier}
-			continue
-		}
-		info, work, err := prepareJXRTileInfo(ctx, input.Info, options)
-		if err != nil {
-			return nil, 0, err
-		}
-		if options.SeparateAlpha && !info.Alpha {
-			return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
-		}
-		clearJXRMergedMetadata(&options)
-		if work > budget {
-			return nil, 0, &LimitError{Resource: "row image file descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, work)))}
-		}
-		retained += work
-		width, height := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
-		if width > (limits.MaxPixels-pixels)/height {
-			return nil, 0, &LimitError{Resource: "combined row image pixels", Limit: limits.MaxPixels, Required: jxrSaturatedAdd(pixels, jxrSaturatedMul(width, height))}
-		}
-		pixels += width * height
-		identifier, format, err := jxrRasterIdentifier(info, [16]byte{})
-		if err != nil {
-			return nil, 0, err
-		}
-		if !options.Uncompressed {
-			resolved := jxrResolveEncodeOptions(options)
-			if resolved.TileSize == (image.Point{}) {
-				resolved.TileSize = jxrDefaultRowTileSize(info, format, resolved)
-			}
-			options = resolved
-		}
-		reader := input.Rows
-		wrapped := func(ctx context.Context, y int, target *Raster) error {
-			if err := reader(ctx, y, target); err != nil {
-				return jxrCallbackError{err: err}
-			}
-			return nil
-		}
-		plans[index] = jxrTileImagePlan{info: info, rows: wrapped, options: options, retained: work, identifier: identifier}
-	}
-	if err := checkJXRImageSequence(ctx, len(plans), func(index int) (Info, [16]byte, Orientation) {
-		return plans[index].info, plans[index].identifier, plans[index].options.Orientation
-	}); err != nil {
-		return nil, 0, err
-	}
-	for index := range plans {
-		plan := &plans[index]
-		if plan.raster != nil || plan.options.Uncompressed {
-			continue
-		}
-		amount, err := jxrTileOptionsQuantizationWork(ctx, plan.options, quantWork)
-		if err != nil {
-			return nil, 0, err
-		}
-		quantWork -= amount
-		options, work, err := snapshotJXRTileOptions(ctx, plan.info, plan.options, limits.MaxMemoryBytes-state-retained-quantWork*2)
-		if err != nil {
-			return nil, 0, err
-		}
-		plan.options, plan.retained = options, plan.retained+work
-		retained += work
-	}
-	return plans, retained, ctx.Err()
-}
-
 // writeJXRRowFileImageTo 在多图文件指定目录位置按单遍行流编码单幅图像并完成偶数对齐与目录链接
 // 入参: ctx Context, w 当前输出, plan 当前独占计划, options 当前合并选项, start 当前目录起点, previous 前一链接位置, maximum 全文件上限, last 是否末图
 // 返回: uint64 文件末尾位置, uint64 当前链接位置, error 布局、资源、提供器、取消或I/O错误
@@ -1422,7 +1357,10 @@ func writeJXRRowFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTile
 			}
 			limits.MaxMemoryBytes -= held
 		}
-		height := jxrRingHeight(input, formatInfo.color, options)
+		height, ringHeightErr := jxrRingHeight(input, formatInfo.color, options)
+		if ringHeightErr != nil {
+			return 0, 0, ringHeightErr
+		}
 		cacheInfo, ringWork, ringErr := jxrRegionInfo(input, image.Rect(0, 0, input.Bounds.Dx(), height))
 		if ringErr != nil {
 			return 0, 0, ringErr

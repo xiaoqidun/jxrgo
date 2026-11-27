@@ -217,11 +217,11 @@ func (d *Decoder) decodeRows(ctx context.Context, plan jxrStripPlan, work uint64
 	return target, nil
 }
 
-// decodeRowsHardTiles 在全内存多独立分块且预算充足时按分块并行重建并写入互不相交的目标区域
+// decodeRowsHardTiles 在多独立分块且预算充足时按分块并行重建并写入互不相交的目标区域，支持内存切片与随机读取源
 // 入参: ctx Context, target 独占完整原生输出图像, plan 已预检的行带预算布局
 // 返回: bool 是否已由多核分块路径完成, error 解码、数值或取消错误
 func (d *Decoder) decodeRowsHardTiles(ctx context.Context, target *Raster, plan jxrStripPlan) (bool, error) {
-	if d.workers <= 1 || d.source.primary.input != nil || d.source.alpha != nil && d.source.alpha.input != nil {
+	if d.workers <= 1 {
 		return false, nil
 	}
 	sources := [2]jxrRasterSource{d.source}
@@ -236,6 +236,7 @@ func (d *Decoder) decodeRowsHardTiles(ctx context.Context, target *Raster, plan 
 	if d.source.alpha != nil {
 		passes++
 		sources[1] = jxrCodedSource(*d.source.alpha, d.source.container.alpha)
+		sources[1].container.imageInput = d.source.container.alphaInput
 		sources[1].container.transform = 0
 	}
 	available := plan.remaining + plan.cacheWork + plan.alphaWork
@@ -274,10 +275,14 @@ func (d *Decoder) decodeRowsHardTiles(ctx context.Context, target *Raster, plan 
 				maxWork = tileWork
 			}
 		}
-		if maxWork > ^uint64(0)-4096 {
+		extra := uint64(4096)
+		if s.input != nil {
+			extra += jxrReaderAtWork
+		}
+		if maxWork > ^uint64(0)-extra {
 			return false, nil
 		}
-		perWorker := maxWork + 4096
+		perWorker := maxWork + extra
 		if perWorker > available {
 			return false, nil
 		}
@@ -295,10 +300,24 @@ func (d *Decoder) decodeRowsHardTiles(ctx context.Context, target *Raster, plan 
 		width, height := int(h.width), int(h.height)
 		alphaOnly := pass != 0
 		tileLimit := maxWorks[pass]
-		if err := runJXRWorkers(ctx, passWorkers[pass], tileCounts[pass], func(runCtx context.Context, tile int) error {
+		var slotInputs []*jxrReaderAt
+		if passWorkers[pass] > 1 && source.primary.input != nil {
+			slotInputs = make([]*jxrReaderAt, passWorkers[pass])
+			for slot := range passWorkers[pass] {
+				slotInputs[slot] = cloneJXRReaderAt(source.primary.input)
+			}
+		}
+		if err := runJXRWorkerSlots(ctx, passWorkers[pass], tileCounts[pass], func(runCtx context.Context, slot, tile int) error {
 			selected, coded, err := source.regionTile(tile)
 			if err != nil {
 				return err
+			}
+			if slotInputs != nil {
+				in := slotInputs[slot]
+				in.ctx = runCtx
+				defer func() { in.ctx = nil }()
+				selected.primary.input = in
+				selected.container.imageInput = in
 			}
 			selected.setWorkers(1)
 			return selected.copyRegionTile(runCtx, target, coded.Min, bounds, width, height, transform, alphaOnly, tileLimit)
@@ -309,11 +328,11 @@ func (d *Decoder) decodeRowsHardTiles(ctx context.Context, target *Raster, plan 
 	return true, nil
 }
 
-// decodeRowsFullParallel 在预算可容纳完整系数时执行并行熵解码、两级重建与行分片像素写入
+// decodeRowsFullParallel 在预算可容纳完整系数时执行并行熵解码、两级重建与行分片像素写入，支持内存切片与随机读取源
 // 入参: ctx Context, target 独占完整原生输出图像, plan 已预检的行带预算布局
 // 返回: bool 是否已由多核整图系数路径完成, error 解码、数值或取消错误
 func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, plan jxrStripPlan) (bool, error) {
-	if d.workers <= 1 || d.source.primary.input != nil || d.source.alpha != nil && d.source.alpha.input != nil {
+	if d.workers <= 1 {
 		return false, nil
 	}
 	c := &d.source.container

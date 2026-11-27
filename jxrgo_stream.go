@@ -119,7 +119,7 @@ type jxrPlane struct {
 	explicitChromaY          bool
 	shift                    uint8
 	mantissa                 uint8
-	exponent                 int8
+	exponent                 uint8
 	dcUniform                bool
 	lpUniform                bool
 	hpUniform                bool
@@ -923,7 +923,7 @@ func readJXRPlane(b *jxrBits, h *jxrHeader, alpha bool) (jxrPlane, error) {
 	if h.depth == 2 || h.depth == 3 || h.depth == 6 {
 		p.shift = uint8(b.read(8))
 	} else if h.depth == 7 {
-		p.mantissa, p.exponent = uint8(b.read(8)), int8(b.read(8))
+		p.mantissa, p.exponent = uint8(b.read(8)), uint8(b.read(8))
 	}
 	p.dcUniform = b.flag()
 	if p.dcUniform {
@@ -1128,7 +1128,7 @@ func writeJXRPlaneChecked(b *jxrBitWriter, h *jxrHeader, p *jxrPlane) {
 		b.write(uint32(p.shift), 8)
 	} else if h.depth == 7 {
 		b.write(uint32(p.mantissa), 8)
-		b.write(uint32(uint8(p.exponent)), 8)
+		b.write(uint32(p.exponent), 8)
 	}
 	b.flag(p.dcUniform)
 	if p.dcUniform {
@@ -1261,15 +1261,12 @@ func jxrQuantScale(qp uint8, scaled bool, shift uint8) int64 {
 	return mantissa << exponent
 }
 
-// dequantJXRLowComponents 组合实际分量数的DC及低通系数并缩放，不分配宏块缓冲
-// 入参: p 平面格式, dc, lp 预测后的系数, q 分块量化参数, index 低通集合索引, longWord 是否使用三十二位范围, result 输出，可与低通输入使用同一切片
-// 返回: error 布局、索引或数值范围错误，仅修改有效分量，省略频带时lp可为空
-func dequantJXRLowComponents(p *jxrPlane, dc []int64, lp [][16]int64, q *jxrTileQuant, index int, longWord bool, result [][16]int64) error {
-	if err := checkJXRPlaneComponents(p); err != nil {
-		return err
-	}
-	if q == nil || len(dc) < p.channels || len(result) < p.channels || len(lp) < p.channels && !(p.bands == 3 && len(lp) == 0) || index < 0 || q.lpCount < 1 || q.lpCount > 16 || index >= q.lpCount || index >= len(q.lp) || len(q.dc) != p.channels || len(q.lp[index]) != p.channels {
-		return fmt.Errorf("%w: JPEG XR lowpass quantization index or storage", ErrInvalid)
+// dequantJXRLowComponentsChecked 在分块平面与存储布局已校验前提下反量化DC及低通系数，保留动态量化索引及字长范围检查
+// 入参: p 已校验平面格式, dc, lp 预测后的系数, q 已校验分块量化参数, index 低通集合索引, longWord 是否使用三十二位范围, result 输出，可与低通输入使用同一切片
+// 返回: error 索引或数值范围错误，仅修改有效分量，省略频带时lp可为空
+func dequantJXRLowComponentsChecked(p *jxrPlane, dc []int64, lp [][16]int64, q *jxrTileQuant, index int, longWord bool, result [][16]int64) error {
+	if index < 0 || index >= q.lpCount {
+		return fmt.Errorf("%w: JPEG XR lowpass quantization index", ErrInvalid)
 	}
 	for i := range p.channels {
 		shift := uint8(0)

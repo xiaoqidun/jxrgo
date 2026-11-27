@@ -45,7 +45,7 @@ type jxrOffsetReadWriteSeeker struct {
 }
 
 // RowEncoder 提供面向顺序io.Writer与io.WriteSeeker的推式单遍流式JPEG XR行编码器
-// 内部采用与EncodeRows相同的有界环形行缓存实时编码并提交已就绪分块，无压缩转置方向及未提供Scratch时的顺序暂存受MaxMemoryBytes约束，Close幂等安全且不关闭底层输出流
+// 内部采用与EncodeRows相同的有界环形行缓存实时编码并提交已就绪分块，非转置顺序无压缩流直写目标Writer实现常量行内存，Close幂等安全且不关闭底层输出流
 type RowEncoder struct {
 	mu           sync.Mutex
 	finalWriter  io.Writer
@@ -56,6 +56,7 @@ type RowEncoder struct {
 	file         bool
 	separate     bool
 	uncompressed bool
+	uncDirect    bool
 	closed       bool
 	failed       error
 	height       int
@@ -71,25 +72,13 @@ type RowEncoder struct {
 	mainStart    uint64
 	fileSizeAt   uint64
 	fileMaxBytes uint64
-	stream       jxrStream
-	streamOpts   jxrStreamOutput
-	streamPos    int64
-	indexAt      uint64
-	prefix       uint64
-	total        uint64
-	maximum      uint64
-	bands        int
-	tiles        int
+	packetStream *jxrPacketStream
+	streamPlan   jxrHardTileStreamPlan
+	coders       []jxrTileCoder
+	sharedBudget jxrSharedWriteBudget
 	nextOrdinal  int
 	nextTile     int
 	nextPlan     jxrHardTileInput
-	largest      jxrHardTileInput
-	tileMaxWork  uint64
-	local        *Raster
-	planes       [2]*jxrCoefficients
-	packets      [4]jxrBitWriter
-	packetBudget jxrWriteBudget
-	tileOutput   jxrTileOutput
 	uncLayout    jxrUncompressedLayout
 	uncTransform uint8
 	uncHeader    []byte
@@ -105,7 +94,7 @@ type RowEncoder struct {
 }
 
 // NewRowEncoder 初始化推式单遍流式行编码器并完成元数据、方向、预算及输出头预检
-// w实现io.WriteSeeker时原地直写回填且须位于目标起点；普通顺序io.Writer优先借用opts.Scratch或有界内存暂存回填后流式拷贝，不关闭底层输出流
+// w实现io.WriteSeeker时原地直写回填且须位于目标起点；普通顺序io.Writer在非转置无压缩且未提供Scratch时（无需定位回填布局）直写目标Writer，否则优先借用opts.Scratch或有界内存暂存回填后流式拷贝，不关闭底层输出流
 // 入参: ctx Context，nil采用Background, w 目标输出流, info 完整原生图像元数据, opts 可选编码选项
 // 返回: *RowEncoder 推式行编码器, error 参数、格式、预算、取消或输出错误
 func NewRowEncoder(ctx context.Context, w io.Writer, info Info, opts *EncodeOptions) (*RowEncoder, error) {
@@ -176,7 +165,7 @@ func (e *RowEncoder) WriteRow(ctx context.Context, src *Raster) error {
 // 返回: error 参数、格式、状态、预算、精度、取消或写入错误
 func (e *RowEncoder) WriteRowNRGBA(ctx context.Context, src []byte) error {
 	return e.writeRowFast(ctx, "RowEncoder.WriteRowNRGBA", func(row *Raster) error {
-		return row.writeRowNRGBA(0, src)
+		return row.writeRowRGBABytes(0, src, false)
 	})
 }
 
@@ -185,7 +174,7 @@ func (e *RowEncoder) WriteRowNRGBA(ctx context.Context, src []byte) error {
 // 返回: error 参数、格式、状态、预算、精度、取消或写入错误
 func (e *RowEncoder) WriteRowNRGBA64(ctx context.Context, src []byte) error {
 	return e.writeRowFast(ctx, "RowEncoder.WriteRowNRGBA64", func(row *Raster) error {
-		return row.writeRowNRGBA64(0, src)
+		return row.writeRowRGBA64Bytes(0, src, false)
 	})
 }
 
@@ -222,6 +211,60 @@ func (e *RowEncoder) WriteRowCMYK(ctx context.Context, src []byte) error {
 func (e *RowEncoder) WriteRowCMYKAlpha(ctx context.Context, cmyk, alpha []byte) error {
 	return e.writeRowFast(ctx, "RowEncoder.WriteRowCMYKAlpha", func(row *Raster) error {
 		return row.writeRowCMYK(0, cmyk, alpha)
+	})
+}
+
+// WriteRowRGB 将单行紧凑二十四位八位RGB扫描行零分配推入八位或十六位非预乘RGB流式编码器
+// 入参: ctx Context，nil采用Background, src 源紧凑八位RGB字节缓冲
+// 返回: error 参数、格式、状态、预算、精度、取消或写入错误
+func (e *RowEncoder) WriteRowRGB(ctx context.Context, src []byte) error {
+	return e.writeRowFast(ctx, "RowEncoder.WriteRowRGB", func(row *Raster) error {
+		return row.writeRowRGB(0, src)
+	})
+}
+
+// WriteRowRGBA 将单行八位预乘RGBA扫描行零分配推入八位或十六位预乘RGB流式编码器
+// 入参: ctx Context，nil采用Background, src 源八位预乘RGBA字节缓冲
+// 返回: error 参数、格式、状态、预算、精度、取消或写入错误
+func (e *RowEncoder) WriteRowRGBA(ctx context.Context, src []byte) error {
+	return e.writeRowFast(ctx, "RowEncoder.WriteRowRGBA", func(row *Raster) error {
+		return row.writeRowRGBABytes(0, src, true)
+	})
+}
+
+// WriteRowRGBA64 将单行大端十六位预乘RGBA扫描行零分配推入十六位预乘RGB流式编码器
+// 入参: ctx Context，nil采用Background, src 源大端十六位预乘RGBA字节缓冲
+// 返回: error 参数、格式、状态、预算、精度、取消或写入错误
+func (e *RowEncoder) WriteRowRGBA64(ctx context.Context, src []byte) error {
+	return e.writeRowFast(ctx, "RowEncoder.WriteRowRGBA64", func(row *Raster) error {
+		return row.writeRowRGBA64Bytes(0, src, true)
+	})
+}
+
+// WriteRowBlackWhite 将单行高位优先一位打包黑白扫描行零分配推入原生一位黑白流式编码器
+// 入参: ctx Context，nil采用Background, src 源一位打包字节缓冲
+// 返回: error 参数、格式、状态、预算、精度、取消或写入错误
+func (e *RowEncoder) WriteRowBlackWhite(ctx context.Context, src []byte) error {
+	return e.writeRowFast(ctx, "RowEncoder.WriteRowBlackWhite", func(row *Raster) error {
+		return row.writeRowBlackWhite(0, src)
+	})
+}
+
+// WriteRowCMYK16 将单行大端十六位CMYK扫描行零分配推入十六位非预乘CMYK流式编码器
+// 入参: ctx Context，nil采用Background, src 源大端十六位CMYK字节缓冲
+// 返回: error 参数、格式、状态、预算、精度、取消或写入错误
+func (e *RowEncoder) WriteRowCMYK16(ctx context.Context, src []byte) error {
+	return e.writeRowFast(ctx, "RowEncoder.WriteRowCMYK16", func(row *Raster) error {
+		return row.writeRowCMYK16(0, src, nil)
+	})
+}
+
+// WriteRowCMYK16Alpha 将单行大端十六位CMYK及可选独立大端十六位Alpha扫描行零分配推入十六位非预乘CMYK流式编码器
+// 入参: ctx Context，nil采用Background, cmyk 源大端十六位CMYK字节缓冲, alpha 可选源大端十六位Alpha字节缓冲
+// 返回: error 参数、格式、状态、预算、精度、取消或写入错误
+func (e *RowEncoder) WriteRowCMYK16Alpha(ctx context.Context, cmyk, alpha []byte) error {
+	return e.writeRowFast(ctx, "RowEncoder.WriteRowCMYK16Alpha", func(row *Raster) error {
+		return row.writeRowCMYK16(0, cmyk, alpha)
 	})
 }
 
@@ -658,7 +701,11 @@ func newRowEncoder(ctx context.Context, w io.Writer, info Info, opts *EncodeOpti
 	}
 	settings = jxrResolveEncodeOptions(settings)
 	if settings.TileSize == (image.Point{}) {
-		settings.TileSize = jxrDefaultRowTileSize(cleanInfo, formatInfo, settings)
+		tileSize, err := jxrDefaultRowTileSize(cleanInfo, formatInfo, settings)
+		if err != nil {
+			return nil, err
+		}
+		settings.TileSize = tileSize
 	}
 	if err := enc.initCompressed(ctx, info, formatInfo, settings, metadata); err != nil {
 		return nil, err
@@ -666,7 +713,7 @@ func newRowEncoder(ctx context.Context, w io.Writer, info Info, opts *EncodeOpti
 	return enc, nil
 }
 
-// initUncompressed 初始化无压缩模式的推式行编码器，写入容器前缀并分配单行或转置工作缓冲
+// initUncompressed 初始化无压缩模式的推式行编码器，非转置顺序流无需定位时直接向最终Writer写出以达成常量行内存
 // 入参: ctx 已规范化Context, origInfo 含容器元数据的原始描述, settings 已校验无压缩选项
 // 返回: error 格式、资源、取消或I/O错误
 func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settings EncodeOptions) error {
@@ -681,13 +728,6 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 	if err != nil {
 		return err
 	}
-	position, err := e.stageWriter.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	if position != 0 {
-		return fmt.Errorf("%w: uncompressed row encoder output position", ErrInvalid)
-	}
 	rowInfo, rowRasterWork, err := jxrRegionInfo(jxrStripContainerMetadata(info), image.Rect(0, 0, e.width, e.step))
 	if err != nil {
 		return err
@@ -696,6 +736,13 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 	e.uncLayout, e.uncTransform = prefix.layout, prefix.transform
 	e.uncMainStart, e.uncAlphaAt, e.uncTotal, e.uncPadMain = prefix.mainLocal, prefix.alphaLocal, prefix.totalLocal, prefix.padMain
 	if prefix.transform&4 != 0 {
+		position, err := e.stageWriter.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		if position != 0 {
+			return fmt.Errorf("%w: uncompressed row encoder output position", ErrInvalid)
+		}
 		e.uncHeader = prefix.header
 		rawTotal := prefix.layout.mainBytes + prefix.layout.alphaBytes
 		if rawTotal > uint64(^uint(0)>>1) {
@@ -724,10 +771,25 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 	if !ok {
 		return &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(baseHeld, jxrSaturatedAdd(rowRasterWork, bufWork)), Detail: "uncompressed row encoder memory"}
 	}
-	if e.memStage != nil {
-		e.memStage.maxMemory = limits.MaxMemoryBytes - held
-		if prefix.totalLocal > e.memStage.maxMemory {
-			return &LimitError{Resource: "max memory bytes", Limit: e.memStage.maxMemory, Required: prefix.totalLocal, Detail: "sequential row output stage memory"}
+	e.uncNeedSeek = prefix.layout.planar || prefix.layout.separateAlpha || prefix.transform&1 != 0
+	if e.memStage != nil && !e.uncNeedSeek {
+		e.uncDirect = true
+		e.memStage = nil
+		e.stageWriter = nil
+		e.stageReader = nil
+	} else {
+		position, err := e.stageWriter.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
+		if position != 0 {
+			return fmt.Errorf("%w: uncompressed row encoder output position", ErrInvalid)
+		}
+		if e.memStage != nil {
+			e.memStage.maxMemory = limits.MaxMemoryBytes - held
+			if prefix.totalLocal > e.memStage.maxMemory {
+				return &LimitError{Resource: "max memory bytes", Limit: e.memStage.maxMemory, Required: prefix.totalLocal, Detail: "sequential row output stage memory"}
+			}
 		}
 	}
 	ring, err := newRasterContext(ctx, rowInfo, Limits{MaxPixels: limits.MaxPixels, MaxMemoryBytes: rowRasterWork})
@@ -740,10 +802,13 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 	if !prefix.layout.planar && prefix.layout.separateAlpha {
 		e.uncAlphaBuf = make([]byte, int(prefix.layout.alphaRowBytes))
 	}
-	if err := writeEncoderOutput(ctx, e.stageWriter, prefix.header); err != nil {
+	dst := io.Writer(e.stageWriter)
+	if e.uncDirect {
+		dst = e.finalWriter
+	}
+	if err := writeEncoderOutput(ctx, dst, prefix.header); err != nil {
 		return err
 	}
-	e.uncNeedSeek = prefix.layout.planar || prefix.layout.separateAlpha || prefix.transform&1 != 0
 	if e.uncNeedSeek {
 		var zeros [32768]byte
 		for remaining := prefix.totalLocal - uint64(len(prefix.header)); remaining != 0; {
@@ -757,7 +822,7 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 	return ctx.Err()
 }
 
-// initCompressed 初始化压缩模式的推式行编码器，分配环形行缓存、码流前缀与可复用单块工作区
+// initCompressed 初始化压缩模式的推式行编码器，分配环形行缓存、码流前缀与可复用工作槽
 // 入参: ctx 已规范化Context, origInfo 含容器元数据的原始描述, formatInfo 像素格式, settings 已解析编码选项, metadata 固定描述额度
 // 返回: error 布局、预算、取消或I/O错误
 func (e *RowEncoder) initCompressed(ctx context.Context, origInfo Info, formatInfo jxrPixelFormat, settings EncodeOptions, metadata uint64) error {
@@ -780,7 +845,10 @@ func (e *RowEncoder) initCompressed(ctx context.Context, origInfo Info, formatIn
 		}
 		limits.MaxMemoryBytes -= held
 	}
-	ringHeight := jxrRingHeight(cleanInfo, formatInfo.color, settings)
+	ringHeight, err := jxrRingHeight(cleanInfo, formatInfo.color, settings)
+	if err != nil {
+		return err
+	}
 	cacheInfo, ringWork, err := jxrRegionInfo(cleanInfo, image.Rect(0, 0, e.width, ringHeight))
 	if err != nil {
 		return err
@@ -900,102 +968,51 @@ func (e *RowEncoder) initRowView(info Info) {
 	e.rowStorage.planes = make([]imageComponents, len(info.Components))
 }
 
-// initStreamState 规划码流全部块的最大工作预算、写出码流头与占位索引并预分配复用的局部变换缓冲
+// initStreamState 规划码流全部块的最大工作预算、写出码流头与占位索引并预分配复用的单块或并发工作槽
 // 入参: ctx Context, codedInfo 当前主码流原生描述, source 主码流头部, options 码流输出预算与参数
 // 返回: error 布局、预算、取消或I/O错误
 func (e *RowEncoder) initStreamState(ctx context.Context, codedInfo Info, source *jxrStream, options jxrStreamOutput) error {
-	settingsWork, err := options.tileWork(ctx, options.maxMemory)
-	if err != nil {
-		return err
-	}
 	streamPlan, err := planJXRHardTileStream(ctx, codedInfo, source, options.maxMemory)
 	if err != nil {
 		return err
 	}
-	count := streamPlan.tiles * streamPlan.bands
-	working := streamPlan.retained + streamPlan.tileMax
-	if settingsWork > ^uint64(0)-uint64(count)*8 {
-		return fmt.Errorf("%w: incremental settings capacity", ErrLimit)
-	}
-	extra := settingsWork + uint64(count)*8
-	if working >= options.maxMemory || extra >= options.maxMemory-working {
-		return fmt.Errorf("%w: incremental output working memory", ErrLimit)
-	}
-	position, err := e.stageWriter.Seek(0, io.SeekCurrent)
+	ps, _, err := beginJXRPacketStream(ctx, e.stageWriter, source, options, streamPlan.retained+streamPlan.tileMax)
 	if err != nil {
 		return err
 	}
-	if position < 0 {
-		return fmt.Errorf("%w: incremental output position", ErrInvalid)
+	rowTiles := len(source.header.columns) - 1
+	if source.header.transform&4 != 0 {
+		rowTiles = len(source.header.rows) - 1
 	}
-	maximum := min(options.maxBytes, uint64(math.MaxInt64-position))
-	if maximum == 0 {
-		return fmt.Errorf("%w: incremental output address capacity", ErrLimit)
+	freePacket := ps.budget.limit
+	if ps.budget.used < freePacket {
+		freePacket -= ps.budget.used
+	} else {
+		freePacket = 0
 	}
-	e.packetBudget = jxrWriteBudget{limit: options.maxMemory - working - extra}
-	if e.memStage != nil {
-		memCap := uint64(cap(e.memStage.data))
-		if memCap >= e.packetBudget.limit {
-			return &LimitError{Resource: "max memory bytes", Limit: e.packetBudget.limit, Required: jxrSaturatedAdd(memCap, 1), Detail: "sequential row output stage memory"}
-		}
-		e.packetBudget.used = memCap
-		e.memStage.budget = &e.packetBudget
-		e.memStage.maxMemory = e.packetBudget.limit
-	}
-	e.stream = *source
-	e.stream.packets = make([]uint64, count)
-	header := newJXRBitWriter(ctx, maximum, e.packetBudget.limit)
-	header.budget = &e.packetBudget
-	indexAt := writeJXRStreamHeaderChecked(&header, &e.stream, true)
-	if header.err != nil {
-		return header.err
-	}
-	total, prefix := uint64(len(header.data)), uint64(len(header.data))
-	if err := writeEncoderOutput(ctx, e.stageWriter, header.data); err != nil {
-		return err
-	}
-	e.packetBudget.used -= uint64(cap(header.data))
-	header.data = nil
-	e.tileOutput = jxrTileOutput{exact: options.exact, validated: true, maxMemory: options.maxMemory}
-	for band := range streamPlan.bands {
-		e.packets[band] = newJXRBitWriter(ctx, maximum-total, e.packetBudget.limit)
-		e.packets[band].budget = &e.packetBudget
-		if e.packets[band].err != nil {
-			return e.packets[band].err
-		}
-		e.tileOutput.packet[band] = &e.packets[band]
-	}
-	for index, plane := range [2]*jxrPlane{&e.stream.primary, e.stream.alpha} {
-		if plane != nil {
-			e.tileOutput.macro[index].high = make([]int64, plane.channels*256)
+	slots := jxrTileCoderSlots(options.workers, rowTiles, streamPlan.tileMax, freePacket)
+	if slots > 1 {
+		ps.budget.limit -= uint64(slots-1) * streamPlan.tileMax
+		e.sharedBudget.limit = ps.budget.limit
+		if e.memStage != nil {
+			e.memStage.maxMemory = min(e.memStage.maxMemory, ps.budget.limit)
 		}
 	}
-	local, err := resizeJXRHardTile(ctx, codedInfo, streamPlan.largest, streamPlan.largest.rawWork, nil)
-	if err != nil {
-		return err
-	}
-	available := streamPlan.tileMax - streamPlan.largest.rawWork
-	allocated := uint64(0)
-	for index, plane := range [2]*jxrPlane{&streamPlan.template.primary, streamPlan.template.alpha} {
-		if plane != nil {
-			e.planes[index], err = newJXRTransformPlane(ctx, &streamPlan.template.header, plane, available-allocated)
-			if err != nil {
-				return err
-			}
-			allocated += uint64(cap(e.planes[index].low)+cap(e.planes[index].high))*8 + uint64(cap(e.planes[index].info))*6
+	coders := make([]jxrTileCoder, slots)
+	for slot := range slots {
+		var budget *jxrWriteBudget
+		if slots == 1 {
+			budget = &ps.budget
+		} else {
+			coders[slot].budget = jxrWriteBudget{limit: ps.budget.limit, shared: &e.sharedBudget}
+		}
+		if err := coders[slot].init(ctx, codedInfo, &streamPlan, &ps.stream, &options, ps.maximum-ps.total, budget); err != nil {
+			return err
 		}
 	}
-	e.streamOpts = options
-	e.streamPos = position
-	e.indexAt = indexAt
-	e.prefix = prefix
-	e.total = total
-	e.maximum = maximum
-	e.bands = streamPlan.bands
-	e.tiles = streamPlan.tiles
-	e.largest = streamPlan.largest
-	e.tileMaxWork = streamPlan.tileMax
-	e.local = local
+	e.packetStream = ps
+	e.streamPlan = streamPlan
+	e.coders = coders
 	e.nextOrdinal = 0
 	return e.prepareNextTilePlan(codedInfo)
 }
@@ -1004,14 +1021,14 @@ func (e *RowEncoder) initStreamState(ctx context.Context, codedInfo Info, source
 // 入参: codedInfo 主码流原生描述
 // 返回: error 几何规划错误
 func (e *RowEncoder) prepareNextTilePlan(codedInfo Info) error {
-	if e.nextOrdinal >= e.tiles {
+	if e.nextOrdinal >= e.packetStream.tiles {
 		return nil
 	}
 	tile := e.nextOrdinal
-	if e.stream.header.transform&5 != 0 {
-		tile = jxrDisplayTileIndex(&e.stream.header, e.nextOrdinal)
+	if e.packetStream.stream.header.transform&5 != 0 {
+		tile = jxrDisplayTileIndex(&e.packetStream.stream.header, e.nextOrdinal)
 	}
-	plan, err := planJXRHardTile(codedInfo, &e.stream, tile)
+	plan, err := planJXRHardTile(codedInfo, &e.packetStream.stream, tile)
 	if err != nil {
 		return err
 	}
@@ -1026,7 +1043,7 @@ func (e *RowEncoder) bindRingRowView(height int) *Raster {
 	return jxrBindRingRowView(e.ring, &e.rowStorage, &e.rowView, e.pushed, height)
 }
 
-// writeRowFast 共用六种零分配单行快路径写入，校验状态后直写环形缓存并立即刷出已就绪分块
+// writeRowFast 共用十二种零分配单行快路径写入，校验状态后直写环形缓存并立即刷出已就绪分块
 // 入参: ctx Context, op 公开操作名, fill 单行写入回调
 // 返回: error 状态、格式、参数、编码、取消或写入错误
 func (e *RowEncoder) writeRowFast(ctx context.Context, op string, fill func(*Raster) error) error {
@@ -1168,10 +1185,14 @@ func (e *RowEncoder) commitUncompressedRow(ctx context.Context) error {
 	if e.uncTransform&4 != 0 {
 		return jxrScatterUncompressedRowTransposed(ctx, cleanInfo, e.rowStorage.planes, &e.uncLayout, e.uncMainData, e.uncAlphaData, e.uncTransform, e.pushed, e.step)
 	}
-	return jxrWriteUncompressedRowStreamStep(ctx, e.stageWriter, cleanInfo, e.rowStorage.planes, &e.uncLayout, e.uncRowBuf, e.uncAlphaBuf, e.uncTransform, e.pushed, e.step, e.uncMainStart, e.uncAlphaAt, e.uncNeedSeek)
+	dst := io.Writer(e.stageWriter)
+	if e.uncDirect {
+		dst = e.finalWriter
+	}
+	return jxrWriteUncompressedRowStreamStep(ctx, dst, cleanInfo, e.rowStorage.planes, &e.uncLayout, e.uncRowBuf, e.uncAlphaBuf, e.uncTransform, e.pushed, e.step, e.uncMainStart, e.uncAlphaAt, e.uncNeedSeek)
 }
 
-// flushReadyTiles 按显示行序同步编码并写出全部所需显示行均已到达的分块，确保环形缓存安全回卷
+// flushReadyTiles 按显示行序编码并写出全部所需显示行均已到达的分块，多列就绪且预算充足时按批并发编码并按序提交
 // 入参: ctx 已规范化Context
 // 返回: error 变换、编码、预算、取消或写入错误
 func (e *RowEncoder) flushReadyTiles(ctx context.Context) error {
@@ -1179,86 +1200,86 @@ func (e *RowEncoder) flushReadyTiles(ctx context.Context) error {
 	if e.separate {
 		codedInfo = e.separateIn.info[0]
 	}
-	for e.nextOrdinal < e.tiles {
+	ps := e.packetStream
+	slots := len(e.coders)
+	capacity := e.ring.Bounds().Dy()
+	var batchBuf [16]jxrTileJob
+	batch := batchBuf[:0]
+	if slots > len(batchBuf) {
+		batch = make([]jxrTileJob, 0, slots)
+	}
+	for e.nextOrdinal < ps.tiles {
 		if e.pushed < e.nextPlan.region.Max.Y {
 			break
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := e.encodeSingleTile(ctx, codedInfo, e.nextTile, e.nextPlan); err != nil {
-			return err
+		batch = batch[:0]
+		for len(batch) < slots && e.nextOrdinal < ps.tiles && e.pushed >= e.nextPlan.region.Max.Y {
+			if e.nextPlan.region.Min.Y < max(0, e.pushed-capacity) || e.nextPlan.region.Max.Y > e.height || e.nextPlan.region.Dy() > capacity {
+				return fmt.Errorf("%w: row encoder ring window order", ErrInvalid)
+			}
+			batch = append(batch, jxrTileJob{tile: e.nextTile, plan: e.nextPlan})
+			e.nextOrdinal++
+			if err := e.prepareNextTilePlan(codedInfo); err != nil {
+				return err
+			}
 		}
-		e.nextOrdinal++
-		if err := e.prepareNextTilePlan(codedInfo); err != nil {
-			return err
+		if slots > 1 && e.memStage != nil {
+			memCap := uint64(cap(e.memStage.data))
+			if memCap >= ps.budget.limit {
+				return &LimitError{Resource: "max memory bytes", Limit: ps.budget.limit, Required: jxrSaturatedAdd(memCap, 1), Detail: "sequential row output stage memory"}
+			}
+			sharedLimit := ps.budget.limit - memCap
+			if e.sharedBudget.used.Load() > sharedLimit {
+				for slot := range slots {
+					e.coders[slot].resetPackets(e.streamPlan.bands)
+				}
+			}
+			e.sharedBudget.limit = sharedLimit
+			for slot := range slots {
+				e.coders[slot].setPacketLimit(e.streamPlan.bands, sharedLimit)
+			}
 		}
-	}
-	return nil
-}
-
-// encodeSingleTile 从环形行缓存投影单个分块窗口，执行正变换、熵编码并将各频带包写出至暂存或目标流
-// 入参: ctx 已规范化Context, codedInfo 当前码流原生描述, tile 编码分块序号, plan 分块窗口计划
-// 返回: error 投影、变换、编码、预算、取消或写入错误
-func (e *RowEncoder) encodeSingleTile(ctx context.Context, codedInfo Info, tile int, plan jxrHardTileInput) error {
-	capacity := e.ring.Bounds().Dy()
-	if plan.region.Min.Y < max(0, e.pushed-capacity) || plan.region.Max.Y > e.height || plan.region.Dy() > capacity {
-		return fmt.Errorf("%w: row encoder ring window order", ErrInvalid)
-	}
-	local, err := resizeJXRHardTile(ctx, codedInfo, plan, e.largest.rawWork, e.local)
-	if err != nil {
-		return err
-	}
-	e.local = local
-	if err := jxrProjectRingRegion(ctx, e.ring, local, plan.region); err != nil {
-		return err
-	}
-	frame := e.stream
-	var horizontal, vertical [4]uint32
-	var offset [36]uint64
-	window, localTile := jxrBuildTileFrame(&frame, e.stream.header.frequency, e.bands, &plan, &horizontal, &vertical, &offset)
-	selected := e.streamOpts
-	setting := &e.streamOpts.tiles[0]
-	if len(e.streamOpts.tiles) != 1 {
-		selected.tiles = e.streamOpts.tiles[tile : tile+1 : tile+1]
-		setting = &e.streamOpts.tiles[tile]
-	}
-	e.tileOutput.quant, e.tileOutput.trim = setting.quant, setting.trim
-	noCancel := ctx == context.Background() || ctx == context.TODO()
-	for band := range e.bands {
-		packet := &e.packets[band]
-		clear(packet.data)
-		packet.data, packet.bit, packet.maxBytes, packet.ctx = packet.data[:0], 0, e.maximum-e.total, ctx
-		packet.noCancel, packet.checks = noCancel, 0
-	}
-	available := e.tileMaxWork - e.largest.rawWork
-	state, err := forwardJXRNativeWindowStorage(ctx, local, &frame, &selected, available, &e.planes, window)
-	if err != nil {
-		return err
-	}
-	working, ok := jxrWorkTotal(e.streamOpts.maxMemory, state.outputWork(&frame), jxrHardTileReserve, e.tileOutput.packet[0].budget.limit)
-	if !ok {
-		required := jxrSaturatedAdd(state.outputWork(&frame), jxrSaturatedAdd(jxrHardTileReserve, e.tileOutput.packet[0].budget.limit))
-		return &LimitError{Resource: "local tile output memory", Limit: e.streamOpts.maxMemory, Required: required}
-	}
-	e.tileOutput.maxMemory = working
-	if _, err := state.writeTile(ctx, &frame, localTile, &e.tileOutput); err != nil {
-		return err
-	}
-	encoded := uint64(0)
-	for band := range e.bands {
-		length := uint64(len(e.packets[band].data))
-		if length > e.maximum-e.total-encoded {
-			return fmt.Errorf("%w: incremental combined packet byte budget", ErrLimit)
+		packetMax := ps.maximum - ps.total
+		if len(batch) == 1 {
+			coder := &e.coders[0]
+			local, err := resizeJXRHardTile(ctx, codedInfo, batch[0].plan, e.streamPlan.largest.rawWork, coder.local)
+			if err != nil {
+				return err
+			}
+			coder.local = local
+			if err := jxrProjectRingRegion(ctx, e.ring, local, batch[0].plan.region); err != nil {
+				return err
+			}
+			if err := coder.encodeLocal(ctx, &ps.stream, &ps.options, &e.streamPlan, batch[0].tile, &batch[0].plan, packetMax); err != nil {
+				return err
+			}
+		} else {
+			if err := runJXRWorkers(ctx, len(batch), len(batch), func(runCtx context.Context, i int) error {
+				coder := &e.coders[i]
+				local, err := resizeJXRHardTile(runCtx, codedInfo, batch[i].plan, e.streamPlan.largest.rawWork, coder.local)
+				if err != nil {
+					return err
+				}
+				coder.local = local
+				if err := jxrProjectRingRegion(runCtx, e.ring, local, batch[i].plan.region); err != nil {
+					return err
+				}
+				return coder.encodeLocal(runCtx, &ps.stream, &ps.options, &e.streamPlan, batch[i].tile, &batch[i].plan, packetMax)
+			}); err != nil {
+				return err
+			}
 		}
-		encoded += length
-	}
-	for band := range e.bands {
-		e.stream.packets[tile*e.bands+band] = e.total - e.prefix
-		if err := writeEncoderOutput(ctx, e.stageWriter, e.packets[band].data); err != nil {
-			return err
+		if slots > 1 && e.memStage != nil {
+			ps.budget.used = uint64(cap(e.memStage.data)) + e.sharedBudget.used.Load()
 		}
-		e.total += uint64(len(e.packets[band].data))
+		for i := range batch {
+			if err := ps.commitTile(ctx, e.stageWriter, batch[i].tile, &e.coders[i].packets); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -1315,10 +1336,8 @@ func (e *RowEncoder) finish(ctx context.Context) error {
 	if err := e.flushReadyTiles(ctx); err != nil {
 		return err
 	}
-	if e.stream.header.index {
-		if err := patchJXRStreamIndexTable(ctx, e.stageWriter, e.streamPos, e.indexAt, e.total, e.stream.packets); err != nil {
-			return err
-		}
+	if err := e.packetStream.finish(ctx, e.stageWriter); err != nil {
+		return err
 	}
 	if e.separate {
 		if err := e.finishSeparateAlpha(ctx); err != nil {
@@ -1331,7 +1350,7 @@ func (e *RowEncoder) finish(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if endPos < 0 || uint64(endPos) < e.mainStart || uint64(endPos)-e.mainStart > e.streamOpts.maxBytes {
+		if endPos < 0 || uint64(endPos) < e.mainStart || uint64(endPos)-e.mainStart > e.packetStream.options.maxBytes {
 			return fmt.Errorf("%w: incremental file output extent", ErrInvalid)
 		}
 		if err := patchJXRFileSize(ctx, e.stageWriter, e.fileSizeAt, uint64(endPos)-e.mainStart, uint64(endPos)); err != nil {
@@ -1352,11 +1371,9 @@ func (e *RowEncoder) finishSeparateAlpha(ctx context.Context) error {
 	if mainEnd < 0 || uint64(mainEnd) < e.mainStart || uint64(mainEnd) > e.fileMaxBytes {
 		return fmt.Errorf("%w: incremental separate alpha main extent", ErrInvalid)
 	}
-	e.local = nil
-	e.planes = [2]*jxrCoefficients{}
-	for band := range e.packets {
-		e.packets[band].data = nil
-	}
+	e.coders = nil
+	e.packetStream = nil
+	e.sharedBudget = jxrSharedWriteBudget{}
 	mainSize := uint64(mainEnd) - e.mainStart
 	cursor := uint64(mainEnd)
 	if cursor&1 != 0 {
@@ -1437,8 +1454,8 @@ func (e *RowEncoder) unbindContext() {
 	if e.memStage != nil {
 		e.memStage.ctx = nil
 	}
-	for band := range e.packets {
-		e.packets[band].ctx = nil
+	for index := range e.coders {
+		e.coders[index].unbindContext(e.streamPlan.bands)
 	}
 }
 
@@ -1449,6 +1466,7 @@ func (e *RowEncoder) release() {
 	e.finalWriter = nil
 	e.stageWriter = nil
 	e.stageReader = nil
+	e.uncDirect = false
 	if e.memStage != nil {
 		e.memStage.ctx = nil
 		e.memStage.data = nil
@@ -1460,13 +1478,10 @@ func (e *RowEncoder) release() {
 	e.rowStorage = Raster{}
 	e.alphaStorage = jxrAlphaRowStorage{}
 	e.separateIn = jxrSeparateTileInput{}
-	e.stream = jxrStream{}
-	e.streamOpts = jxrStreamOutput{}
-	e.local = nil
-	e.planes = [2]*jxrCoefficients{}
-	e.packets = [4]jxrBitWriter{}
-	e.packetBudget = jxrWriteBudget{}
-	e.tileOutput = jxrTileOutput{}
+	e.packetStream = nil
+	e.streamPlan = jxrHardTileStreamPlan{}
+	e.coders = nil
+	e.sharedBudget = jxrSharedWriteBudget{}
 	e.uncHeader = nil
 	e.uncRowBuf = nil
 	e.uncAlphaBuf = nil
