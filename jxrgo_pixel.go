@@ -224,8 +224,8 @@ func jxrIntegerScaleComponents(h *jxrHeader, p *jxrPlane, values []int64, color 
 			}
 		}
 		value := values[i] + (componentBias << scale)
-		if err := checkJXRWords([]int64{value}, true); err != nil {
-			return 0, err
+		if value < jxrLongWordMin || value > jxrLongWordMax {
+			return 0, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 		}
 		componentScale := scale
 		if color == 7 && h.depth == 10 && i != 1 {
@@ -535,8 +535,8 @@ func jxrFloatInput(h *jxrHeader, p *jxrPlane, bits []uint32, values []int64, alp
 		if p.scaled {
 			value <<= 3
 		}
-		if err := checkJXRWords([]int64{value}, true); err != nil {
-			return 0, err
+		if value < jxrLongWordMin || value > jxrLongWordMax {
+			return 0, fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 		}
 		values[index] = value
 	}

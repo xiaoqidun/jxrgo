@@ -202,6 +202,15 @@ func (c *jxrDC) readComponents(b *jxrBits, p *jxrPlane, adapt bool, values []int
 		b.err = err
 		return
 	}
+	c.readChecked(b, p, adapt, values)
+}
+
+// readChecked 在平面静态布局已校验前提下读取DC残差并更新模型
+// 入参: b 读取器, p 已校验平面格式, adapt 是否调整编码表, values 残差缓冲
+func (c *jxrDC) readChecked(b *jxrBits, p *jxrPlane, adapt bool, values []int64) {
+	if b.err != nil {
+		return
+	}
 	mean := c.readResidualChecked(b, p, values)
 	if b.err == nil {
 		c.model.update(mean, p, 0)
@@ -371,6 +380,15 @@ func (c *jxrDC) writeComponents(b *jxrBitWriter, p *jxrPlane, values []int64, ad
 		b.err = err
 		return
 	}
+	c.writeChecked(b, p, values, adapt)
+}
+
+// writeChecked 在平面静态布局已校验前提下写入宏块DC残差并更新模型
+// 入参: b 位写入器, p 已校验平面格式, values DC残差, adapt 是否在宏块后调整编码表
+func (c *jxrDC) writeChecked(b *jxrBitWriter, p *jxrPlane, values []int64, adapt bool) {
+	if b.err != nil {
+		return
+	}
 	mean := c.writeResidualChecked(b, p, values)
 	if b.err == nil {
 		c.model.update(mean, p, 0)
@@ -400,7 +418,7 @@ func (c *jxrDC) writeResidualChecked(b *jxrBitWriter, p *jxrPlane, values []int6
 	}
 	if p.color == 0 || p.color == 4 || p.color == 6 {
 		for index := range p.channels {
-			if index&63 == 0 {
+			if !b.noCancel && index&63 == 0 {
 				if err := b.ctx.Err(); err != nil {
 					b.err = err
 					return mean
@@ -451,8 +469,8 @@ func writeJXRDCValue(b *jxrBitWriter, level *jxrPairVLC, modelBits uint8, value 
 		b.err = fmt.Errorf("%w: JPEG XR DC refinement width", ErrInvalid)
 		return
 	}
-	if err := checkJXRWords([]int64{value}, true); err != nil {
-		b.err = err
+	if value < jxrLongWordMin || value > jxrLongWordMax {
+		b.err = fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 		return
 	}
 	magnitude := jxrAbs(value)
@@ -550,6 +568,15 @@ func (c *jxrLP) readComponents(b *jxrBits, p *jxrPlane, reset, adapt bool, value
 	}
 	if err := checkJXRModelComponents(p); err != nil {
 		b.err = err
+		return
+	}
+	c.readChecked(b, p, reset, adapt, values, flags)
+}
+
+// readChecked 在平面静态布局已校验前提下读取低通残差并更新模型
+// 入参: b 读取器, p 已校验平面格式, reset, adapt 扫描及编码表控制, values 系数缓冲, flags 逐分量标志工作缓冲
+func (c *jxrLP) readChecked(b *jxrBits, p *jxrPlane, reset, adapt bool, values [][16]int64, flags []bool) {
+	if b.err != nil {
 		return
 	}
 	mean := c.readResidualChecked(b, p, reset, values, flags)
@@ -727,6 +754,15 @@ func (c *jxrLP) writeComponents(b *jxrBitWriter, p *jxrPlane, values [][16]int64
 		b.err = err
 		return
 	}
+	c.writeChecked(b, p, values, reset, adapt, flags)
+}
+
+// writeChecked 在平面静态布局已校验前提下写入低通残差并更新模型
+// 入参: b 位写入器, p 已校验平面格式, values 低通残差, reset, adapt 扫描及编码表控制, flags 逐分量标志工作缓冲
+func (c *jxrLP) writeChecked(b *jxrBitWriter, p *jxrPlane, values [][16]int64, reset, adapt bool, flags []bool) {
+	if b.err != nil {
+		return
+	}
 	mean := c.writeResidualChecked(b, p, values, reset, flags)
 	if b.err == nil {
 		c.model.update(mean, p, 1)
@@ -753,7 +789,7 @@ func (c *jxrLP) writeResidualChecked(b *jxrBitWriter, p *jxrPlane, values [][16]
 	pattern := uint32(0)
 	clear(flags[:p.channels])
 	for n := range p.channels {
-		if n&63 == 0 {
+		if !b.noCancel && n&63 == 0 {
 			if err := b.ctx.Err(); err != nil {
 				b.err = err
 				return mean
@@ -907,8 +943,8 @@ func writeJXRLPRefinement(b *jxrBitWriter, value int64, width uint8) {
 		b.err = fmt.Errorf("%w: JPEG XR lowpass output refinement width", ErrInvalid)
 		return
 	}
-	if err := checkJXRWords([]int64{value}, true); err != nil {
-		b.err = err
+	if value < jxrLongWordMin || value > jxrLongWordMax {
+		b.err = fmt.Errorf("%w: JPEG XR 32-bit coefficient range", ErrInvalid)
 		return
 	}
 	magnitude := jxrAbs(value)
@@ -942,6 +978,17 @@ func (c *jxrHP) readComponents(b *jxrBits, p *jxrPlane, pattern []uint16, contro
 	}
 	if len(values) < p.channels*256 {
 		b.err = fmt.Errorf("%w: JPEG XR highpass coefficient buffer", ErrInvalid)
+		return bits
+	}
+	return c.readChecked(b, p, pattern, control, values)
+}
+
+// readChecked 在平面、块标志与系数缓冲布局已校验前提下读取宏块高通系数并更新模型
+// 入参: b 码流读取器, p 已校验图像平面, pattern 已校验逐分量块标志, control 宏块读取控制, values 系数缓冲
+// 返回: [2]uint8 亮度及其他分量的细化位数，错误保存在读取器中
+func (c *jxrHP) readChecked(b *jxrBits, p *jxrPlane, pattern []uint16, control jxrHPControl, values []int64) [2]uint8 {
+	bits := c.model.bits
+	if b.err != nil {
 		return bits
 	}
 	clear(values[:p.channels*256])
@@ -1121,7 +1168,7 @@ func (c *jxrHP) writeComponents(b *jxrBitWriter, p *jxrPlane, pattern []uint16, 
 	} else {
 		expected = expected[:p.channels]
 	}
-	if err := makeJXRHighPatternChecked(p, values, bits, expected); err != nil {
+	if err := makeJXRHighPattern(p, values, bits, expected); err != nil {
 		b.err = err
 		return bits
 	}
@@ -1130,6 +1177,17 @@ func (c *jxrHP) writeComponents(b *jxrBitWriter, p *jxrPlane, pattern []uint16, 
 			b.err = fmt.Errorf("%w: JPEG XR highpass output nonzero pattern", ErrInvalid)
 			return bits
 		}
+	}
+	return c.writeChecked(b, p, pattern, control, values, exact)
+}
+
+// writeChecked 在平面、模型与刚生成的非零块标志已校验前提下写入宏块高通残差，跳过重复全量重扫
+// 入参: b 位写入器, p 已校验平面格式, pattern 已校验逐分量非零块标志, control 扫描及空间模式控制, values 完整高通残差, exact 是否拒绝细化位截断造成的精度损失
+// 返回: [2]uint8 当前宏块的亮度及其他分量细化位数，错误保存在写入器中
+func (c *jxrHP) writeChecked(b *jxrBitWriter, p *jxrPlane, pattern []uint16, control jxrHPControl, values []int64, exact bool) [2]uint8 {
+	bits := c.model.bits
+	if b.err != nil {
+		return bits
 	}
 	trim := control.trim
 	if p.bands != 0 {
@@ -1221,20 +1279,13 @@ func (c *jxrHP) writeComponents(b *jxrBitWriter, p *jxrPlane, pattern []uint16, 
 	return bits
 }
 
-// makeJXRHighPattern 按当前细化位数生成层次扫描顺序的非零块标志，并校验系数布局
+// makeJXRHighPattern 按当前细化位数生成层次扫描顺序的非零块标志，并校验系数布局与数值范围
 // 入参: p 平面格式, values 完整高通残差, widths 亮度及其他分量细化位数, pattern 调用方提供的逐分量标志缓冲
 // 返回: error 布局、数值、缓冲或逃逸范围错误，仅修改有效分量的输出
 func makeJXRHighPattern(p *jxrPlane, values []int64, widths [2]uint8, pattern []uint16) error {
 	if err := checkJXRPlaneComponents(p); err != nil {
 		return err
 	}
-	return makeJXRHighPatternChecked(p, values, widths, pattern)
-}
-
-// makeJXRHighPatternChecked 在平面分量已校验前提下生成高通非零块标志
-// 入参: p 已校验平面格式, values 完整高通残差, widths 亮度及其他分量细化位数, pattern 逐分量标志缓冲
-// 返回: error 布局、数值、缓冲或逃逸范围错误
-func makeJXRHighPatternChecked(p *jxrPlane, values []int64, widths [2]uint8, pattern []uint16) error {
 	if p.channels > len(pattern) {
 		return fmt.Errorf("%w: JPEG XR highpass pattern component storage", ErrInvalid)
 	}
@@ -1326,6 +1377,15 @@ func (c *jxrCBP) readComponents(b *jxrBits, p *jxrPlane, values []uint16) {
 		b.err = fmt.Errorf("%w: JPEG XR CBP coding state", ErrInvalid)
 		return
 	}
+	c.readChecked(b, p, values)
+}
+
+// readChecked 在平面、存储与编码表状态已校验前提下读取高通块标志残差
+// 入参: b 码流读取器, p 已校验图像平面, values 逐分量块标志残差缓冲
+func (c *jxrCBP) readChecked(b *jxrBits, p *jxrPlane, values []uint16) {
+	if b.err != nil {
+		return
+	}
 	clear(values[:p.channels])
 	components := 1
 	if p.color == 4 || p.color == 6 {
@@ -1405,6 +1465,13 @@ func (c *jxrCBP) predictComponents(p *jxrPlane, residual, left, top []uint16, fi
 	if err := c.checkPrediction(p, residual, left, top, values); err != nil {
 		return err
 	}
+	c.predictChecked(p, residual, left, top, firstColumn, firstRow, values)
+	return nil
+}
+
+// predictChecked 在平面、相邻缓冲与预测状态已校验前提下重建高通块标志并更新模型
+// 入参: p 已校验图像平面, residual 残差, left, top 相邻标志, firstColumn, firstRow 分块边缘, values 输出切片
+func (c *jxrCBP) predictChecked(p *jxrPlane, residual, left, top []uint16, firstColumn, firstRow bool, values []uint16) {
 	for i := range p.channels {
 		group, count, leftBit, topBit := 0, 16, uint(5), uint(10)
 		if i != 0 {
@@ -1449,7 +1516,6 @@ func (c *jxrCBP) predictComponents(p *jxrPlane, residual, left, top []uint16, fi
 		values[i] = value
 		c.update(group, value, count)
 	}
-	return nil
 }
 
 // checkPrediction 在块标志预测前检查全部存储及模型，不将扩展分量误判为固定数组容量错误
@@ -1543,13 +1609,22 @@ func (c *jxrCBP) writeComponents(b *jxrBitWriter, p *jxrPlane, values []uint16) 
 		b.err = fmt.Errorf("%w: JPEG XR output CBP coding state", ErrInvalid)
 		return
 	}
+	c.writeChecked(b, p, values)
+}
+
+// writeChecked 在平面、残差与编码表状态已校验前提下写入高通块标志残差
+// 入参: b 位写入器, p 已校验平面格式, values 已校验逐分量块标志残差
+func (c *jxrCBP) writeChecked(b *jxrBitWriter, p *jxrPlane, values []uint16) {
+	if b.err != nil {
+		return
+	}
 	components := 1
 	if p.color == 4 || p.color == 6 {
 		components = p.channels
 	}
 	combined := p.color >= 1 && p.color <= 3
 	for n := range components {
-		if n&63 == 0 {
+		if !b.noCancel && n&63 == 0 {
 			if err := b.ctx.Err(); err != nil {
 				b.err = err
 				return
@@ -1656,6 +1731,13 @@ func (c *jxrCBP) residualComponents(p *jxrPlane, values, left, top []uint16, fir
 	if err := c.checkPrediction(p, values, left, top, residual); err != nil {
 		return err
 	}
+	c.residualChecked(p, values, left, top, firstColumn, firstRow, residual)
+	return nil
+}
+
+// residualChecked 在平面、相邻缓冲与预测状态已校验前提下计算高通块标志残差并更新模型
+// 入参: p 已校验平面格式, values 原始标志, left, top 相邻标志, firstColumn, firstRow 分块边缘, residual 输出切片
+func (c *jxrCBP) residualChecked(p *jxrPlane, values, left, top []uint16, firstColumn, firstRow bool, residual []uint16) {
 	for n := range p.channels {
 		group, count, leftBit, topBit := 0, 16, uint(5), uint(10)
 		if n != 0 {
@@ -1700,7 +1782,6 @@ func (c *jxrCBP) residualComponents(p *jxrPlane, values, left, top []uint16, fir
 		c.update(group, values[n], count)
 		residual[n] = value
 	}
-	return nil
 }
 
 // checkJXRBlockPattern 校验高通块标志的分量容量及抽样布局，不接受保留块位
@@ -2061,6 +2142,15 @@ func writeJXRHighFlex(b *jxrBitWriter, p *jxrPlane, bits [2]uint8, trim uint8, v
 	}
 	if len(values) < p.channels*256 || bits[0] > 15 || bits[1] > 15 || trim > 15 {
 		b.err = fmt.Errorf("%w: JPEG XR output flex coefficient layout", ErrInvalid)
+		return
+	}
+	writeJXRHighFlexChecked(b, p, bits, trim, values, exact)
+}
+
+// writeJXRHighFlexChecked 在平面与系数缓冲静态布局已校验前提下写入宏块精细位，保留全部字长与精度检查
+// 入参: b 位写入器, p 已校验平面格式, bits 当前宏块的双组细化位数, trim 包截断量, values 完整高通残差, exact 是否要求精确恢复
+func writeJXRHighFlexChecked(b *jxrBitWriter, p *jxrPlane, bits [2]uint8, trim uint8, values []int64, exact bool) {
+	if b.err != nil {
 		return
 	}
 	for n := range p.channels {

@@ -206,21 +206,29 @@ func readJXRDirectoryAt(data []byte, offset uint64) (jxrDirectory, error) {
 	if count == 0 || count*12+6 > uint64(len(data))-offset {
 		return jxrDirectory{}, fmt.Errorf("%w: JPEG XR directory size", ErrInvalid)
 	}
-	d := jxrDirectory{data: data, order: binary.LittleEndian, entries: data[offset+2 : offset+2+count*12]}
-	previous := -1
-	for i := range count {
-		entry := data[offset+2+i*12 : offset+2+(i+1)*12]
-		tag := d.order.Uint16(entry)
-		if int(tag) <= previous {
-			return jxrDirectory{}, fmt.Errorf("%w: JPEG XR directory tag order", ErrInvalid)
-		}
-		previous = int(tag)
-	}
-	d.next = d.order.Uint32(data[offset+2+count*12:])
-	if d.next&1 != 0 {
-		return jxrDirectory{}, fmt.Errorf("%w: JPEG XR next directory alignment", ErrInvalid)
+	d := jxrDirectory{data: data, order: binary.LittleEndian, entries: data[offset+2 : offset+2+count*12], next: binary.LittleEndian.Uint32(data[offset+2+count*12:])}
+	if err := validateJXRDirectoryEntries(d.entries, d.next); err != nil {
+		return jxrDirectory{}, err
 	}
 	return d, nil
+}
+
+// validateJXRDirectoryEntries 校验目录项标签严格递增顺序及后续目录偶数对齐
+// 入参: entries 十二字节步长的目录项字节切片, next 下一目录偏移
+// 返回: error 标签顺序或对齐错误
+func validateJXRDirectoryEntries(entries []byte, next uint32) error {
+	previous := -1
+	for at := 0; at < len(entries); at += 12 {
+		tag := int(binary.LittleEndian.Uint16(entries[at:]))
+		if tag <= previous {
+			return fmt.Errorf("%w: JPEG XR directory tag order", ErrInvalid)
+		}
+		previous = tag
+	}
+	if next&1 != 0 {
+		return fmt.Errorf("%w: JPEG XR next directory alignment", ErrInvalid)
+	}
+	return nil
 }
 
 // jxrField 按标签允许的类型及数量取得数据，未知组合按JPEG XR要求忽略
@@ -1069,21 +1077,17 @@ func jxrValidDateTime(value string) bool {
 	return month >= 1 && month <= 12 && day >= 1 && day <= 31 && hour <= 23 && minute <= 59 && second <= 59
 }
 
-// jxrReadDescription 解析ITU-T T.832 Annex A.5定义的图像描述标签，缺省全部标签时返回nil
+// jxrReadDescription 解析ITU-T T.832 Annex A.5定义的图像描述标签，全部描述标签缺省或均为空时返回nil
 // 入参: d 已校验目录, parser 共享解析预算
-// 返回: *ImageDescription 图像描述副本，无任何描述标签时为nil, error 编码、格式或资源错误
+// 返回: *ImageDescription 图像描述副本，全部描述标签缺省或均为空时为nil, error 编码、格式或资源错误
 func jxrReadDescription(d *jxrDirectory, parser *jxrParser) (*ImageDescription, error) {
 	var desc ImageDescription
-	present := false
 	readText := func(tag uint16, target *string) error {
-		text, ok, err := jxrReadUTF8Field(d, parser, tag)
+		text, err := jxrReadUTF8Field(d, parser, tag)
 		if err != nil {
 			return err
 		}
-		if ok {
-			*target = text
-			present = true
-		}
+		*target = text
 		return nil
 	}
 	for _, item := range []struct {
@@ -1113,7 +1117,6 @@ func jxrReadDescription(d *jxrDirectory, parser *jxrParser) (*ImageDescription, 
 				return nil, err
 			}
 			desc.DateTime = text
-			present = true
 		}
 	}
 	if raw, err := d.jxrField(0x0129, 2, 4, 3); err != nil {
@@ -1124,9 +1127,8 @@ func jxrReadDescription(d *jxrDirectory, parser *jxrParser) (*ImageDescription, 
 		}
 		page := [2]uint16{d.order.Uint16(raw[0:2]), d.order.Uint16(raw[2:4])}
 		desc.PageNumber = &page
-		present = true
 	}
-	if !present {
+	if jxrDescriptionEmpty(&desc) {
 		return nil, nil
 	}
 	if err := parser.reserve(256); err != nil {
@@ -1137,26 +1139,26 @@ func jxrReadDescription(d *jxrDirectory, parser *jxrParser) (*ImageDescription, 
 
 // jxrReadUTF8Field 读取并校验单个NUL终止的UTF-8描述标签
 // 入参: d 已校验目录, parser 共享解析预算, tag 字段标签
-// 返回: string 去掉末尾NUL的文本, bool 目录中是否包含该标签, error 编码、终止符或资源错误
-func jxrReadUTF8Field(d *jxrDirectory, parser *jxrParser, tag uint16) (string, bool, error) {
+// 返回: string 去掉末尾NUL的文本，缺省时为空字符串, error 编码、终止符或资源错误
+func jxrReadUTF8Field(d *jxrDirectory, parser *jxrParser, tag uint16) (string, error) {
 	raw, err := d.jxrField(tag, 0, math.MaxUint32, 2)
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
 	if raw == nil {
-		return "", false, nil
+		return "", nil
 	}
 	if len(raw) == 0 || raw[len(raw)-1] != 0 {
-		return "", false, fmt.Errorf("%w: JPEG XR UTF-8 field %x termination", ErrInvalid, tag)
+		return "", fmt.Errorf("%w: JPEG XR UTF-8 field %x termination", ErrInvalid, tag)
 	}
 	body := raw[:len(raw)-1]
 	if !utf8.Valid(body) || bytes.Contains(body, []byte{0, 0}) || len(body) > 0 && body[len(body)-1] == 0 {
-		return "", false, fmt.Errorf("%w: JPEG XR UTF-8 field %x encoding", ErrInvalid, tag)
+		return "", fmt.Errorf("%w: JPEG XR UTF-8 field %x encoding", ErrInvalid, tag)
 	}
 	if err := parser.reserve(uint64(len(body))); err != nil {
-		return "", false, err
+		return "", err
 	}
-	return string(body), true, nil
+	return string(body), nil
 }
 
 // checkJXRDescription 校验待写入容器的Annex A.5描述结构体中全部文本与日期时间字段
@@ -1960,16 +1962,8 @@ func (parser *jxrParser) directoryAt(input *jxrReaderAt, offset uint64) (jxrDire
 		return jxrDirectory{}, fmt.Errorf("%w: JPEG XR unstable directory input", ErrInvalid)
 	}
 	directory := jxrDirectory{order: binary.LittleEndian, entries: data[2 : 2+count*12], next: binary.LittleEndian.Uint32(data[2+count*12:]), input: input, parser: parser}
-	previous := -1
-	for index := range count {
-		tag := int(binary.LittleEndian.Uint16(directory.entries[index*12:]))
-		if tag <= previous {
-			return jxrDirectory{}, fmt.Errorf("%w: JPEG XR directory tag order", ErrInvalid)
-		}
-		previous = tag
-	}
-	if directory.next&1 != 0 {
-		return jxrDirectory{}, fmt.Errorf("%w: JPEG XR next directory alignment", ErrInvalid)
+	if err := validateJXRDirectoryEntries(directory.entries, directory.next); err != nil {
+		return jxrDirectory{}, err
 	}
 	return directory, nil
 }
@@ -2269,9 +2263,6 @@ func (parser *jxrParser) profiles(b *jxrBits, end uint64) ([]jxrProfileLevel, er
 		}
 		profiles[index] = jxrProfileLevel{uint8(profile), uint8(level), uint16(reserved)}
 		keys[index] = profile<<23 | level<<15 | reserved
-	}
-	if err := parser.check(); err != nil {
-		return nil, err
 	}
 	slices.Sort(keys)
 	for index := 1; index < len(keys); index++ {

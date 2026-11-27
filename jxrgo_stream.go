@@ -642,6 +642,12 @@ func writeJXRHeader(b *jxrBitWriter, h *jxrHeader, maxPixels uint64) {
 		b.err = fmt.Errorf("%w: JPEG XR output header alignment", ErrInvalid)
 		return
 	}
+	writeJXRHeaderChecked(b, h)
+}
+
+// writeJXRHeaderChecked 在图像头已校验且写入器字节对齐前提下直接写入图像头比特
+// 入参: b 字节对齐位写入器, h 已校验图像头
+func writeJXRHeaderChecked(b *jxrBitWriter, h *jxrHeader) {
 	for _, value := range []byte("WMPHOTO\x00") {
 		b.write(uint32(value), 8)
 	}
@@ -755,12 +761,32 @@ func writeJXRStreamHeader(b *jxrBitWriter, s *jxrStream, maxPixels uint64, wideI
 		b.err = err
 		return 0
 	}
+	return writeJXRStreamHeaderChecked(b, s, wideIndex)
+}
+
+// writeJXRStreamHeaderChecked 在调用方已校验完整码流头的前提下直接序列化码流头、包索引与档次级别声明
+// 入参: b 位写入器, s 已校验完整头部及相对包偏移, wideIndex 是否采用固定六十四位索引表示
+// 返回: uint64 首个索引字节的位置，无索引或失败时为零
+func writeJXRStreamHeaderChecked(b *jxrBitWriter, s *jxrStream, wideIndex bool) uint64 {
+	if b.err != nil {
+		return 0
+	}
+	if !b.noCancel {
+		if err := b.ctx.Err(); err != nil {
+			b.err = err
+			return 0
+		}
+	}
 	indexAt := uint64(0)
 	h := &s.header
-	writeJXRHeader(b, h, maxPixels)
-	writeJXRPlane(b, h, &s.primary, false)
+	if b.bit%8 != 0 {
+		b.err = fmt.Errorf("%w: JPEG XR output header alignment", ErrInvalid)
+		return 0
+	}
+	writeJXRHeaderChecked(b, h)
+	writeJXRPlaneChecked(b, h, &s.primary)
 	if s.alpha != nil {
-		writeJXRPlane(b, h, s.alpha, true)
+		writeJXRPlaneChecked(b, h, s.alpha)
 	}
 	if h.index {
 		b.write(1, 16)
@@ -1113,6 +1139,12 @@ func writeJXRPlane(b *jxrBitWriter, h *jxrHeader, p *jxrPlane, alpha bool) {
 		b.err = err
 		return
 	}
+	writeJXRPlaneChecked(b, h, p)
+}
+
+// writeJXRPlaneChecked 在平面头已校验前提下直接写入平面头比特
+// 入参: b 位写入器, h 已校验图像头, p 已校验平面参数
+func writeJXRPlaneChecked(b *jxrBitWriter, h *jxrHeader, p *jxrPlane) {
 	b.write(uint32(p.color), 3)
 	b.flag(p.scaled)
 	b.write(uint32(p.bands), 4)
@@ -1482,6 +1514,16 @@ func writeJXRPacket(b *jxrBitWriter, s *jxrStream, band int, q *[2]jxrTileQuant,
 			return
 		}
 	}
+	writeJXRPacketChecked(b, s, band, q, trim)
+}
+
+// writeJXRPacketChecked 在已校验码流与分块量化前提下写入单个分块包头，跳过重复结构校验
+// 入参: b 位写入器, s 已校验码流头, band 频带编号或-1表示空间布局, q 已校验分块量化参数, trim 精细位截断量
+func writeJXRPacketChecked(b *jxrBitWriter, s *jxrStream, band int, q *[2]jxrTileQuant, trim uint8) {
+	if b.err != nil {
+		return
+	}
+	planes := [2]*jxrPlane{&s.primary, s.alpha}
 	b.write(1, 24)
 	b.write(0, 8)
 	if s.header.trim && (band == -1 || band == 3) {

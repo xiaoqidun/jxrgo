@@ -42,17 +42,10 @@ func normalizeJXRWorkers(requested int) int {
 // 入参: requested 请求并发数，非正数取当前CPU核数, tasks 待执行任务数
 // 返回: int 最终并发工作数
 func resolveJXRWorkers(requested, tasks int) int {
-	if tasks <= 1 || requested == 1 {
+	if tasks <= 1 {
 		return 1
 	}
-	workers := requested
-	if workers <= 0 {
-		workers = runtime.GOMAXPROCS(0)
-	}
-	if workers < 1 {
-		return 1
-	}
-	return min(tasks, workers)
+	return min(tasks, normalizeJXRWorkers(requested))
 }
 
 // budgetJXRWorkers 根据可用内存预算与单个工作区开销收缩并发度，最小保底为一
@@ -70,16 +63,6 @@ func budgetJXRWorkers(workers int, available, perWorker uint64) int {
 		return int(allowed)
 	}
 	return workers
-}
-
-// jxrWorkerBudgetAllowance 安全合并额外可用预算与已计入基线的单份工作区预算，溢出时饱和
-// 入参: extraBudget 基线之外的可用字节数, perWorker 单份工作区字节数
-// 返回: uint64 供并发度预算计算的总可用字节数
-func jxrWorkerBudgetAllowance(extraBudget, perWorker uint64) uint64 {
-	if extraBudget > ^uint64(0)-perWorker {
-		return ^uint64(0)
-	}
-	return extraBudget + perWorker
 }
 
 // jxrMacroChunkPlan 计算宏块数组并行的有效并发数、每片宏块数与分片总数
@@ -104,9 +87,6 @@ func jxrMacroChunkPlan(total, minChunk, requested int) (int, int, int) {
 // 入参: ctx 已规范化Context, workers 最大并发数, tasks 任务总数, fn 单任务回调
 // 返回: error 首个真实错误或Context取消错误
 func runJXRWorkers(ctx context.Context, workers, tasks int, fn func(context.Context, int) error) error {
-	if tasks <= 0 {
-		return ctx.Err()
-	}
 	if workers <= 1 || tasks <= 1 {
 		for task := range tasks {
 			if err := ctx.Err(); err != nil {

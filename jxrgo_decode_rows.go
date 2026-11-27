@@ -341,7 +341,7 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 		coeffWork += alphaWork
 	}
 	slack := available - coeffWork
-	state, err := d.source.primary.coefficientsContext(ctx, c.image, jxrWorkerBudgetAllowance(slack, d.source.primary.coefficientWork()))
+	state, err := d.source.primary.coefficientsContext(ctx, c.image, jxrSaturatedAdd(slack, d.source.primary.coefficientWork()))
 	if err != nil {
 		return true, err
 	}
@@ -351,7 +351,7 @@ func (d *Decoder) decodeRowsFullParallel(ctx context.Context, target *Raster, pl
 	}
 	alphaHeader, alphaPlane := &state.header, state.alpha
 	if d.source.alpha != nil {
-		alphaState, err := d.source.alpha.coefficientsContext(ctx, c.alpha, jxrWorkerBudgetAllowance(slack, d.source.alpha.coefficientWork()))
+		alphaState, err := d.source.alpha.coefficientsContext(ctx, c.alpha, jxrSaturatedAdd(slack, d.source.alpha.coefficientWork()))
 		if err != nil {
 			return true, err
 		}
@@ -1185,9 +1185,6 @@ func walkJXRReconstructedRows(ctx context.Context, s *jxrStream, reader jxrCoeff
 			alpha = &alphaViews[0]
 		}
 		if err := emit(ctx, &row.header, views, alpha, macroY); err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}

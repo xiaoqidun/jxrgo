@@ -554,7 +554,7 @@ func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha fl
 				rgb[index] *= scale
 			}
 			srgb := jxrApplyColorMatrix(display.linearMatrix, rgb)
-			return displayLinear(jxrClampUnit(srgb[0])), displayLinear(jxrClampUnit(srgb[1])), displayLinear(jxrClampUnit(srgb[2]))
+			return displayLinear(colorClamp(srgb[0])), displayLinear(colorClamp(srgb[1])), displayLinear(colorClamp(srgb[2]))
 		}
 		if display.transfer == 16 && display.peakNits != 10000 {
 			scale := 10000 / display.peakNits
@@ -570,7 +570,7 @@ func (display *jxrCICPColorDisplay) color(info Info, samples []float64, alpha fl
 			}
 			directSRGB := jxrApplyColorMatrix(display.linearMatrix, directSrc)
 			for index, value := range directSRGB {
-				directSRGB[index] = jxrClampUnit(value)
+				directSRGB[index] = colorClamp(value)
 			}
 			bt2020 := rgb
 			if display.toBT2020 != nil {
@@ -918,25 +918,12 @@ func jxrHLGDisplayLight(rgb, weights [3]float64, peakNits float64) [3]float64 {
 	return rgb
 }
 
-// jxrClampUnit 将浮点数安全裁剪到单位闭区间并将NaN归一化为零
-// 入参: value 待裁剪数值
-// 返回: float64 单位闭区间数值
-func jxrClampUnit(value float64) float64 {
-	if !(value > 0) {
-		return 0
-	}
-	if value > 1 {
-		return 1
-	}
-	return value
-}
-
 // jxrBT2446MethodACore 执行纯ITU-R BT.2446方法A色调映射公式，输入为相对peakNits归一化的BT.2020线性显示RGB
 // 入参: rgb 相对peakNits归一化的BT.2020线性显示RGB, peakNits 高于100的HDR标称峰值亮度
 // 返回: [3]float64 BT.2020线性SDR显示RGB
 func jxrBT2446MethodACore(rgb [3]float64, peakNits float64) [3]float64 {
 	for index, value := range rgb {
-		clamped := jxrClampUnit(value)
+		clamped := colorClamp(value)
 		if clamped == 0 || clamped == 1 {
 			rgb[index] = clamped
 		} else {

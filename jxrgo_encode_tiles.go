@@ -46,6 +46,27 @@ type jxrHardTileInput struct {
 // 回调自身存储和I/O由调用方约束不计入工作预算，返回错误将原样向上传递
 type RasterRowReader func(ctx context.Context, y int, target *Raster) error
 
+// jxrHardTileStreamPlan 保存逐块或推式行流编码共用的最大单块模板、分块频带数及已校验工作预算
+type jxrHardTileStreamPlan struct {
+	tiles    int
+	bands    int
+	largest  jxrHardTileInput
+	template jxrStream
+	tileMax  uint64
+	retained uint64
+}
+
+// jxrUncompressedPrefix 保存已构建的无压缩容器目录前缀、主区与透明区偏移及尺寸布局
+type jxrUncompressedPrefix struct {
+	layout     jxrUncompressedLayout
+	transform  uint8
+	header     []byte
+	mainLocal  uint64
+	alphaLocal uint64
+	totalLocal uint64
+	padMain    bool
+}
+
 // jxrRowInput 保存单遍行源的环形样本缓存，描述和行视图不保留完整原图
 type jxrRowInput struct {
 	info    Info
@@ -162,28 +183,91 @@ func copyJXRHardTile(ctx context.Context, raster *Raster, plan jxrHardTileInput,
 		if err != nil {
 			return nil, err
 		}
-		for y := range component.Bounds.Dy() {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			for x := range component.Bounds.Dx() {
-				if x&1023 == 0 {
-					if err := ctx.Err(); err != nil {
-						return nil, err
-					}
-				}
-				bits, err := original.sampleBitsAt(plan.region.Min.X/int(component.XStep)+x, plan.region.Min.Y/int(component.YStep)+y)
-				if err != nil {
-					return nil, err
-				}
-				local.planes[index].storeBits(y*component.Bounds.Dx()+x, bits)
-			}
+		srcX0 := original.info.Bounds.Min.X + plan.region.Min.X/int(component.XStep)
+		srcY0 := original.info.Bounds.Min.Y + plan.region.Min.Y/int(component.YStep)
+		if err := copyJXRComponentRect(ctx, &local.planes[index], original, srcX0, srcY0, component.Bounds.Dx(), component.Bounds.Dy()); err != nil {
+			return nil, err
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 	return local, nil
+}
+
+// copyJXRComponentRect 将源分量视图中的矩形区域直接从底层切片拷贝至目标独立平面
+// 入参: ctx 已规范化Context, dst 目标独立平面, src 源分量视图, srcX0, srcY0 源坐标起点, width, height 拷贝尺寸
+// 返回: error 坐标、存储或取消错误
+func copyJXRComponentRect(ctx context.Context, dst *imageComponents, src Component, srcX0, srcY0, width, height int) error {
+	if src.source == nil {
+		return fmt.Errorf("%w: uninitialized component view", ErrInvalid)
+	}
+	bounds := src.source.bounds
+	if srcX0 < bounds.Min.X || srcY0 < bounds.Min.Y || srcX0+width > bounds.Max.X || srcY0+height > bounds.Max.Y {
+		return fmt.Errorf("%w: component copy out of range", ErrInvalid)
+	}
+	stride := src.source.channels
+	if src.source.alpha {
+		stride++
+	}
+	if stride <= 0 || src.index < 0 || src.index >= stride {
+		return fmt.Errorf("%w: component channel out of range", ErrInvalid)
+	}
+	srcW := bounds.Dx()
+	offX, offY := srcX0-bounds.Min.X, srcY0-bounds.Min.Y
+	if src.source.words != nil {
+		srcWords, dstWords := src.source.words, dst.words
+		if stride == 1 {
+			for y := range height {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				from := (offY+y)*srcW + offX
+				copy(dstWords[y*width:(y+1)*width], srcWords[from:from+width])
+			}
+			return nil
+		}
+		for y := range height {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			from := ((offY+y)*srcW+offX)*stride + src.index
+			to := y * width
+			for x := range width {
+				if x&1023 == 1023 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
+				dstWords[to+x] = srcWords[from+x*stride]
+			}
+		}
+		return nil
+	}
+	srcVals, dstVals := src.source.values, dst.values
+	if stride == 1 {
+		for y := range height {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			from := (offY+y)*srcW + offX
+			copy(dstVals[y*width:(y+1)*width], srcVals[from:from+width])
+		}
+		return nil
+	}
+	for y := range height {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		from := ((offY+y)*srcW+offX)*stride + src.index
+		to := y * width
+		for x := range width {
+			if x&1023 == 1023 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			dstVals[to+x] = srcVals[from+x*stride]
+		}
+	}
+	return nil
 }
 
 // resizeJXRHardTile 共用局部原始分量的有界构造与容量复用，不读取任何原图样本
@@ -245,24 +329,24 @@ func resizeJXRHardTile(ctx context.Context, input Info, plan jxrHardTileInput, m
 	return local, nil
 }
 
-// encodeJXRHardTileSourceTo 共用完整原图与逐块提供器的局部变换，预检最大容量后每次只装载当前分块
-// 入参: ctx Context, w 可定位输出, info 完整原生元数据, source 完整编码头, options 除源元数据外的工作上限, load 当前分块装载器
-// 返回: error 预检、样本提供、变换、编码、取消或I/O错误
-func encodeJXRHardTileSourceTo(ctx context.Context, w io.WriteSeeker, info Info, source *jxrStream, options jxrStreamOutput, load func(jxrHardTileInput, uint64, *Raster) (*Raster, error)) error {
-	settingsWork, err := options.tileWork(ctx, options.maxMemory)
-	if err != nil {
-		return err
-	}
+// planJXRHardTileStream 预扫描全部分块并建立单块最大工作区模板与常驻头部预算，消除重复扣减
+// 入参: ctx Context, info 原生描述, source 完整编码头, maxMemory 可用内存预算
+// 返回: jxrHardTileStreamPlan 分块工作计划, error 布局、资源或取消错误
+func planJXRHardTileStream(ctx context.Context, info Info, source *jxrStream, maxMemory uint64) (jxrHardTileStreamPlan, error) {
 	tiles := (len(source.header.columns) - 1) * (len(source.header.rows) - 1)
+	bands := 1
+	if source.header.frequency {
+		bands = 4 - int(source.primary.bands)
+	}
 	var largest jxrHardTileInput
 	columns, rows := uint32(0), uint32(0)
 	for tile := range tiles {
 		if err := ctx.Err(); err != nil {
-			return err
+			return jxrHardTileStreamPlan{}, err
 		}
 		plan, err := planJXRHardTile(info, source, tile)
 		if err != nil {
-			return err
+			return jxrHardTileStreamPlan{}, err
 		}
 		if plan.rawWork > largest.rawWork {
 			largest = plan
@@ -274,49 +358,56 @@ func encodeJXRHardTileSourceTo(ctx context.Context, w io.WriteSeeker, info Info,
 	template.header.width, template.header.height = uint64(columns)*16, uint64(rows)*16
 	template.header.left, template.header.top, template.header.right, template.header.bottom = 0, 0, 0, 0
 	template.header.columns, template.header.rows = []uint32{0, columns}, []uint32{0, rows}
-	bands := 1
-	if source.header.frequency {
-		bands = 4 - int(source.primary.bands)
-	}
 	var templateOffsets [4]uint64
 	template.header.index, template.packets = source.header.frequency, templateOffsets[:bands]
 	estimate := jxrCoefficientImage{primary: jxrCoefficients{plane: template.primary}}
 	if template.alpha != nil {
 		estimate.alpha = &jxrCoefficients{plane: *template.alpha}
 	}
-	maximum := estimate.outputWork(&template)
-	for _, extra := range []uint64{largest.rawWork, settingsWork, jxrHardTileReserve} {
-		if maximum > options.maxMemory || extra > options.maxMemory-maximum {
-			return &LimitError{Resource: "local hard tile working memory", Limit: options.maxMemory, Required: jxrSaturatedAdd(maximum, extra)}
+	tileMax := estimate.outputWork(&template)
+	for _, extra := range []uint64{largest.rawWork, jxrHardTileReserve} {
+		if tileMax > maxMemory || extra > maxMemory-tileMax {
+			return jxrHardTileStreamPlan{}, &LimitError{Resource: "local hard tile working memory", Limit: maxMemory, Required: jxrSaturatedAdd(tileMax, extra)}
 		}
-		maximum += extra
+		tileMax += extra
 	}
-	retained := source.headerWork() + jxrHardTileReserve
-	if retained > options.maxMemory || maximum > options.maxMemory-retained {
-		return &LimitError{Resource: "retained hard tile header memory", Limit: options.maxMemory, Required: jxrSaturatedAdd(retained, maximum)}
+	retained := source.headerWork()
+	if retained > maxMemory || tileMax > maxMemory-retained {
+		return jxrHardTileStreamPlan{}, &LimitError{Resource: "retained hard tile header memory", Limit: maxMemory, Required: jxrSaturatedAdd(retained, tileMax)}
+	}
+	return jxrHardTileStreamPlan{tiles: tiles, bands: bands, largest: largest, template: template, tileMax: tileMax, retained: retained}, nil
+}
+
+// encodeJXRHardTileSourceTo 共用完整原图与逐块提供器的局部变换，预检最大容量后每次只装载当前分块
+// 入参: ctx Context, w 可定位输出, info 完整原生元数据, source 完整编码头, options 除源元数据外的工作上限, load 当前分块装载器
+// 返回: error 预检、样本提供、变换、编码、取消或I/O错误
+func encodeJXRHardTileSourceTo(ctx context.Context, w io.WriteSeeker, info Info, source *jxrStream, options jxrStreamOutput, load func(jxrHardTileInput, uint64, *Raster) (*Raster, error)) error {
+	streamPlan, err := planJXRHardTileStream(ctx, info, source, options.maxMemory)
+	if err != nil {
+		return err
 	}
 	var local *Raster
 	var planes [2]*jxrCoefficients
 	frame := *source
 	var horizontal, vertical [4]uint32
 	var offset [36]uint64
-	frame.header.columns, frame.header.rows, frame.packets = horizontal[:2:2], vertical[:2:2], offset[:bands:bands]
+	frame.header.columns, frame.header.rows, frame.packets = horizontal[:2:2], vertical[:2:2], offset[:streamPlan.bands:streamPlan.bands]
 	frame.header.index = source.header.frequency
-	return writeJXRPacketsTo(ctx, w, source, options, retained+maximum, func(tile int, output *jxrTileOutput) error {
+	return writeJXRPacketsTo(ctx, w, source, options, streamPlan.retained+streamPlan.tileMax, func(tile int, output *jxrTileOutput) error {
 		plan, err := planJXRHardTile(info, source, tile)
 		if err != nil {
 			return err
 		}
-		available := maximum - largest.rawWork
+		available := streamPlan.tileMax - streamPlan.largest.rawWork
 		if local == nil {
-			local, err = resizeJXRHardTile(ctx, info, largest, largest.rawWork, nil)
+			local, err = resizeJXRHardTile(ctx, info, streamPlan.largest, streamPlan.largest.rawWork, nil)
 			if err != nil {
 				return err
 			}
 			allocated := uint64(0)
-			for index, plane := range [2]*jxrPlane{&template.primary, template.alpha} {
+			for index, plane := range [2]*jxrPlane{&streamPlan.template.primary, streamPlan.template.alpha} {
 				if plane != nil {
-					planes[index], err = newJXRTransformPlane(ctx, &template.header, plane, available-allocated)
+					planes[index], err = newJXRTransformPlane(ctx, &streamPlan.template.header, plane, available-allocated)
 					if err != nil {
 						return err
 					}
@@ -324,11 +415,11 @@ func encodeJXRHardTileSourceTo(ctx context.Context, w io.WriteSeeker, info Info,
 				}
 			}
 		}
-		local, err = load(plan, largest.rawWork, local)
+		local, err = load(plan, streamPlan.largest.rawWork, local)
 		if err != nil {
 			return err
 		}
-		window, localTile := jxrBuildTileFrame(&frame, source.header.frequency, bands, &plan, &horizontal, &vertical, &offset)
+		window, localTile := jxrBuildTileFrame(&frame, source.header.frequency, streamPlan.bands, &plan, &horizontal, &vertical, &offset)
 		selected := options
 		if len(options.tiles) != 1 {
 			selected.tiles = options.tiles[tile : tile+1 : tile+1]
@@ -450,8 +541,11 @@ func jxrDefaultRowTileSize(input Info, format jxrPixelFormat, settings EncodeOpt
 	} else if settings.Subsampling == Subsampling422 {
 		internalColor = 2
 	}
-	if (internalColor == 1 || internalColor == 2) && settings.Overlap == OverlapTwo && mbW >= 2 && prefMBX < 2 {
+	if (internalColor == 1 || internalColor == 2) && settings.Overlap == OverlapTwo && prefMBX < 2 {
 		prefMBX = 2
+		if transform&4 != 0 && settings.HardTiles && mbW == 3 {
+			prefMBX = 3
+		}
 	}
 	tileMBX := max(prefMBX, (mbW+4095)/4096)
 	tileMBY := max(prefMBY, (mbH+4095)/4096)
@@ -574,13 +668,29 @@ func (source *jxrRowInput) load(ctx context.Context, region image.Rectangle, tar
 	return jxrProjectRingRegion(ctx, source.cache, target, region)
 }
 
-// jxrRingHeight 计算单遍流式行编码所需的有界环形行缓存高度，转置方向取TileSize.X并按软重叠追加邻域行
+// jxrRingHeight 计算单遍流式行编码所需的有界环形行缓存高度，转置方向按实际最大列块宽度对齐并按软重叠追加邻域行
 // 入参: info 已规范化原生描述, color 输出像素颜色编码, settings 已解析编码选项
 // 返回: int 环形缓存高度
 func jxrRingHeight(info Info, color uint8, settings EncodeOptions) int {
 	tileHeight := settings.TileSize.Y
 	if jxrInputTransform(info, color, uint8(settings.Orientation))&4 != 0 {
 		tileHeight = settings.TileSize.X
+		internalColor := color
+		if settings.Subsampling == Subsampling420 {
+			internalColor = 1
+		} else if settings.Subsampling == Subsampling422 {
+			internalColor = 2
+		}
+		if settings.HardTiles && settings.Overlap == OverlapTwo && (internalColor == 1 || internalColor == 2) && tileHeight == 32 {
+			codedW := uint64(info.Bounds.Dy())
+			if settings.Window != nil {
+				codedW += uint64(settings.Window.Left) + uint64(settings.Window.Right)
+			}
+			extent := (codedW + 15) / 16
+			if extent >= 3 && extent&1 != 0 {
+				tileHeight = 48
+			}
+		}
 	}
 	dispH := info.Bounds.Dy()
 	height := min(dispH, tileHeight)
@@ -777,73 +887,115 @@ func prepareJXRTileInfo(ctx context.Context, info Info, settings EncodeOptions) 
 	if uint64(info.Bounds.Dx()) > limits.MaxPixels/uint64(info.Bounds.Dy()) {
 		return Info{}, 0, &LimitError{Resource: "tiled source pixels", Limit: limits.MaxPixels, Required: jxrSaturatedMul(uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy()))}
 	}
-	retained := uint64(512) + uint64(count)*128
+	merged := info
 	if settings.Format == FormatJXR {
-		info = jxrWithContainerMetadata(info, &settings)
-		for _, blob := range [][]byte{info.ICCProfile, info.EXIF, info.GPS, info.XMP, info.IPTC} {
+		merged = jxrWithContainerMetadata(info, &settings)
+	}
+	retained, err := checkJXRTileMetadataBudget(merged, settings)
+	if err != nil {
+		return Info{}, 0, err
+	}
+	clean := jxrStripContainerMetadata(merged)
+	clean.Components = cloneComponentInfo(info.Components)
+	clean.ColorEncoding = cloneColorEncoding(merged.ColorEncoding)
+	if err := normalizeRasterInfo(&clean); err != nil {
+		return Info{}, 0, err
+	}
+	if err := checkJXRModelComponents(&jxrPlane{channels: clean.Channels}); err != nil {
+		return Info{}, 0, err
+	}
+	cloned, err := cloneJXRTileMetadata(ctx, clean, merged, settings)
+	if err != nil {
+		return Info{}, 0, err
+	}
+	return cloned, retained, nil
+}
+
+// attachJXRTileMetadata 为已规范化的行编码描述补充容器元数据预算校验、浮点参数检查与大字段深拷贝
+// 入参: ctx Context, clean 已规范化且不含大元数据的描述, origInfo 原始描述, settings 已校验编码选项
+// 返回: Info 独占描述快照, uint64 常驻元数据额度, error 预算、浮点参数或取消错误
+func attachJXRTileMetadata(ctx context.Context, clean, origInfo Info, settings EncodeOptions) (Info, uint64, error) {
+	merged := origInfo
+	if settings.Format == FormatJXR {
+		merged = jxrWithContainerMetadata(origInfo, &settings)
+	}
+	retained, err := checkJXRTileMetadataBudget(merged, settings)
+	if err != nil {
+		return Info{}, 0, err
+	}
+	cloned, err := cloneJXRTileMetadata(ctx, clean, merged, settings)
+	if err != nil {
+		return Info{}, 0, err
+	}
+	return cloned, retained, nil
+}
+
+// checkJXRTileMetadataBudget 校验容器大字段容量及逐块编码常驻元数据预算
+// 入参: merged 已合并覆盖字段的原生描述, settings 编码选项
+// 返回: uint64 常驻元数据额度, error 预算错误
+func checkJXRTileMetadataBudget(merged Info, settings EncodeOptions) (uint64, error) {
+	limits := settings.Limits.normalized()
+	retained := uint64(512) + uint64(len(merged.Components))*128
+	if settings.Format == FormatJXR {
+		for _, blob := range [][]byte{merged.ICCProfile, merged.EXIF, merged.GPS, merged.XMP, merged.IPTC} {
 			if uint64(len(blob)) > math.MaxUint32 {
-				return Info{}, 0, &LimitError{Resource: "tiled file metadata field capacity", Limit: math.MaxUint32, Required: uint64(len(blob))}
+				return 0, &LimitError{Resource: "tiled file metadata field capacity", Limit: math.MaxUint32, Required: uint64(len(blob))}
 			}
 			amount := uint64(cap(blob)) + uint64(len(blob))
 			if retained > limits.MaxMemoryBytes || amount > limits.MaxMemoryBytes-retained {
-				return Info{}, 0, &LimitError{Resource: "tiled file retained metadata memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, amount)}
+				return 0, &LimitError{Resource: "tiled file retained metadata memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, amount)}
 			}
 			retained += amount
 		}
-		if descWork := jxrDescriptionWork(info.Description); descWork != 0 {
+		if descWork := jxrDescriptionWork(merged.Description); descWork != 0 {
 			amount := descWork * 2
 			if retained > limits.MaxMemoryBytes || amount > limits.MaxMemoryBytes-retained {
-				return Info{}, 0, &LimitError{Resource: "tiled file retained description memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, amount)}
+				return 0, &LimitError{Resource: "tiled file retained description memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, amount)}
 			}
 			retained += amount
 		}
 	}
-	if info.ColorEncoding != nil {
+	if merged.ColorEncoding != nil {
 		retained += 4
 	}
 	if retained > limits.MaxMemoryBytes || jxrInputHeaderReserve > limits.MaxMemoryBytes-retained {
-		return Info{}, 0, &LimitError{Resource: "tiled source header memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, jxrInputHeaderReserve)}
+		return 0, &LimitError{Resource: "tiled source header memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, jxrInputHeaderReserve)}
 	}
-	info.Components = cloneComponentInfo(info.Components)
-	info.ColorEncoding = cloneColorEncoding(info.ColorEncoding)
-	if err := normalizeRasterInfo(&info); err != nil {
-		return Info{}, 0, err
-	}
-	if err := checkJXRModelComponents(&jxrPlane{channels: info.Channels}); err != nil {
-		return Info{}, 0, err
-	}
+	return retained, nil
+}
+
+// cloneJXRTileMetadata 校验逐块浮点参数并深拷贝容器大元数据字段到规范化描述快照
+// 入参: ctx Context, info 已规范化描述, merged 已合并大元数据的描述, settings 编码选项
+// 返回: Info 独占描述快照, error 浮点参数或取消错误
+func cloneJXRTileMetadata(ctx context.Context, info, merged Info, settings EncodeOptions) (Info, error) {
 	if !settings.Uncompressed {
 		if info.Components[0].Format == SampleFloat && info.Components[0].Precision == 32 && settings.Float == nil {
-			return Info{}, 0, fmt.Errorf("%w: tile input requires explicit float parameters", ErrUnsupported)
+			return Info{}, fmt.Errorf("%w: tile input requires explicit float parameters", ErrUnsupported)
 		}
 		if info.Alpha && settings.Alpha != nil && info.Components[info.Channels].Format == SampleFloat && info.Components[info.Channels].Precision == 32 && settings.Alpha.Float == nil {
-			return Info{}, 0, fmt.Errorf("%w: tile input requires explicit alpha float parameters", ErrUnsupported)
+			return Info{}, fmt.Errorf("%w: tile input requires explicit alpha float parameters", ErrUnsupported)
 		}
 	}
 	if settings.Format == FormatJXR {
+		info.ICCProfile, info.EXIF, info.GPS, info.XMP, info.IPTC = merged.ICCProfile, merged.EXIF, merged.GPS, merged.XMP, merged.IPTC
 		for _, target := range []*[]byte{&info.ICCProfile, &info.EXIF, &info.GPS, &info.XMP, &info.IPTC} {
 			if len(*target) == 0 {
 				*target = nil
 				continue
 			}
-			if err := ctx.Err(); err != nil {
-				return Info{}, 0, err
-			}
 			original := *target
 			copied := make([]byte, len(original))
 			for at := 0; at < len(original); at += 16384 {
 				if err := ctx.Err(); err != nil {
-					return Info{}, 0, err
+					return Info{}, err
 				}
 				copy(copied[at:min(at+16384, len(original))], original[at:min(at+16384, len(original))])
 			}
 			*target = copied
 		}
-		info.Description = cloneImageDescription(info.Description)
-	} else {
-		info.ICCProfile, info.EXIF, info.GPS, info.XMP, info.IPTC, info.Description = nil, nil, nil, nil, nil, nil
+		info.Description = cloneImageDescription(merged.Description)
 	}
-	return info, retained, nil
+	return info, nil
 }
 
 // encodeJXRProvidedTilesTo 共用文件与独立码流的逐块样本装载，局部缓冲每次清零且提供器只看到临时视图
@@ -880,35 +1032,33 @@ func encodeJXRRowsUncompressed(ctx context.Context, w io.WriteSeeker, info Info,
 	if info.ImageType&ImageTypePreview != 0 {
 		return fmt.Errorf("%w: JPEG XR preview requires corresponding image", ErrInvalid)
 	}
-	_, _, err := encodeJXRRowsUncompressedAt(ctx, w, info, read, settings, 8)
-	return err
-}
-
-// encodeJXRRowsUncompressedAt 在指定目录位置将顺序行带按0xBC03无压缩容器格式写出，支持单图与多图容器
-// 入参: ctx 已规范化Context, w 当前输出, info 原始图像描述, read 顺序行带读取回调, settings 已校验无压缩选项, start 目录起点
-// 返回: uint64 图像结束位置, uint64 当前目录链接位置, error 格式、样本、资源、源、取消或I/O错误
-func encodeJXRRowsUncompressedAt(ctx context.Context, w io.WriteSeeker, info Info, read RasterRowReader, settings EncodeOptions, start uint64) (uint64, uint64, error) {
-	if start < 8 || start&1 != 0 || start > math.MaxUint32 {
-		return 0, 0, fmt.Errorf("%w: uncompressed row directory position", ErrInvalid)
-	}
 	settings.Format = FormatJXR
 	info, retained, err := prepareJXRTileInfo(ctx, info, settings)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
+	_, _, err = encodeJXRRowsUncompressedPreparedAt(ctx, w, info, retained, read, settings, 8)
+	return err
+}
+
+// jxrStripContainerMetadata 返回清零容器元数据字段后的浅拷贝原生描述，供局部与行带内存计算复用
+// 入参: info 原生图像描述
+// 返回: Info 不含容器大元数据字段的浅拷贝描述
+func jxrStripContainerMetadata(info Info) Info {
+	info.ICCProfile, info.EXIF, info.GPS, info.XMP, info.IPTC, info.Description = nil, nil, nil, nil, nil, nil
+	return info
+}
+
+// prepareJXRUncompressedPrefix 构造并校验无压缩容器目录前缀、主区与可选独立透明区布局及输出字节预算
+// 入参: ctx 已规范化Context, info 已准备原生描述, settings 无压缩编码选项, maxBytes 允许最大输出字节, prefixMemory 前缀内存上限
+// 返回: jxrUncompressedPrefix 无压缩目录前缀与布局, error 格式、预算、取消或输出错误
+func prepareJXRUncompressedPrefix(ctx context.Context, info Info, settings EncodeOptions, maxBytes, prefixMemory uint64) (jxrUncompressedPrefix, error) {
 	if settings.SeparateAlpha && !info.Alpha {
-		return 0, 0, fmt.Errorf("%w: separate alpha without source alpha", ErrInvalid)
+		return jxrUncompressedPrefix{}, fmt.Errorf("%w: separate alpha without source alpha", ErrInvalid)
 	}
-	limits := settings.Limits.normalized()
-	maxBytes := settings.MaxOutputBytes
-	if maxBytes == 0 {
-		maxBytes = 64 << 20
-	}
-	delta := start - 8
-	maxBytes = min(maxBytes, uint64(math.MaxUint32)-delta)
 	identifier, format, err := jxrRasterIdentifier(info, [16]byte{})
 	if err != nil {
-		return 0, 0, err
+		return jxrUncompressedPrefix{}, err
 	}
 	transform := jxrInputTransform(info, format.color, uint8(settings.Orientation))
 	codedW, codedH := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
@@ -917,44 +1067,44 @@ func encodeJXRRowsUncompressedAt(ctx context.Context, w io.WriteSeeker, info Inf
 	}
 	layout, err := jxrMakeUncompressedLayout(identifier[15], format, codedW, codedH, settings.SeparateAlpha)
 	if err != nil {
-		return 0, 0, err
+		return jxrUncompressedPrefix{}, err
 	}
 	if format.name == "BlackWhite" && format.depth == 15 {
 		format.depth = 0
 	}
 	c := jxrContainer{width: codedW, height: codedH, format: format, pixelFormat: identifier, transform: uint32(transform), uncompressed: true}
 	c.setInfoMetadata(info)
-	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(ctx, &c, limits.MaxPixels, limits.MaxMemoryBytes-retained, settings.SeparateAlpha)
+	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(ctx, &c, settings.Limits.normalized().MaxPixels, prefixMemory, settings.SeparateAlpha)
 	if err != nil {
-		return 0, 0, err
+		return jxrUncompressedPrefix{}, err
 	}
-	b := newJXRBitWriter(ctx, maxBytes, limits.MaxMemoryBytes-retained)
+	b := newJXRBitWriter(ctx, maxBytes, prefixMemory)
 	if b.err != nil {
-		return 0, 0, b.err
+		return jxrUncompressedPrefix{}, b.err
 	}
 	var offsets jxrContainerOffsets
 	writeJXRContainerBytes(&b, &c, true, settings.SeparateAlpha, &offsets, exifNode, gpsNode)
 	if b.err != nil {
-		return 0, 0, b.err
+		return jxrUncompressedPrefix{}, b.err
 	}
 	header := b.data
 	mainLocal := uint64(len(header))
 	if layout.mainBytes > maxBytes-mainLocal {
-		return 0, 0, &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(mainLocal, layout.mainBytes), Detail: "uncompressed row output bytes"}
+		return jxrUncompressedPrefix{}, &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(mainLocal, layout.mainBytes), Detail: "uncompressed row output bytes"}
 	}
 	totalLocal := mainLocal + layout.mainBytes
 	alphaLocal, padMain := uint64(0), false
 	if settings.SeparateAlpha {
 		if totalLocal&1 != 0 {
 			if totalLocal >= maxBytes {
-				return 0, 0, &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(totalLocal, 1), Detail: "uncompressed row alpha alignment"}
+				return jxrUncompressedPrefix{}, &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(totalLocal, 1), Detail: "uncompressed row alpha alignment"}
 			}
 			totalLocal++
 			padMain = true
 		}
 		alphaLocal = totalLocal
 		if layout.alphaBytes > maxBytes-totalLocal {
-			return 0, 0, &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(totalLocal, layout.alphaBytes), Detail: "uncompressed row alpha output bytes"}
+			return jxrUncompressedPrefix{}, &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(totalLocal, layout.alphaBytes), Detail: "uncompressed row alpha output bytes"}
 		}
 		totalLocal += layout.alphaBytes
 	}
@@ -963,7 +1113,31 @@ func encodeJXRRowsUncompressedAt(ctx context.Context, w io.WriteSeeker, info Inf
 		binary.LittleEndian.PutUint32(header[offsets.alphaOffset:], uint32(alphaLocal))
 		binary.LittleEndian.PutUint32(header[offsets.alphaSize:], uint32(layout.alphaBytes))
 	}
-	link, err := relocateJXRImageDirectory(header, start)
+	return jxrUncompressedPrefix{layout: layout, transform: transform, header: header, mainLocal: mainLocal, alphaLocal: alphaLocal, totalLocal: totalLocal, padMain: padMain}, nil
+}
+
+// encodeJXRRowsUncompressedPreparedAt 复用已准备的图像描述与常驻额度，在指定目录位置写出无压缩顺序行带
+// 入参: ctx 已规范化Context, w 当前输出, info 已准备原生描述, retained 常驻元数据额度, read 顺序行带读取回调, settings 已校验无压缩选项, start 目录起点
+// 返回: uint64 图像结束位置, uint64 当前目录链接位置, error 格式、样本、资源、源、取消或I/O错误
+func encodeJXRRowsUncompressedPreparedAt(ctx context.Context, w io.WriteSeeker, info Info, retained uint64, read RasterRowReader, settings EncodeOptions, start uint64) (uint64, uint64, error) {
+	if start < 8 || start&1 != 0 || start > math.MaxUint32 {
+		return 0, 0, fmt.Errorf("%w: uncompressed row directory position", ErrInvalid)
+	}
+	limits := settings.Limits.normalized()
+	if retained >= limits.MaxMemoryBytes {
+		return 0, 0, &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(retained, 1), Detail: "uncompressed row retained metadata"}
+	}
+	maxBytes := settings.MaxOutputBytes
+	if maxBytes == 0 {
+		maxBytes = 64 << 20
+	}
+	delta := start - 8
+	maxBytes = min(maxBytes, uint64(math.MaxUint32)-delta)
+	prefix, err := prepareJXRUncompressedPrefix(ctx, info, settings, maxBytes, limits.MaxMemoryBytes-retained)
+	if err != nil {
+		return 0, 0, err
+	}
+	link, err := relocateJXRImageDirectory(prefix.header, start)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -978,31 +1152,29 @@ func encodeJXRRowsUncompressedAt(ctx context.Context, w io.WriteSeeker, info Inf
 	if position != wanted {
 		return 0, 0, fmt.Errorf("%w: uncompressed row output position", ErrInvalid)
 	}
-	writeHeader := header
+	writeHeader := prefix.header
 	if start != 8 {
-		writeHeader = header[8:]
+		writeHeader = prefix.header[8:]
 	}
 	step := 1
 	for _, component := range info.Components {
 		step = max(step, int(component.YStep))
 	}
-	cleanInfo := info
-	cleanInfo.ICCProfile, cleanInfo.EXIF, cleanInfo.GPS, cleanInfo.XMP, cleanInfo.IPTC, cleanInfo.Description = nil, nil, nil, nil, nil, nil
-	rowInfo, rowRasterWork, err := jxrRegionInfo(cleanInfo, image.Rect(0, 0, info.Bounds.Dx(), step))
+	rowInfo, rowRasterWork, err := jxrRegionInfo(jxrStripContainerMetadata(info), image.Rect(0, 0, info.Bounds.Dx(), step))
 	if err != nil {
 		return 0, 0, err
 	}
-	baseHeld := retained + uint64(cap(header))
-	mainStart := delta + mainLocal
-	alphaStart := delta + alphaLocal
-	total := delta + totalLocal
-	if transform&4 != 0 {
-		if err := writeJXRUncompressedRowTransposed(ctx, w, info, rowInfo, read, &layout, writeHeader, transform, step, padMain, baseHeld, rowRasterWork, limits); err != nil {
+	baseHeld := retained + uint64(cap(prefix.header))
+	mainStart := delta + prefix.mainLocal
+	alphaStart := delta + prefix.alphaLocal
+	total := delta + prefix.totalLocal
+	if prefix.transform&4 != 0 {
+		if err := writeJXRUncompressedRowTransposed(ctx, w, info, rowInfo, read, &prefix.layout, writeHeader, prefix.transform, step, prefix.padMain, baseHeld, rowRasterWork, limits); err != nil {
 			return 0, 0, err
 		}
 		return total, link, nil
 	}
-	if err := writeJXRUncompressedRowStream(ctx, w, info, rowInfo, read, &layout, writeHeader, transform, step, mainStart, alphaStart, total, baseHeld, rowRasterWork, limits); err != nil {
+	if err := writeJXRUncompressedRowStream(ctx, w, info, rowInfo, read, &prefix.layout, writeHeader, prefix.transform, step, mainStart, alphaStart, total, baseHeld, rowRasterWork, limits); err != nil {
 		return 0, 0, err
 	}
 	return total, link, nil

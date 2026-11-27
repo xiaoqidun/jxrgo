@@ -780,17 +780,7 @@ func writeJXRFileImageTo(ctx context.Context, w io.WriteSeeker, raster *Raster, 
 	if err != nil {
 		return 0, 0, err
 	}
-	if end > maximum {
-		return 0, 0, &LimitError{Resource: "incremental image file output capacity", Limit: maximum, Required: end}
-	}
-	padding := !last && end&1 != 0
-	if padding {
-		if end == maximum {
-			return 0, 0, &LimitError{Resource: "incremental image file alignment capacity", Limit: maximum, Required: jxrSaturatedAdd(end, 1)}
-		}
-		end++
-	}
-	return finishJXRImageOutput(ctx, w, start, end, previous, link, padding)
+	return finishJXRImageOutput(ctx, w, start, end, previous, link, maximum, last, "incremental image file")
 }
 
 // relocateJXRImageDirectory 共用完整图像及仅目录前缀的地址重定位，不读取或推测压缩包
@@ -842,14 +832,21 @@ func relocateJXRImageDirectory(data []byte, start uint64) (uint64, error) {
 	return link, nil
 }
 
-// finishJXRImageOutput 完成当前图像偶数填充并最后提交前一目录链接，不在未完成图像上提前建立链接
-// 入参: ctx Context, w 可定位输出, start 当前目录, end 已计入填充的结束位置, previous 前一链接位置, link 当前链接位置, padding 是否待写一个零字节
-// 返回: uint64 文件结束位置, uint64 当前链接位置, error 取消、定位或写入错误
-func finishJXRImageOutput(ctx context.Context, w io.WriteSeeker, start, end, previous, link uint64, padding bool) (uint64, uint64, error) {
-	if padding {
+// finishJXRImageOutput 校验当前图像字节上限、执行偶数边界填充并最后提交前一目录链接，不在未完成图像上提前建立链接
+// 入参: ctx Context, w 可定位输出, start 当前目录, end 当前图像结束位置, previous 前一链接位置, link 当前链接位置, maximum 全文件上限, last 是否末图, scope 错误资源前缀
+// 返回: uint64 文件结束位置, uint64 当前链接位置, error 容量、取消、定位或写入错误
+func finishJXRImageOutput(ctx context.Context, w io.WriteSeeker, start, end, previous, link, maximum uint64, last bool, scope string) (uint64, uint64, error) {
+	if end > maximum {
+		return 0, 0, &LimitError{Resource: scope + " output capacity", Limit: maximum, Required: end}
+	}
+	if !last && end&1 != 0 {
+		if end == maximum {
+			return 0, 0, &LimitError{Resource: scope + " alignment capacity", Limit: maximum, Required: jxrSaturatedAdd(end, 1)}
+		}
 		if err := writeEncoderOutput(ctx, w, []byte{0}); err != nil {
 			return 0, 0, err
 		}
+		end++
 	}
 	if previous != 0 {
 		if err := seekJXRImageOutput(ctx, w, previous); err != nil {
@@ -1035,6 +1032,9 @@ func planJXRTileImageFile(ctx context.Context, images []ImageInput, limits Limit
 		if err != nil {
 			return nil, 0, err
 		}
+		if options.SeparateAlpha && !info.Alpha {
+			return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
+		}
 		clearJXRMergedMetadata(&options)
 		if work > limits.MaxMemoryBytes-state-retained-reserved {
 			return nil, 0, &LimitError{Resource: "tiled image descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, jxrSaturatedAdd(reserved, work)))}
@@ -1210,17 +1210,7 @@ func writeJXRTileFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTil
 	if err != nil {
 		return 0, 0, err
 	}
-	if end > maximum {
-		return 0, 0, &LimitError{Resource: "tiled image file output capacity", Limit: maximum, Required: end}
-	}
-	padding := !last && end&1 != 0
-	if padding {
-		if end == maximum {
-			return 0, 0, &LimitError{Resource: "tiled image file alignment capacity", Limit: maximum, Required: jxrSaturatedAdd(end, 1)}
-		}
-		end++
-	}
-	return finishJXRImageOutput(ctx, w, start, end, previous, link, padding)
+	return finishJXRImageOutput(ctx, w, start, end, previous, link, maximum, last, "tiled image file")
 }
 
 // encodeJXRImagesRows 逐图流式编码单遍行源与可选整图组合的多图JXR容器，每图写完后才链接前一目录
@@ -1317,6 +1307,9 @@ func planJXRRowImageFile(ctx context.Context, images []ImageInput, limits Limits
 		if err != nil {
 			return nil, 0, err
 		}
+		if options.SeparateAlpha && !info.Alpha {
+			return nil, 0, fmt.Errorf("%w: JPEG XR separate alpha without source alpha", ErrInvalid)
+		}
 		clearJXRMergedMetadata(&options)
 		if work > limits.MaxMemoryBytes-state-retained {
 			return nil, 0, &LimitError{Resource: "row image file descriptions memory", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(state, jxrSaturatedAdd(retained, work))}
@@ -1374,11 +1367,13 @@ func writeJXRRowFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTile
 	var end, link uint64
 	var err error
 	if options.Uncompressed {
-		end, link, err = encodeJXRRowsUncompressedAt(ctx, w, plan.info, plan.rows, options, start)
+		end, link, err = encodeJXRRowsUncompressedPreparedAt(ctx, w, plan.info, plan.retained, plan.rows, options, start)
 	} else {
 		limits := options.Limits.normalized()
-		input := plan.info
-		input.ICCProfile, input.EXIF, input.GPS, input.XMP, input.IPTC, input.Description = nil, nil, nil, nil, nil, nil
+		if plan.retained >= limits.MaxMemoryBytes {
+			return 0, 0, &LimitError{Resource: "row image file retained metadata", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(plan.retained, 1)}
+		}
+		input := jxrStripContainerMetadata(plan.info)
 		formatInfo, fmtErr := rasterPixelFormat(input)
 		if fmtErr != nil {
 			return 0, 0, fmtErr
@@ -1386,7 +1381,7 @@ func writeJXRRowFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTile
 		var alpha jxrAlphaRowStorage
 		if options.SeparateAlpha {
 			var held uint64
-			alpha, held, err = makeJXRAlphaRowStorage(input, options.Scratch, limits.MaxMemoryBytes)
+			alpha, held, err = makeJXRAlphaRowStorage(input, options.Scratch, limits.MaxMemoryBytes-plan.retained)
 			if err != nil {
 				return 0, 0, err
 			}
@@ -1397,8 +1392,8 @@ func writeJXRRowFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTile
 		if ringErr != nil {
 			return 0, 0, ringErr
 		}
-		if ringWork >= limits.MaxMemoryBytes {
-			return 0, 0, &LimitError{Resource: "row ring storage", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(ringWork, 1)}
+		if ringWork >= limits.MaxMemoryBytes-plan.retained {
+			return 0, 0, &LimitError{Resource: "row ring storage", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(plan.retained, jxrSaturatedAdd(ringWork, 1))}
 		}
 		limits.MaxMemoryBytes -= ringWork
 		options.Limits = limits
@@ -1408,7 +1403,7 @@ func writeJXRRowFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTile
 		}
 		source := jxrRowInput{info: cacheInfo, read: plan.rows, height: input.Bounds.Dy(), step: step, maxWork: ringWork}
 		if options.SeparateAlpha {
-			end, link, err = encodeJXRSeparateRowsAt(ctx, w, plan.info, &source, &alpha, options, start)
+			end, link, err = encodeJXRSeparateRowsPreparedAt(ctx, w, plan.info, plan.retained, &source, &alpha, options, start)
 		} else {
 			metadata := Raster{info: plan.info}
 			streamLayout, output, planErr := makeJXREncodingPlanRetained(ctx, &metadata, &options, plan.retained)
@@ -1425,15 +1420,5 @@ func writeJXRRowFileImageTo(ctx context.Context, w io.WriteSeeker, plan *jxrTile
 	if err != nil {
 		return 0, 0, err
 	}
-	if end > maximum {
-		return 0, 0, &LimitError{Resource: "row image file output capacity", Limit: maximum, Required: end}
-	}
-	padding := !last && end&1 != 0
-	if padding {
-		if end == maximum {
-			return 0, 0, &LimitError{Resource: "row image file alignment capacity", Limit: maximum, Required: jxrSaturatedAdd(end, 1)}
-		}
-		end++
-	}
-	return finishJXRImageOutput(ctx, w, start, end, previous, link, padding)
+	return finishJXRImageOutput(ctx, w, start, end, previous, link, maximum, last, "row image file")
 }

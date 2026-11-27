@@ -16,7 +16,6 @@ package jxrgo
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"image"
 	"io"
@@ -34,6 +33,7 @@ type jxrMemWriteSeeker struct {
 	pos       int64
 	maxBytes  uint64
 	maxMemory uint64
+	budget    *jxrWriteBudget
 }
 
 // jxrOffsetReadWriteSeeker 将外部暂存的偏移子区间映射为零起点独立io.ReadWriteSeeker，支持单暂存分区复用
@@ -53,7 +53,6 @@ type RowEncoder struct {
 	stageReader  io.ReadSeeker
 	memStage     *jxrMemWriteSeeker
 	info         Info
-	cleanInfo    Info
 	file         bool
 	separate     bool
 	uncompressed bool
@@ -262,7 +261,21 @@ func (e *RowEncoder) closeWithOp(ctx context.Context, op string) error {
 	return nil
 }
 
-// Write 将字节写入有界内存暂存并检查Context、输出上限与内存上限
+// availableLimit 计算内存暂存当前允许达到的最大总容量，结合共享写缓冲预算防止超额
+// 返回: uint64 当前允许的最大总字节容量
+func (m *jxrMemWriteSeeker) availableLimit() uint64 {
+	limit := m.maxMemory
+	if m.budget != nil {
+		free := uint64(0)
+		if m.budget.limit > m.budget.used {
+			free = m.budget.limit - m.budget.used
+		}
+		limit = min(limit, jxrSaturatedAdd(uint64(cap(m.data)), free))
+	}
+	return limit
+}
+
+// Write 将字节写入有界内存暂存并检查Context、输出上限与共享内存上限
 // 入参: p 待写入字节切片
 // 返回: int 实际写入字节数, error 取消或上限错误
 func (m *jxrMemWriteSeeker) Write(p []byte) (int, error) {
@@ -279,8 +292,10 @@ func (m *jxrMemWriteSeeker) Write(p []byte) (int, error) {
 		return 0, &LimitError{Resource: "max output bytes", Limit: m.maxBytes, Required: end, Detail: "sequential row output stage"}
 	}
 	if end > uint64(cap(m.data)) {
-		if end > uint64(^uint(0)>>1) || end > m.maxMemory {
-			return 0, &LimitError{Resource: "max memory bytes", Limit: m.maxMemory, Required: end, Detail: "sequential row output stage memory"}
+		limit := m.availableLimit()
+		maxInt := uint64(^uint(0) >> 1)
+		if end > maxInt || end > limit {
+			return 0, &LimitError{Resource: "max memory bytes", Limit: limit, Required: end, Detail: "sequential row output stage memory"}
 		}
 		target := uint64(cap(m.data)) * 2
 		if target < 4096 {
@@ -289,15 +304,14 @@ func (m *jxrMemWriteSeeker) Write(p []byte) (int, error) {
 		if target < end {
 			target = end
 		}
-		if target > m.maxMemory {
-			target = m.maxMemory
-		}
-		if target > m.maxBytes {
-			target = m.maxBytes
-		}
+		target = min(target, limit, m.maxBytes, maxInt)
+		oldCap := uint64(cap(m.data))
 		grown := make([]byte, len(m.data), int(target))
 		copy(grown, m.data)
 		m.data = grown
+		if m.budget != nil {
+			m.budget.used += uint64(cap(m.data)) - oldCap
+		}
 	}
 	if int(end) > len(m.data) {
 		m.data = m.data[:int(end)]
@@ -325,8 +339,9 @@ func (m *jxrMemWriteSeeker) Seek(offset int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("%w: sequential row stage seek range", ErrInvalid)
 	}
 	next := base + offset
-	if uint64(next) > m.maxBytes || uint64(next) > m.maxMemory {
-		return 0, &LimitError{Resource: "max memory bytes", Limit: min(m.maxBytes, m.maxMemory), Required: uint64(next), Detail: "sequential row stage seek"}
+	limit := m.availableLimit()
+	if uint64(next) > m.maxBytes || uint64(next) > limit {
+		return 0, &LimitError{Resource: "max memory bytes", Limit: min(m.maxBytes, limit), Required: uint64(next), Detail: "sequential row stage seek"}
 	}
 	m.pos = next
 	return m.pos, nil
@@ -446,67 +461,79 @@ func encodeJXRRowsSequential(ctx context.Context, w io.Writer, info Info, read R
 	if err := checkJXREncodeOptions(settings); err != nil {
 		return err
 	}
-	limits := settings.Limits.normalized()
-	maxBytes := settings.MaxOutputBytes
-	if maxBytes == 0 {
-		maxBytes = 64 << 20
-	}
 	if file {
-		maxBytes = min(maxBytes, uint64(math.MaxUint32))
+		settings.Format = FormatJXR
+	} else {
+		settings.Format = FormatCodestream
 	}
-	if settings.Scratch != nil {
-		if sameInterfaceTarget(w, settings.Scratch) {
-			return fmt.Errorf("%w: row output scratch aliases output", ErrInvalid)
-		}
-		if limits.MaxMemoryBytes <= jxrRowStageCopyBytes {
-			return &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrRowStageCopyBytes + 1, Detail: "sequential row copy buffer"}
-		}
-		var stage io.ReadWriteSeeker
-		if settings.SeparateAlpha && !settings.Uncompressed {
-			alphaLen, err := jxrAlphaRowByteLength(info)
-			if err != nil {
-				return err
-			}
-			origScratch := settings.Scratch
-			settings.Scratch = &jxrOffsetReadWriteSeeker{target: origScratch, base: 0}
-			stage = &jxrOffsetReadWriteSeeker{target: origScratch, base: int64(alphaLen)}
-		} else {
-			if err := seekJXRImageOutput(ctx, settings.Scratch, 0); err != nil {
-				return err
-			}
-			stage = settings.Scratch
-			settings.Scratch = nil
-		}
-		limits.MaxMemoryBytes -= jxrRowStageCopyBytes
-		settings.Limits = limits
-		if err := encodeJXRRows(ctx, stage, info, read, &settings, file); err != nil {
-			return err
-		}
-		endPos, err := stage.Seek(0, io.SeekCurrent)
+	if settings.Scratch == nil {
+		enc, err := newRowEncoder(ctx, w, info, &settings)
 		if err != nil {
 			return err
 		}
-		return copyJXRStageToWriter(ctx, w, stage, endPos)
+		defer enc.release()
+		for y := 0; y < enc.height; y += enc.step {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			height := min(enc.step, enc.height-y)
+			view := enc.bindRingRowView(height)
+			if err := read(ctx, y, view); err != nil {
+				return err
+			}
+			if err := enc.commitStep(ctx, height); err != nil {
+				return err
+			}
+		}
+		return enc.finish(ctx)
 	}
-	mem := &jxrMemWriteSeeker{ctx: ctx, maxBytes: maxBytes, maxMemory: limits.MaxMemoryBytes}
-	if err := encodeJXRRows(ctx, mem, info, read, &settings, file); err != nil {
+	limits := settings.Limits.normalized()
+	if sameInterfaceTarget(w, settings.Scratch) {
+		return fmt.Errorf("%w: row output scratch aliases output", ErrInvalid)
+	}
+	if limits.MaxMemoryBytes <= jxrRowStageCopyBytes {
+		return &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrRowStageCopyBytes + 1, Detail: "sequential row copy buffer"}
+	}
+	var stage io.ReadWriteSeeker
+	if settings.SeparateAlpha && !settings.Uncompressed {
+		alphaLen, err := jxrAlphaRowByteLength(info)
+		if err != nil {
+			return err
+		}
+		origScratch := settings.Scratch
+		settings.Scratch = &jxrOffsetReadWriteSeeker{target: origScratch, base: 0}
+		stage = &jxrOffsetReadWriteSeeker{target: origScratch, base: int64(alphaLen)}
+	} else {
+		if err := seekJXRImageOutput(ctx, settings.Scratch, 0); err != nil {
+			return err
+		}
+		stage = settings.Scratch
+		settings.Scratch = nil
+	}
+	limits.MaxMemoryBytes -= jxrRowStageCopyBytes
+	settings.Limits = limits
+	if err := encodeJXRRows(ctx, stage, info, read, &settings, file); err != nil {
 		return err
 	}
-	if err := writeEncoderOutput(ctx, w, mem.data); err != nil {
+	endPos, err := stage.Seek(0, io.SeekCurrent)
+	if err != nil {
 		return err
 	}
-	mem.data = nil
-	return ctx.Err()
+	return copyJXRStageToWriter(ctx, w, stage, endPos)
 }
 
 // jxrAlphaRowByteLength 计算单通道透明度原始行样本暂存所需的精确字节长度
 // 入参: info 原始图像描述
 // 返回: uint64 精确暂存字节数, error 元数据或容量错误
 func jxrAlphaRowByteLength(info Info) (uint64, error) {
-	if !info.Alpha || len(info.Components) == 0 || info.Bounds.Empty() || info.Bounds.Min != (image.Point{}) {
+	count := len(info.Components)
+	if count < 1 || count > rasterMaxComponents+1 || info.Bounds.Empty() || info.Bounds.Min != (image.Point{}) || uint64(info.Bounds.Max.X) > 1<<32 || uint64(info.Bounds.Max.Y) > 1<<32 {
+		return 0, fmt.Errorf("%w: row source geometry", ErrInvalid)
+	}
+	if !info.Alpha || count < 2 || info.Channels != 0 && info.Channels != count-1 {
 		return 0, fmt.Errorf("%w: row alpha scratch metadata", ErrInvalid)
 	}
-	comp := info.Components[len(info.Components)-1]
+	comp := info.Components[count-1]
 	sampleBytes := uint64(2)
 	if comp.Precision == 32 {
 		sampleBytes = 4
@@ -564,10 +591,12 @@ func newRowEncoder(ctx context.Context, w io.Writer, info Info, opts *EncodeOpti
 	if uint64(info.Bounds.Dx()) > limits.MaxPixels/uint64(info.Bounds.Dy()) {
 		return nil, &LimitError{Resource: "row encoder pixels", Limit: limits.MaxPixels, Required: jxrSaturatedMul(uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy()))}
 	}
-	cleanInfo := info
-	cleanInfo.ICCProfile, cleanInfo.EXIF, cleanInfo.GPS, cleanInfo.XMP, cleanInfo.IPTC, cleanInfo.Description = nil, nil, nil, nil, nil, nil
+	cleanInfo := jxrStripContainerMetadata(info)
+	if file {
+		cleanInfo = jxrStripContainerMetadata(jxrWithContainerMetadata(info, &settings))
+	}
 	cleanInfo.Components = cloneComponentInfo(info.Components)
-	cleanInfo.ColorEncoding = cloneColorEncoding(info.ColorEncoding)
+	cleanInfo.ColorEncoding = cloneColorEncoding(cleanInfo.ColorEncoding)
 	if err := normalizeRasterInfo(&cleanInfo); err != nil {
 		return nil, err
 	}
@@ -581,7 +610,6 @@ func newRowEncoder(ctx context.Context, w io.Writer, info Info, opts *EncodeOpti
 	enc := &RowEncoder{
 		finalWriter:  w,
 		info:         cleanInfo,
-		cleanInfo:    cleanInfo,
 		file:         file,
 		separate:     settings.SeparateAlpha,
 		uncompressed: settings.Uncompressed,
@@ -645,72 +673,16 @@ func newRowEncoder(ctx context.Context, w io.Writer, info Info, opts *EncodeOpti
 // 入参: ctx 已规范化Context, origInfo 含容器元数据的原始描述, settings 已校验无压缩选项
 // 返回: error 格式、资源、取消或I/O错误
 func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settings EncodeOptions) error {
-	info, retained, err := prepareJXRTileInfo(ctx, origInfo, settings)
+	info, retained, err := attachJXRTileMetadata(ctx, e.info, origInfo, settings)
 	if err != nil {
 		return err
-	}
-	if settings.SeparateAlpha && !info.Alpha {
-		return fmt.Errorf("%w: separate alpha without source alpha", ErrInvalid)
 	}
 	e.info = info
 	limits := settings.Limits.normalized()
 	maxBytes := min(settings.MaxOutputBytes, uint64(math.MaxUint32))
-	identifier, format, err := jxrRasterIdentifier(info, [16]byte{})
+	prefix, err := prepareJXRUncompressedPrefix(ctx, info, settings, maxBytes, limits.MaxMemoryBytes-retained)
 	if err != nil {
 		return err
-	}
-	transform := jxrInputTransform(info, format.color, uint8(settings.Orientation))
-	codedW, codedH := uint64(info.Bounds.Dx()), uint64(info.Bounds.Dy())
-	if transform&4 != 0 {
-		codedW, codedH = codedH, codedW
-	}
-	layout, err := jxrMakeUncompressedLayout(identifier[15], format, codedW, codedH, settings.SeparateAlpha)
-	if err != nil {
-		return err
-	}
-	if format.name == "BlackWhite" && format.depth == 15 {
-		format.depth = 0
-	}
-	c := jxrContainer{width: codedW, height: codedH, format: format, pixelFormat: identifier, transform: uint32(transform), uncompressed: true}
-	c.setInfoMetadata(info)
-	exifNode, gpsNode, err := checkJXRContainerMetadataLayout(ctx, &c, limits.MaxPixels, limits.MaxMemoryBytes-retained, settings.SeparateAlpha)
-	if err != nil {
-		return err
-	}
-	b := newJXRBitWriter(ctx, maxBytes, limits.MaxMemoryBytes-retained)
-	if b.err != nil {
-		return b.err
-	}
-	var offsets jxrContainerOffsets
-	writeJXRContainerBytes(&b, &c, true, settings.SeparateAlpha, &offsets, exifNode, gpsNode)
-	if b.err != nil {
-		return b.err
-	}
-	header := b.data
-	mainStart := uint64(len(header))
-	if layout.mainBytes > maxBytes-mainStart {
-		return &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(mainStart, layout.mainBytes), Detail: "uncompressed row encoder output bytes"}
-	}
-	total := mainStart + layout.mainBytes
-	alphaStart, padMain := uint64(0), false
-	if settings.SeparateAlpha {
-		if total&1 != 0 {
-			if total >= maxBytes {
-				return &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(total, 1), Detail: "uncompressed row encoder alpha alignment"}
-			}
-			total++
-			padMain = true
-		}
-		alphaStart = total
-		if layout.alphaBytes > maxBytes-total {
-			return &LimitError{Resource: "max output bytes", Limit: maxBytes, Required: jxrSaturatedAdd(total, layout.alphaBytes), Detail: "uncompressed row encoder alpha output bytes"}
-		}
-		total += layout.alphaBytes
-	}
-	binary.LittleEndian.PutUint32(header[offsets.imageSize:], uint32(layout.mainBytes))
-	if settings.SeparateAlpha {
-		binary.LittleEndian.PutUint32(header[offsets.alphaOffset:], uint32(alphaStart))
-		binary.LittleEndian.PutUint32(header[offsets.alphaSize:], uint32(layout.alphaBytes))
 	}
 	position, err := e.stageWriter.Seek(0, io.SeekCurrent)
 	if err != nil {
@@ -719,16 +691,16 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 	if position != 0 {
 		return fmt.Errorf("%w: uncompressed row encoder output position", ErrInvalid)
 	}
-	rowInfo, rowRasterWork, err := jxrRegionInfo(e.cleanInfo, image.Rect(0, 0, e.width, e.step))
+	rowInfo, rowRasterWork, err := jxrRegionInfo(jxrStripContainerMetadata(info), image.Rect(0, 0, e.width, e.step))
 	if err != nil {
 		return err
 	}
-	baseHeld := retained + uint64(cap(header))
-	e.uncLayout, e.uncTransform = layout, transform
-	e.uncMainStart, e.uncAlphaAt, e.uncTotal, e.uncPadMain = mainStart, alphaStart, total, padMain
-	if transform&4 != 0 {
-		e.uncHeader = header
-		rawTotal := layout.mainBytes + layout.alphaBytes
+	baseHeld := retained + uint64(cap(prefix.header))
+	e.uncLayout, e.uncTransform = prefix.layout, prefix.transform
+	e.uncMainStart, e.uncAlphaAt, e.uncTotal, e.uncPadMain = prefix.mainLocal, prefix.alphaLocal, prefix.totalLocal, prefix.padMain
+	if prefix.transform&4 != 0 {
+		e.uncHeader = prefix.header
+		rawTotal := prefix.layout.mainBytes + prefix.layout.alphaBytes
 		if rawTotal > uint64(^uint(0)>>1) {
 			return &LimitError{Resource: "max memory bytes", Limit: uint64(^uint(0) >> 1), Required: rawTotal, Detail: "uncompressed transposed payload capacity"}
 		}
@@ -741,18 +713,25 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 		}
 		e.ring = ring
 		e.initRowView(rowInfo)
-		e.uncMainData = make([]byte, int(layout.mainBytes))
-		if layout.separateAlpha {
-			e.uncAlphaData = make([]byte, int(layout.alphaBytes))
+		e.uncMainData = make([]byte, int(prefix.layout.mainBytes))
+		if prefix.layout.separateAlpha {
+			e.uncAlphaData = make([]byte, int(prefix.layout.alphaBytes))
 		}
 		return ctx.Err()
 	}
-	bufWork := layout.rowBufferWork()
+	bufWork := prefix.layout.rowBufferWork()
 	if bufWork > uint64(^uint(0)>>1) {
 		return &LimitError{Resource: "max memory bytes", Limit: uint64(^uint(0) >> 1), Required: bufWork, Detail: "uncompressed row encoder buffer capacity"}
 	}
-	if _, ok := jxrWorkTotal(limits.MaxMemoryBytes, baseHeld, rowRasterWork, bufWork); !ok {
+	held, ok := jxrWorkTotal(limits.MaxMemoryBytes, baseHeld, rowRasterWork, bufWork)
+	if !ok {
 		return &LimitError{Resource: "max memory bytes", Limit: limits.MaxMemoryBytes, Required: jxrSaturatedAdd(baseHeld, jxrSaturatedAdd(rowRasterWork, bufWork)), Detail: "uncompressed row encoder memory"}
+	}
+	if e.memStage != nil {
+		e.memStage.maxMemory = limits.MaxMemoryBytes - held
+		if prefix.totalLocal > e.memStage.maxMemory {
+			return &LimitError{Resource: "max memory bytes", Limit: e.memStage.maxMemory, Required: prefix.totalLocal, Detail: "sequential row output stage memory"}
+		}
 	}
 	ring, err := newRasterContext(ctx, rowInfo, Limits{MaxPixels: limits.MaxPixels, MaxMemoryBytes: rowRasterWork})
 	if err != nil {
@@ -760,17 +739,17 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 	}
 	e.ring = ring
 	e.initRowView(rowInfo)
-	e.uncRowBuf = make([]byte, int(layout.rowBytes))
-	if !layout.planar && layout.separateAlpha {
-		e.uncAlphaBuf = make([]byte, int(layout.alphaRowBytes))
+	e.uncRowBuf = make([]byte, int(prefix.layout.rowBytes))
+	if !prefix.layout.planar && prefix.layout.separateAlpha {
+		e.uncAlphaBuf = make([]byte, int(prefix.layout.alphaRowBytes))
 	}
-	if err := writeEncoderOutput(ctx, e.stageWriter, header); err != nil {
+	if err := writeEncoderOutput(ctx, e.stageWriter, prefix.header); err != nil {
 		return err
 	}
-	e.uncNeedSeek = layout.planar || layout.separateAlpha || transform&1 != 0
+	e.uncNeedSeek = prefix.layout.planar || prefix.layout.separateAlpha || prefix.transform&1 != 0
 	if e.uncNeedSeek {
 		var zeros [32768]byte
-		for remaining := total - uint64(len(header)); remaining != 0; {
+		for remaining := prefix.totalLocal - uint64(len(prefix.header)); remaining != 0; {
 			chunk := min(remaining, uint64(len(zeros)))
 			if err := writeEncoderOutput(ctx, e.stageWriter, zeros[:int(chunk)]); err != nil {
 				return err
@@ -786,10 +765,11 @@ func (e *RowEncoder) initUncompressed(ctx context.Context, origInfo Info, settin
 // 返回: error 布局、预算、取消或I/O错误
 func (e *RowEncoder) initCompressed(ctx context.Context, origInfo Info, formatInfo jxrPixelFormat, settings EncodeOptions, metadata uint64) error {
 	limits := settings.Limits.normalized()
+	cleanInfo := e.info
 	if settings.SeparateAlpha {
 		var held uint64
 		var err error
-		e.alphaStorage, held, err = makeJXRAlphaRowStorage(e.cleanInfo, settings.Scratch, limits.MaxMemoryBytes-metadata)
+		e.alphaStorage, held, err = makeJXRAlphaRowStorage(cleanInfo, settings.Scratch, limits.MaxMemoryBytes-metadata)
 		if err != nil {
 			return err
 		}
@@ -803,8 +783,8 @@ func (e *RowEncoder) initCompressed(ctx context.Context, origInfo Info, formatIn
 		}
 		limits.MaxMemoryBytes -= held
 	}
-	ringHeight := jxrRingHeight(e.cleanInfo, formatInfo.color, settings)
-	cacheInfo, ringWork, err := jxrRegionInfo(e.cleanInfo, image.Rect(0, 0, e.width, ringHeight))
+	ringHeight := jxrRingHeight(cleanInfo, formatInfo.color, settings)
+	cacheInfo, ringWork, err := jxrRegionInfo(cleanInfo, image.Rect(0, 0, e.width, ringHeight))
 	if err != nil {
 		return err
 	}
@@ -813,7 +793,7 @@ func (e *RowEncoder) initCompressed(ctx context.Context, origInfo Info, formatIn
 	}
 	limits.MaxMemoryBytes -= ringWork + metadata
 	settings.Limits = limits
-	info, retained, err := prepareJXRTileInfo(ctx, origInfo, settings)
+	info, retained, err := attachJXRTileMetadata(ctx, cleanInfo, origInfo, settings)
 	if err != nil {
 		return err
 	}
@@ -840,6 +820,9 @@ func (e *RowEncoder) initCompressed(ctx context.Context, origInfo Info, formatIn
 		}
 		if uint64(len(header)) >= min(input.file.maximum, uint64(math.MaxUint32)) {
 			return &LimitError{Resource: "incremental separate alpha file capacity", Limit: min(input.file.maximum, uint64(math.MaxUint32)), Required: jxrSaturatedAdd(uint64(len(header)), 1)}
+		}
+		if e.memStage != nil {
+			e.memStage.maxMemory = input.file.prefixMemory
 		}
 		if err := writeEncoderOutput(ctx, e.stageWriter, header); err != nil {
 			return err
@@ -872,7 +855,8 @@ func (e *RowEncoder) initCompressed(ctx context.Context, origInfo Info, formatIn
 				return fmt.Errorf("%w: incremental file metadata memory", ErrLimit)
 			}
 			maxFileBytes := min(streamOpts.maxBytes, uint64(math.MaxUint32))
-			header, sizeAt, err := makeJXRFilePrefix(ctx, info, &source, streamOpts.maxPixels, maxFileBytes, streamOpts.maxMemory-retained-working)
+			prefixMemory := streamOpts.maxMemory - retained - working
+			header, sizeAt, err := makeJXRFilePrefix(ctx, info, &source, streamOpts.maxPixels, maxFileBytes, prefixMemory)
 			if err != nil {
 				return err
 			}
@@ -885,6 +869,9 @@ func (e *RowEncoder) initCompressed(ctx context.Context, origInfo Info, formatIn
 			}
 			if position != 0 {
 				return fmt.Errorf("%w: incremental file output position", ErrInvalid)
+			}
+			if e.memStage != nil {
+				e.memStage.maxMemory = prefixMemory
 			}
 			if err := writeEncoderOutput(ctx, e.stageWriter, header); err != nil {
 				return err
@@ -920,78 +907,22 @@ func (e *RowEncoder) initRowView(info Info) {
 // 入参: ctx Context, codedInfo 当前主码流原生描述, source 主码流头部, options 码流输出预算与参数
 // 返回: error 布局、预算、取消或I/O错误
 func (e *RowEncoder) initStreamState(ctx context.Context, codedInfo Info, source *jxrStream, options jxrStreamOutput) error {
-	if err := checkJXRStreamOutput(source, options.maxPixels); err != nil {
-		return err
-	}
 	settingsWork, err := options.tileWork(ctx, options.maxMemory)
 	if err != nil {
 		return err
 	}
-	tiles := (len(source.header.columns) - 1) * (len(source.header.rows) - 1)
-	bands := 1
-	if source.header.frequency {
-		bands = 4 - int(source.primary.bands)
+	streamPlan, err := planJXRHardTileStream(ctx, codedInfo, source, options.maxMemory)
+	if err != nil {
+		return err
 	}
-	var largest jxrHardTileInput
-	columns, rows := uint32(0), uint32(0)
-	for tile := range tiles {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		plan, err := planJXRHardTile(codedInfo, source, tile)
-		if err != nil {
-			return err
-		}
-		if plan.rawWork > largest.rawWork {
-			largest = plan
-		}
-		columns = max(columns, plan.columns)
-		rows = max(rows, plan.rows)
-	}
-	template := *source
-	template.header.width, template.header.height = uint64(columns)*16, uint64(rows)*16
-	template.header.left, template.header.top, template.header.right, template.header.bottom = 0, 0, 0, 0
-	template.header.columns, template.header.rows = []uint32{0, columns}, []uint32{0, rows}
-	var templateOffsets [4]uint64
-	template.header.index, template.packets = source.header.frequency, templateOffsets[:bands]
-	estimate := jxrCoefficientImage{primary: jxrCoefficients{plane: template.primary}}
-	if template.alpha != nil {
-		estimate.alpha = &jxrCoefficients{plane: *template.alpha}
-	}
-	tileMax := estimate.outputWork(&template)
-	for _, extra := range []uint64{largest.rawWork, settingsWork, jxrHardTileReserve} {
-		if tileMax > options.maxMemory || extra > options.maxMemory-tileMax {
-			return &LimitError{Resource: "local hard tile working memory", Limit: options.maxMemory, Required: jxrSaturatedAdd(tileMax, extra)}
-		}
-		tileMax += extra
-	}
-	retained := source.headerWork() + jxrHardTileReserve
-	if retained > options.maxMemory || tileMax > options.maxMemory-retained {
-		return &LimitError{Resource: "retained hard tile header memory", Limit: options.maxMemory, Required: jxrSaturatedAdd(retained, tileMax)}
-	}
-	count := tiles * bands
-	working := retained + tileMax
+	count := streamPlan.tiles * streamPlan.bands
+	working := streamPlan.retained + streamPlan.tileMax
 	if settingsWork > ^uint64(0)-uint64(count)*8 {
 		return fmt.Errorf("%w: incremental settings capacity", ErrLimit)
 	}
 	extra := settingsWork + uint64(count)*8
 	if working >= options.maxMemory || extra >= options.maxMemory-working {
 		return fmt.Errorf("%w: incremental output working memory", ErrLimit)
-	}
-	for _, setting := range options.tiles {
-		if setting.trim > 15 || !source.header.trim && setting.trim != 0 {
-			return fmt.Errorf("%w: incremental trim", ErrInvalid)
-		}
-		for index, plane := range [2]*jxrPlane{&source.primary, source.alpha} {
-			if plane != nil {
-				if err := checkJXRModelComponents(plane); err != nil {
-					return err
-				}
-				if err := checkJXRTileQuant(plane, &setting.quant[index]); err != nil {
-					return err
-				}
-			}
-		}
 	}
 	position, err := e.stageWriter.Seek(0, io.SeekCurrent)
 	if err != nil {
@@ -1005,11 +936,20 @@ func (e *RowEncoder) initStreamState(ctx context.Context, codedInfo Info, source
 		return fmt.Errorf("%w: incremental output address capacity", ErrLimit)
 	}
 	e.packetBudget = jxrWriteBudget{limit: options.maxMemory - working - extra}
+	if e.memStage != nil {
+		memCap := uint64(cap(e.memStage.data))
+		if memCap >= e.packetBudget.limit {
+			return &LimitError{Resource: "max memory bytes", Limit: e.packetBudget.limit, Required: jxrSaturatedAdd(memCap, 1), Detail: "sequential row output stage memory"}
+		}
+		e.packetBudget.used = memCap
+		e.memStage.budget = &e.packetBudget
+		e.memStage.maxMemory = e.packetBudget.limit
+	}
 	e.stream = *source
 	e.stream.packets = make([]uint64, count)
 	header := newJXRBitWriter(ctx, maximum, e.packetBudget.limit)
 	header.budget = &e.packetBudget
-	indexAt := writeJXRStreamHeader(&header, &e.stream, options.maxPixels, true)
+	indexAt := writeJXRStreamHeaderChecked(&header, &e.stream, true)
 	if header.err != nil {
 		return header.err
 	}
@@ -1019,8 +959,8 @@ func (e *RowEncoder) initStreamState(ctx context.Context, codedInfo Info, source
 	}
 	e.packetBudget.used -= uint64(cap(header.data))
 	header.data = nil
-	e.tileOutput = jxrTileOutput{exact: options.exact, maxMemory: options.maxMemory}
-	for band := range bands {
+	e.tileOutput = jxrTileOutput{exact: options.exact, validated: true, maxMemory: options.maxMemory}
+	for band := range streamPlan.bands {
 		e.packets[band] = newJXRBitWriter(ctx, maximum-total, e.packetBudget.limit)
 		e.packets[band].budget = &e.packetBudget
 		if e.packets[band].err != nil {
@@ -1033,15 +973,15 @@ func (e *RowEncoder) initStreamState(ctx context.Context, codedInfo Info, source
 			e.tileOutput.macro[index].high = make([]int64, plane.channels*256)
 		}
 	}
-	local, err := resizeJXRHardTile(ctx, codedInfo, largest, largest.rawWork, nil)
+	local, err := resizeJXRHardTile(ctx, codedInfo, streamPlan.largest, streamPlan.largest.rawWork, nil)
 	if err != nil {
 		return err
 	}
-	available := tileMax - largest.rawWork
+	available := streamPlan.tileMax - streamPlan.largest.rawWork
 	allocated := uint64(0)
-	for index, plane := range [2]*jxrPlane{&template.primary, template.alpha} {
+	for index, plane := range [2]*jxrPlane{&streamPlan.template.primary, streamPlan.template.alpha} {
 		if plane != nil {
-			e.planes[index], err = newJXRTransformPlane(ctx, &template.header, plane, available-allocated)
+			e.planes[index], err = newJXRTransformPlane(ctx, &streamPlan.template.header, plane, available-allocated)
 			if err != nil {
 				return err
 			}
@@ -1054,10 +994,10 @@ func (e *RowEncoder) initStreamState(ctx context.Context, codedInfo Info, source
 	e.prefix = prefix
 	e.total = total
 	e.maximum = maximum
-	e.bands = bands
-	e.tiles = tiles
-	e.largest = largest
-	e.tileMaxWork = tileMax
+	e.bands = streamPlan.bands
+	e.tiles = streamPlan.tiles
+	e.largest = streamPlan.largest
+	e.tileMaxWork = streamPlan.tileMax
 	e.local = local
 	e.nextOrdinal = 0
 	return e.prepareNextTilePlan(codedInfo)
@@ -1144,7 +1084,7 @@ func (e *RowEncoder) writeRowRaster(ctx context.Context, src *Raster) error {
 		return fmt.Errorf("%w: nil or empty row raster", ErrInvalid)
 	}
 	srcInfo := src.info
-	if srcInfo.ColorSpace != e.cleanInfo.ColorSpace || srcInfo.Channels != e.cleanInfo.Channels || srcInfo.Alpha != e.cleanInfo.Alpha || srcInfo.Premultiplied != e.cleanInfo.Premultiplied || len(srcInfo.Components) != len(e.cleanInfo.Components) {
+	if srcInfo.ColorSpace != e.info.ColorSpace || srcInfo.Channels != e.info.Channels || srcInfo.Alpha != e.info.Alpha || srcInfo.Premultiplied != e.info.Premultiplied || len(srcInfo.Components) != len(e.info.Components) {
 		return fmt.Errorf("%w: row raster format mismatch", ErrInvalid)
 	}
 	bounds := src.Bounds()
@@ -1153,7 +1093,7 @@ func (e *RowEncoder) writeRowRaster(ctx context.Context, src *Raster) error {
 		return fmt.Errorf("%w: row raster dimensions", ErrInvalid)
 	}
 	for index, comp := range srcInfo.Components {
-		want := e.cleanInfo.Components[index]
+		want := e.info.Components[index]
 		if !jxrSameSampleEncoding(comp, want) || comp.XStep != want.XStep || comp.YStep != want.YStep || comp.Bounds.Dx() != want.Bounds.Dx() || comp.Bounds.Dy() != rows/int(want.YStep) {
 			return fmt.Errorf("%w: row raster component mismatch", ErrInvalid)
 		}
@@ -1184,37 +1124,17 @@ func (e *RowEncoder) writeRowRaster(ctx context.Context, src *Raster) error {
 			srcComp := srcComps[index]
 			srcY0 := srcComp.info.Bounds.Min.Y + offset/int(comp.YStep)
 			srcX0 := srcComp.info.Bounds.Min.X
-			cw, ch := comp.Bounds.Dx(), comp.Bounds.Dy()
-			plane := &dst.planes[index]
-			for ry := range ch {
-				for cx := range cw {
-					if cx&1023 == 0 {
-						if err := ctx.Err(); err != nil {
-							if offset > 0 {
-								e.failed = err
-							}
-							return err
-						}
-					}
-					bits, err := srcComp.sampleBitsAt(srcX0+cx, srcY0+ry)
-					if err != nil {
-						if offset > 0 {
-							e.failed = err
-						}
-						return err
-					}
-					plane.storeBits(ry*cw+cx, bits)
+			if err := copyJXRComponentRect(ctx, &dst.planes[index], srcComp, srcX0, srcY0, comp.Bounds.Dx(), comp.Bounds.Dy()); err != nil {
+				if offset > 0 {
+					e.failed = err
 				}
+				return err
 			}
 		}
 		if err := e.commitStep(ctx, e.step); err != nil {
 			e.failed = err
 			return err
 		}
-	}
-	if err := ctx.Err(); err != nil {
-		e.failed = err
-		return err
 	}
 	return nil
 }
@@ -1228,15 +1148,14 @@ func (e *RowEncoder) commitStep(ctx context.Context, rows int) error {
 		e.memStage.ctx = ctx
 	}
 	if e.uncompressed {
-		err := e.commitUncompressedRow(ctx)
-		if err != nil {
+		if err := e.commitUncompressedRow(ctx); err != nil {
 			return err
 		}
 		e.pushed += rows
-		return ctx.Err()
+		return nil
 	}
 	if e.separate {
-		if err := e.alphaStorage.transfer(ctx, &e.rowStorage.planes[e.cleanInfo.Channels], true); err != nil {
+		if err := e.alphaStorage.transfer(ctx, &e.rowStorage.planes[e.info.Channels], true); err != nil {
 			return err
 		}
 	}
@@ -1248,10 +1167,11 @@ func (e *RowEncoder) commitStep(ctx context.Context, rows int) error {
 // 入参: ctx 已规范化Context
 // 返回: error 打包、取消或写入错误
 func (e *RowEncoder) commitUncompressedRow(ctx context.Context) error {
+	cleanInfo := jxrStripContainerMetadata(e.info)
 	if e.uncTransform&4 != 0 {
-		return jxrScatterUncompressedRowTransposed(ctx, e.cleanInfo, e.rowStorage.planes, &e.uncLayout, e.uncMainData, e.uncAlphaData, e.uncTransform, e.pushed, e.step)
+		return jxrScatterUncompressedRowTransposed(ctx, cleanInfo, e.rowStorage.planes, &e.uncLayout, e.uncMainData, e.uncAlphaData, e.uncTransform, e.pushed, e.step)
 	}
-	return jxrWriteUncompressedRowStreamStep(ctx, e.stageWriter, e.cleanInfo, e.rowStorage.planes, &e.uncLayout, e.uncRowBuf, e.uncAlphaBuf, e.uncTransform, e.pushed, e.step, e.uncMainStart, e.uncAlphaAt, e.uncNeedSeek)
+	return jxrWriteUncompressedRowStreamStep(ctx, e.stageWriter, cleanInfo, e.rowStorage.planes, &e.uncLayout, e.uncRowBuf, e.uncAlphaBuf, e.uncTransform, e.pushed, e.step, e.uncMainStart, e.uncAlphaAt, e.uncNeedSeek)
 }
 
 // flushReadyTiles 按显示行序同步编码并写出全部所需显示行均已到达的分块，确保环形缓存安全回卷
@@ -1277,7 +1197,7 @@ func (e *RowEncoder) flushReadyTiles(ctx context.Context) error {
 			return err
 		}
 	}
-	return ctx.Err()
+	return nil
 }
 
 // encodeSingleTile 从环形行缓存投影单个分块窗口，执行正变换、熵编码并将各频带包写出至暂存或目标流
@@ -1301,11 +1221,9 @@ func (e *RowEncoder) encodeSingleTile(ctx context.Context, codedInfo Info, tile 
 	var offset [36]uint64
 	window, localTile := jxrBuildTileFrame(&frame, e.stream.header.frequency, e.bands, &plan, &horizontal, &vertical, &offset)
 	selected := e.streamOpts
-	if len(e.streamOpts.tiles) != 1 {
-		selected.tiles = e.streamOpts.tiles[tile : tile+1 : tile+1]
-	}
 	setting := &e.streamOpts.tiles[0]
 	if len(e.streamOpts.tiles) != 1 {
+		selected.tiles = e.streamOpts.tiles[tile : tile+1 : tile+1]
 		setting = &e.streamOpts.tiles[tile]
 	}
 	e.tileOutput.quant, e.tileOutput.trim = setting.quant, setting.trim
@@ -1345,7 +1263,7 @@ func (e *RowEncoder) encodeSingleTile(ctx context.Context, codedInfo Info, tile 
 		}
 		e.total += uint64(len(e.packets[band].data))
 	}
-	return ctx.Err()
+	return nil
 }
 
 // finish 校验写满整帧、回填索引和容器长度字段、写出可选独立透明度并流式拷贝至顺序输出
@@ -1367,21 +1285,28 @@ func (e *RowEncoder) finish(ctx context.Context) error {
 	}
 	if e.uncompressed {
 		if e.uncTransform&4 != 0 {
-			if err := writeEncoderOutput(ctx, e.stageWriter, e.uncHeader); err != nil {
+			dst := io.Writer(e.stageWriter)
+			if e.memStage != nil {
+				dst = e.finalWriter
+			}
+			if err := writeEncoderOutput(ctx, dst, e.uncHeader); err != nil {
 				return err
 			}
-			if err := writeEncoderOutput(ctx, e.stageWriter, e.uncMainData); err != nil {
+			if err := writeEncoderOutput(ctx, dst, e.uncMainData); err != nil {
 				return err
 			}
 			if e.uncPadMain {
-				if err := writeEncoderOutput(ctx, e.stageWriter, []byte{0}); err != nil {
+				if err := writeEncoderOutput(ctx, dst, []byte{0}); err != nil {
 					return err
 				}
 			}
 			if e.uncLayout.separateAlpha {
-				if err := writeEncoderOutput(ctx, e.stageWriter, e.uncAlphaData); err != nil {
+				if err := writeEncoderOutput(ctx, dst, e.uncAlphaData); err != nil {
 					return err
 				}
+			}
+			if e.memStage != nil {
+				return ctx.Err()
 			}
 		} else if e.uncNeedSeek {
 			if err := seekJXRImageOutput(ctx, e.stageWriter, e.uncTotal); err != nil {
@@ -1412,15 +1337,7 @@ func (e *RowEncoder) finish(ctx context.Context) error {
 		if endPos < 0 || uint64(endPos) < e.mainStart || uint64(endPos)-e.mainStart > e.streamOpts.maxBytes {
 			return fmt.Errorf("%w: incremental file output extent", ErrInvalid)
 		}
-		if err := seekJXRImageOutput(ctx, e.stageWriter, e.fileSizeAt); err != nil {
-			return err
-		}
-		var sizeField [4]byte
-		binary.LittleEndian.PutUint32(sizeField[:], uint32(uint64(endPos)-e.mainStart))
-		if err := writeEncoderOutput(ctx, e.stageWriter, sizeField[:]); err != nil {
-			return err
-		}
-		if err := seekJXRImageOutput(ctx, e.stageWriter, uint64(endPos)); err != nil {
+		if err := patchJXRFileSize(ctx, e.stageWriter, e.fileSizeAt, uint64(endPos)-e.mainStart, uint64(endPos)); err != nil {
 			return err
 		}
 	}
@@ -1474,11 +1391,20 @@ func (e *RowEncoder) finishSeparateAlpha(ctx context.Context) error {
 		height: e.height,
 		step:   e.step,
 		read: func(cbCtx context.Context, _ int, target *Raster) error {
-			return e.alphaStorage.transfer(cbCtx, &target.planes[e.cleanInfo.Channels], false)
+			return e.alphaStorage.transfer(cbCtx, &target.planes[e.info.Channels], false)
 		},
 	}
 	selected := e.separateIn.output[1]
 	selected.maxBytes, selected.rowOrder = e.fileMaxBytes-alphaStart, true
+	if e.memStage != nil {
+		e.memStage.budget = nil
+		memCap := uint64(cap(e.memStage.data))
+		if memCap >= selected.maxMemory {
+			return &LimitError{Resource: "max memory bytes", Limit: selected.maxMemory, Required: jxrSaturatedAdd(memCap, 1), Detail: "sequential separate alpha output stage memory"}
+		}
+		e.memStage.maxMemory = selected.maxMemory
+		selected.maxMemory -= memCap
+	}
 	if err := encodeJXRProjectedTilesTo(ctx, e.stageWriter, e.separateIn.file.info, e.separateIn.info[1], &e.separateIn.file.layout[1], selected, alphaSource.load, true, e.separateIn.mirror); err != nil {
 		return err
 	}
@@ -1489,18 +1415,7 @@ func (e *RowEncoder) finishSeparateAlpha(ctx context.Context) error {
 	if alphaEnd < 0 || uint64(alphaEnd) < alphaStart || uint64(alphaEnd) > e.fileMaxBytes {
 		return fmt.Errorf("%w: incremental separate alpha output extent", ErrInvalid)
 	}
-	alphaSize := uint64(alphaEnd) - alphaStart
-	for index, at := range [3]uint64{e.separateOff.imageSize, e.separateOff.alphaOffset, e.separateOff.alphaSize} {
-		if err := seekJXRImageOutput(ctx, e.stageWriter, at); err != nil {
-			return err
-		}
-		var field [4]byte
-		binary.LittleEndian.PutUint32(field[:], uint32([3]uint64{mainSize, alphaStart, alphaSize}[index]))
-		if err := writeEncoderOutput(ctx, e.stageWriter, field[:]); err != nil {
-			return err
-		}
-	}
-	return seekJXRImageOutput(ctx, e.stageWriter, uint64(alphaEnd))
+	return patchJXRSeparateAlphaFields(ctx, e.stageWriter, 0, e.separateOff, mainSize, alphaStart, uint64(alphaEnd)-alphaStart, uint64(alphaEnd))
 }
 
 // flushStagedToFinal 当底层目标为普通顺序Writer时将暂存数据流式拷贝至最终输出流
@@ -1520,7 +1435,7 @@ func (e *RowEncoder) flushStagedToFinal(ctx context.Context) error {
 	return copyJXRStageToWriter(ctx, e.finalWriter, e.stageReader, endPos)
 }
 
-// unbindContext 清空暂存与包写入器绑定的Context，防止编码器滞留已结束请求上下文
+// unbindContext 清空暂存与包写入器绑定的Context，防止编码器滞留已结束请求的Context
 func (e *RowEncoder) unbindContext() {
 	if e.memStage != nil {
 		e.memStage.ctx = nil
@@ -1530,7 +1445,7 @@ func (e *RowEncoder) unbindContext() {
 	}
 }
 
-// release 标记编码器关闭并彻底释放元数据、外部流接口、环形行缓存、局部变换缓冲与暂存引用
+// release 标记编码器关闭并彻底释放元数据、外部流对象、环形行缓存、局部变换缓冲与暂存引用
 func (e *RowEncoder) release() {
 	e.closed = true
 	e.failed = nil
@@ -1543,7 +1458,6 @@ func (e *RowEncoder) release() {
 		e.memStage = nil
 	}
 	e.info = Info{}
-	e.cleanInfo = Info{}
 	e.ring = nil
 	e.rowView = Raster{}
 	e.rowStorage = Raster{}

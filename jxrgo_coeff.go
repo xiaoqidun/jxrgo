@@ -126,6 +126,7 @@ type jxrTileOutput struct {
 	macro     [2]jxrEncodedMacro
 	rows      [2]*jxrTileRow
 	exact     bool
+	validated bool
 	trim      uint8
 	maxMemory uint64
 }
@@ -243,7 +244,7 @@ func (s *jxrStream) coefficientsContext(ctx context.Context, data []byte, maxWor
 		perWorker := s.tileScratchWork()
 		if perWorker != ^uint64(0) {
 			workers = resolveJXRWorkers(s.workers, tiles)
-			workers = budgetJXRWorkers(workers, jxrWorkerBudgetAllowance(limit-baseWork, perWorker), perWorker)
+			workers = budgetJXRWorkers(workers, jxrSaturatedAdd(limit-baseWork, perWorker), perWorker)
 		}
 	}
 	if err := runJXRWorkers(ctx, workers, tiles, func(runCtx context.Context, tile int) error {
@@ -673,14 +674,14 @@ func (img *jxrCoefficientImage) readFrequency(ctx context.Context, data []byte, 
 // 返回: error 数据、缓存或计算容量错误
 func (c *jxrCoefficients) readDC(b *jxrBits, decoder *jxrDC, q *jxrTileQuant, m jxrMacroContext, cache *jxrPrediction, scratch *jxrDecodedMacro) error {
 	residual := scratch.dc
-	decoder.readComponents(b, &c.plane, m.adapt, residual)
+	decoder.readChecked(b, &c.plane, m.adapt, residual)
 	if b.err != nil {
 		return b.err
 	}
 	if err := checkJXRWords(residual[:c.plane.channels], c.longWord); err != nil {
 		return err
 	}
-	mode, err := applyJXRDC(&c.plane, residual[:c.plane.channels], &m.left.low, &m.top.low, &m.corner.low, m.firstColumn, m.firstRow, false)
+	mode, err := applyJXRDCChecked(&c.plane, residual[:c.plane.channels], &m.left.low, &m.top.low, &m.corner.low, m.firstColumn, m.firstRow, false)
 	dc := residual
 	if err != nil {
 		return err
@@ -689,9 +690,7 @@ func (c *jxrCoefficients) readDC(b *jxrBits, decoder *jxrDC, q *jxrTileQuant, m 
 		return err
 	}
 	c.info[m.at].dcMode = mode
-	if err := storeJXRLow(&c.plane, dc[:c.plane.channels], nil, 0, cache); err != nil {
-		return err
-	}
+	storeJXRLowChecked(&c.plane, dc[:c.plane.channels], nil, 0, cache)
 	if c.plane.bands == 3 {
 		values := scratch.low
 		if err := dequantJXRLowComponents(&c.plane, dc, nil, q, 0, c.longWord, values); err != nil {
@@ -714,7 +713,7 @@ func (c *jxrCoefficients) readDC(b *jxrBits, decoder *jxrDC, q *jxrTileQuant, m 
 // 返回: error 数据、缓存或计算容量错误
 func (c *jxrCoefficients) readLP(b *jxrBits, decoder *jxrLP, q *jxrTileQuant, m jxrMacroContext, cache *jxrPrediction, scratch *jxrDecodedMacro) error {
 	values := scratch.low
-	decoder.readComponents(b, &c.plane, m.reset, m.adapt, values, scratch.flags)
+	decoder.readChecked(b, &c.plane, m.reset, m.adapt, values, scratch.flags)
 	if b.err != nil {
 		return b.err
 	}
@@ -722,7 +721,7 @@ func (c *jxrCoefficients) readLP(b *jxrBits, decoder *jxrLP, q *jxrTileQuant, m 
 		return err
 	}
 	info := &c.info[m.at]
-	if err := applyJXRLP(&c.plane, values[:c.plane.channels], info.dcMode, info.lpIndex, &m.left.low, &m.top.low, false); err != nil {
+	if err := applyJXRLPChecked(&c.plane, values[:c.plane.channels], info.dcMode, info.lpIndex, &m.left.low, &m.top.low, false); err != nil {
 		return err
 	}
 	if err := c.checkLow(values); err != nil {
@@ -733,10 +732,8 @@ func (c *jxrCoefficients) readLP(b *jxrBits, decoder *jxrLP, q *jxrTileQuant, m 
 	for i := range c.plane.channels {
 		dc[i] = low[i*16]
 	}
-	if err := storeJXRLow(&c.plane, dc[:c.plane.channels], values[:c.plane.channels], info.lpIndex, cache); err != nil {
-		return err
-	}
-	mode, err := jxrHighpassMode(&c.plane, values[:c.plane.channels])
+	storeJXRLowChecked(&c.plane, dc[:c.plane.channels], values[:c.plane.channels], info.lpIndex, cache)
+	mode, err := jxrHighpassModeChecked(&c.plane, values[:c.plane.channels])
 	if err != nil {
 		return err
 	}
@@ -751,16 +748,14 @@ func (c *jxrCoefficients) readLP(b *jxrBits, decoder *jxrLP, q *jxrTileQuant, m 
 // 入参: b 码流读取器, decoder 分块高通状态, m 宏块状态, spatial 是否为空间模式, trim 精细位截断量, residual, pattern 逐分量残差及重建标志缓冲
 // 返回: error 数据或缓冲错误
 func (c *jxrCoefficients) readHP(b *jxrBits, decoder *jxrHP, m jxrMacroContext, spatial bool, trim uint8, residual, pattern []uint16) error {
-	decoder.cbp.readComponents(b, &c.plane, residual)
+	decoder.cbp.readChecked(b, &c.plane, residual)
 	if b.err != nil {
 		return b.err
 	}
-	if err := decoder.cbp.predictComponents(&c.plane, residual, m.left.pattern, m.top.pattern, m.firstColumn, m.firstRow, pattern); err != nil {
-		return err
-	}
+	decoder.cbp.predictChecked(&c.plane, residual, m.left.pattern, m.top.pattern, m.firstColumn, m.firstRow, pattern)
 	info := &c.info[m.at]
 	control := jxrHPControl{vertical: info.scanMode == 1, reset: m.reset, adapt: m.adapt, spatial: spatial, trim: trim}
-	info.bits = decoder.readComponents(b, &c.plane, pattern, control, c.highMacro(m.at))
+	info.bits = decoder.readChecked(b, &c.plane, pattern, control, c.highMacro(m.at))
 	return b.err
 }
 
@@ -946,8 +941,10 @@ func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, til
 		}
 	}()
 	h := &s.header
-	if err := img.checkOutput(s); err != nil {
-		return offsets, err
+	if !output.validated {
+		if err := img.checkOutput(s); err != nil {
+			return offsets, err
+		}
 	}
 	columns, rows := len(h.columns)-1, len(h.rows)-1
 	if tile < 0 || tile >= columns*rows {
@@ -958,14 +955,16 @@ func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, til
 		if p == nil {
 			continue
 		}
-		if err := checkJXRModelComponents(&p.plane); err != nil {
-			return offsets, err
-		}
 		if len(output.macro[n].high) < p.plane.channels*256 {
 			return offsets, fmt.Errorf("%w: JPEG XR output residual capacity", ErrInvalid)
 		}
-		if err := checkJXRTileQuant(&p.plane, &output.quant[n]); err != nil {
-			return offsets, err
+		if !output.validated {
+			if err := checkJXRModelComponents(&p.plane); err != nil {
+				return offsets, err
+			}
+			if err := checkJXRTileQuant(&p.plane, &output.quant[n]); err != nil {
+				return offsets, err
+			}
 		}
 	}
 	bands := 1
@@ -1047,7 +1046,11 @@ func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, til
 		if !h.frequency {
 			kind = -1
 		}
-		writeJXRPacket(output.packet[band], s, kind, &output.quant, output.trim)
+		if output.validated {
+			writeJXRPacketChecked(output.packet[band], s, kind, &output.quant, output.trim)
+		} else {
+			writeJXRPacket(output.packet[band], s, kind, &output.quant, output.trim)
+		}
 		if output.packet[band].err != nil {
 			return offsets, output.packet[band].err
 		}
@@ -1059,6 +1062,9 @@ func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, til
 	var cacheRows [2]*jxrTileRow
 	for n, p := range planes {
 		if p != nil {
+			if err := output.macro[n].prepareLowStorage(p.plane.channels); err != nil {
+				return offsets, err
+			}
 			if output.rows[n] == nil {
 				var err error
 				output.rows[n], err = newJXRTileRow(ctx, width, p.plane.channels, output.maxMemory)
@@ -1102,7 +1108,7 @@ func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, til
 					}
 				}
 				scratch.cache = row.current.low
-				if err := p.prepareMacro(ctx, q, lpIndex, hpIndex, m, output.exact, scratch); err != nil {
+				if err := p.prepareMacroChecked(ctx, q, lpIndex, hpIndex, m, output.exact, scratch); err != nil {
 					return offsets, err
 				}
 				if p.plane.bands != 3 {
@@ -1119,13 +1125,13 @@ func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, til
 						}
 					}
 				}
-				dc[n].writeComponents(dcWriter, &p.plane, scratch.dc, m.adapt)
+				dc[n].writeChecked(dcWriter, &p.plane, scratch.dc, m.adapt)
 				if dcWriter.err != nil {
 					return offsets, dcWriter.err
 				}
 				current := jxrTileNeighbor{low: scratch.cache, pattern: row.current.pattern}
 				if p.plane.bands != 3 {
-					lp[n].writeComponents(lpWriter, &p.plane, scratch.lp, m.reset, m.adapt, scratch.flags)
+					lp[n].writeChecked(lpWriter, &p.plane, scratch.lp, m.reset, m.adapt, scratch.flags)
 					if lpWriter.err != nil {
 						return offsets, lpWriter.err
 					}
@@ -1136,20 +1142,18 @@ func (img *jxrCoefficientImage) writeTile(ctx context.Context, s *jxrStream, til
 						return offsets, err
 					}
 					residual := row.residual
-					if err := hp[n].cbp.residualComponents(&p.plane, pattern, row.left.pattern, row.top[x].pattern, m.firstColumn, m.firstRow, residual); err != nil {
-						return offsets, err
-					}
-					hp[n].cbp.writeComponents(hpWriter, &p.plane, residual)
+					hp[n].cbp.residualChecked(&p.plane, pattern, row.left.pattern, row.top[x].pattern, m.firstColumn, m.firstRow, residual)
+					hp[n].cbp.writeChecked(hpWriter, &p.plane, residual)
 					if hpWriter.err != nil {
 						return offsets, hpWriter.err
 					}
 					control := jxrHPControl{vertical: scratch.scanMode == 1, spatial: !h.frequency, reset: m.reset, adapt: m.adapt, trim: output.trim}
-					bits := hp[n].writeComponents(hpWriter, &p.plane, pattern, control, scratch.high, output.exact)
+					bits := hp[n].writeChecked(hpWriter, &p.plane, pattern, control, scratch.high, output.exact)
 					if hpWriter.err != nil {
 						return offsets, hpWriter.err
 					}
 					if h.frequency && p.plane.bands == 0 {
-						writeJXRHighFlex(flexWriter, &p.plane, bits, output.trim, scratch.high, output.exact)
+						writeJXRHighFlexChecked(flexWriter, &p.plane, bits, output.trim, scratch.high, output.exact)
 					}
 					current.pattern = pattern
 				}

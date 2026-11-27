@@ -580,7 +580,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 		return nil, &LimitError{Resource: "max memory bytes", Limit: budgetLimit, Required: decodeWork, Detail: "JPEG XR combined decoding storage"}
 	}
 	slack := budgetLimit - decodeWork
-	state, err := source.primary.coefficientsContext(ctx, c.image, jxrWorkerBudgetAllowance(slack, source.primary.coefficientWork()))
+	state, err := source.primary.coefficientsContext(ctx, c.image, jxrSaturatedAdd(slack, source.primary.coefficientWork()))
 	if err != nil {
 		return nil, err
 	}
@@ -590,7 +590,7 @@ func (source *jxrRasterSource) decodeContext(ctx context.Context, maxPixels, max
 	}
 	alphaHeader, alphaPlane := &state.header, state.alpha
 	if source.alpha != nil {
-		alphaState, err := source.alpha.coefficientsContext(ctx, c.alpha, jxrWorkerBudgetAllowance(slack, source.alpha.coefficientWork()))
+		alphaState, err := source.alpha.coefficientsContext(ctx, c.alpha, jxrSaturatedAdd(slack, source.alpha.coefficientWork()))
 		if err != nil {
 			return nil, err
 		}
@@ -1115,9 +1115,6 @@ func displayLinear(value float64) float64 {
 // 入参: value 显示分量
 // 返回: uint16 十六位值
 func displayWord(value float64) uint16 {
-	if math.IsNaN(value) {
-		return 0
-	}
 	return uint16(math.Floor(colorClamp(value)*65535 + 0.5))
 }
 

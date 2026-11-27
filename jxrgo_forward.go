@@ -849,8 +849,9 @@ func (v *jxrComponentView) chromaWindowCorners(ctx context.Context, needed image
 				neighbor = x - 1
 			}
 			value := v.at(x, y) + direction*v.at(neighbor, y)
-			if err := checkJXRWords([]int64{value}, v.wordBits == 32); err != nil {
-				return err
+			low, high := jxrWordBounds(v.wordBits == 32)
+			if value < low || value > high {
+				return fmt.Errorf("%w: JPEG XR %d-bit coefficient range", ErrInvalid, v.wordBits)
 			}
 			if value < -jxrCoefficientLimit || value > jxrCoefficientLimit {
 				return jxrCoefficientRangeError("JPEG XR chroma corner coefficient range", value)

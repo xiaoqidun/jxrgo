@@ -330,18 +330,18 @@ func encodeJXRSeparateRows(ctx context.Context, w io.WriteSeeker, info Info, sou
 	if info.ImageType&ImageTypePreview != 0 {
 		return fmt.Errorf("%w: JPEG XR preview requires corresponding image", ErrInvalid)
 	}
-	_, _, err := encodeJXRSeparateRowsAt(ctx, w, info, source, alpha, options, 8)
+	info, retained, err := prepareJXRTileInfo(ctx, info, options)
+	if err != nil {
+		return err
+	}
+	_, _, err = encodeJXRSeparateRowsPreparedAt(ctx, w, info, retained, source, alpha, options, 8)
 	return err
 }
 
-// encodeJXRSeparateRowsAt 在指定容器目录起点单遍流式写入独立透明度图像，首遍暂存透明度，次遍不再读取原始行源
-// 入参: ctx Context, w 文件输出, info 完整描述, source 共用行缓存, alpha 透明度暂存, options 文件选项, directory 目录起点
+// encodeJXRSeparateRowsPreparedAt 复用已准备的描述与常驻额度，在指定目录起点单遍流式写入独立透明度图像
+// 入参: ctx Context, w 文件输出, info 已准备原生描述, retained 常驻元数据额度, source 共用行缓存, alpha 透明度暂存, options 文件选项, directory 目录起点
 // 返回: uint64 图像结束位置, uint64 当前目录链接位置, error 参数、资源、源、暂存、取消或输出错误
-func encodeJXRSeparateRowsAt(ctx context.Context, w io.WriteSeeker, info Info, source *jxrRowInput, alpha *jxrAlphaRowStorage, options EncodeOptions, directory uint64) (uint64, uint64, error) {
-	info, retained, err := prepareJXRTileInfo(ctx, info, options)
-	if err != nil {
-		return 0, 0, err
-	}
+func encodeJXRSeparateRowsPreparedAt(ctx context.Context, w io.WriteSeeker, info Info, retained uint64, source *jxrRowInput, alpha *jxrAlphaRowStorage, options EncodeOptions, directory uint64) (uint64, uint64, error) {
 	input, err := makeJXRSeparateTileInput(ctx, info, options, retained)
 	if err != nil {
 		return 0, 0, err
@@ -661,20 +661,31 @@ func writeJXRSeparatePacketsAt(ctx context.Context, w io.WriteSeeker, file jxrSe
 			start++
 		}
 	}
-	for index, at := range [3]uint64{offsets.imageSize, offsets.alphaOffset, offsets.alphaSize} {
-		if err := seekJXRImageOutput(ctx, w, delta+at); err != nil {
-			return 0, 0, err
-		}
-		var field [4]byte
-		binary.LittleEndian.PutUint32(field[:], uint32([3]uint64{sizes[0], starts[1], sizes[1]}[index]))
-		if err := writeEncoderOutput(ctx, w, field[:]); err != nil {
-			return 0, 0, err
-		}
-	}
-	if err := seekJXRImageOutput(ctx, w, start); err != nil {
+	if err := patchJXRSeparateAlphaFields(ctx, w, delta, offsets, sizes[0], starts[1], sizes[1], start); err != nil {
 		return 0, 0, err
 	}
-	return start, link, ctx.Err()
+	return start, link, nil
+}
+
+// patchJXRSeparateAlphaFields 回填独立透明度双码流容器中的主图长度、透明偏移与透明长度并恢复输出位置
+// 入参: ctx 已规范化Context, w 可定位输出, delta 目录相对首图基准的增量, offsets 字段局部偏移, mainSize 主流字节数, alphaStart 透明流绝对起点, alphaSize 透明流字节数, endPos 回填后恢复的流末尾
+// 返回: error 定位、写入或取消错误
+func patchJXRSeparateAlphaFields(ctx context.Context, w io.WriteSeeker, delta uint64, offsets jxrContainerOffsets, mainSize, alphaStart, alphaSize, endPos uint64) error {
+	values := [3]uint64{mainSize, alphaStart, alphaSize}
+	for index, at := range [3]uint64{offsets.imageSize, offsets.alphaOffset, offsets.alphaSize} {
+		if err := seekJXRImageOutput(ctx, w, delta+at); err != nil {
+			return err
+		}
+		var field [4]byte
+		binary.LittleEndian.PutUint32(field[:], uint32(values[index]))
+		if err := writeEncoderOutput(ctx, w, field[:]); err != nil {
+			return err
+		}
+	}
+	if err := seekJXRImageOutput(ctx, w, endPos); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // makeJXRSeparateTileInput 在常驻元数据预算后建立两个仅布局计划，浮点参数已由逐块入口显式校验
@@ -823,7 +834,7 @@ func encodeJXRProjectedTilesTo(ctx context.Context, w io.WriteSeeker, original, 
 			clear(plane.values)
 			clear(plane.words)
 		}
-		for index, component := range local.info.Components {
+		for index := range local.info.Components {
 			from := index
 			if alpha {
 				if index != coded.Channels && !mirror {
@@ -831,26 +842,11 @@ func encodeJXRProjectedTilesTo(ctx context.Context, w io.WriteSeeker, original, 
 				}
 				from = original.Channels
 			}
-			input, err := raw.component(from)
-			if err != nil {
-				return nil, err
-			}
-			for y := range component.Bounds.Dy() {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-				for x := range component.Bounds.Dx() {
-					if x&1023 == 0 {
-						if err := ctx.Err(); err != nil {
-							return nil, err
-						}
-					}
-					bits, err := input.sampleBitsAt(x, y)
-					if err != nil {
-						return nil, err
-					}
-					local.planes[index].storeBits(y*component.Bounds.Dx()+x, bits)
-				}
+			src, dst := &raw.planes[from], &local.planes[index]
+			if src.words != nil {
+				copy(dst.words, src.words)
+			} else {
+				copy(dst.values, src.values)
 			}
 		}
 		return local, ctx.Err()

@@ -22,6 +22,7 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"math/bits"
 	"slices"
 )
 
@@ -1200,6 +1201,14 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 			for n := uint64(1); n <= count; n++ {
 				boundary[n] = uint32(min(n*uint64(size), uint64(extent)))
 			}
+			if axis == 0 && s.header.hardTiles && s.header.overlap == 2 && (s.primary.color == 1 || s.primary.color == 2) && count >= 2 && extent-boundary[count-1] < 2 {
+				if size >= 3 {
+					boundary[count-1]--
+				} else if size == 2 {
+					boundary[count-1] = extent
+					boundary = boundary[:count]
+				}
+			}
 			*target = boundary
 		}
 		s.header.short = false
@@ -1212,9 +1221,7 @@ func makeJXREncodingPlanRetained(ctx context.Context, raster *Raster, opts *Enco
 	if err != nil {
 		return layout, output, err
 	}
-	if err := checkJXRStreamOutput(&s, limits.MaxPixels); err != nil {
-		return layout, output, err
-	}
+	output.stream.validated = true
 	return s, output, nil
 }
 
@@ -1312,37 +1319,71 @@ func makeJXREncodePlane(ctx context.Context, raster *Raster, o PlaneOptions, alp
 		}
 		p.mantissa, p.exponent = o.Float.Mantissa, o.Float.Bias
 	} else if first.Format == SampleFloat && first.Precision == 32 {
-		maximum := uint32(1)
-		n := count
-		if includeAlpha && raster.info.Alpha {
-			n++
-		}
-		for index := range n {
-			component, err := raster.Component(base + index)
-			if err != nil {
+		if lossy {
+			if err := ctx.Err(); err != nil {
 				return p, err
 			}
-			for y := range component.Bounds().Dy() {
-				if err := ctx.Err(); err != nil {
+			p.mantissa, p.exponent = 16, 127
+		} else {
+			hasNormal, hasSubnormal := false, false
+			maxExp := uint32(0)
+			needBias := -128
+			n := count
+			if includeAlpha && raster.info.Alpha {
+				n++
+			}
+			for index := range n {
+				component, err := raster.Component(base + index)
+				if err != nil {
 					return p, err
 				}
-				for x := range component.Bounds().Dx() {
-					if x&1023 == 0 {
-						if err := ctx.Err(); err != nil {
-							return p, err
-						}
-					}
-					bits, err := component.SampleBits(x, y)
-					if err != nil {
+				src := component.source
+				stride := src.channels
+				if src.alpha {
+					stride++
+				}
+				w, h := src.bounds.Dx(), src.bounds.Dy()
+				words := src.words
+				for y := range h {
+					if err := ctx.Err(); err != nil {
 						return p, err
 					}
-					maximum = max(maximum, bits>>23&255)
+					rowBase := y*w*stride + component.index
+					for x := range w {
+						if x&1023 == 1023 {
+							if err := ctx.Err(); err != nil {
+								return p, err
+							}
+						}
+						raw := words[rowBase+x*stride] & 0x7fffffff
+						if raw == 0 {
+							continue
+						}
+						exp := raw >> 23
+						if exp == 0 {
+							hasSubnormal = true
+							needBias = max(needBias, 127-bits.TrailingZeros32(raw))
+							continue
+						}
+						hasNormal = true
+						maxExp = max(maxExp, exp)
+						tz := min(23, bits.TrailingZeros32(raw&0x7fffff))
+						needBias = max(needBias, 128-int(exp)-tz)
+					}
 				}
 			}
-		}
-		p.mantissa, p.exponent = 23, int8(min(127, max(-128, 128-int(maximum))))
-		if lossy {
-			p.mantissa = 16
+			p.mantissa = 23
+			safeTop := 15
+			if p.scaled {
+				safeTop = 1
+			}
+			var bias int
+			if !hasNormal && !hasSubnormal || hasSubnormal && int(maxExp) <= safeTop {
+				bias = 127
+			} else {
+				bias = min(127+255-int(maxExp), max(128-int(maxExp), needBias))
+			}
+			p.exponent = int8(min(127, max(-128, bias)))
 		}
 	}
 	if o.Quantization != nil {

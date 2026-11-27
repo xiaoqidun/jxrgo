@@ -265,7 +265,8 @@ type ImageDescription struct {
 // TileSize以编码网格像素计且须为十六倍数，仅Lossy或Quality(1至99)允许精度损失与Subsampling下采样，SeparateAlpha写入独立透明度码流
 // Quality取0保持默认无损或显式Quantization，取1至100且未手动指定Quantization时自动映射标准T.832量化参数；Resolution非nil时优先于源Info写入0xBC82/0xBC83
 // PreserveYCbCr为真时Encode与EncodeContext对边界对齐的4:4:4/4:2:2/4:2:0标准YCbCr保留原生YCC分量；Profiles、ICCProfile、ColorHint、ColorEncoding、EXIF、GPS、XMP、IPTC与Description非空时优先于源Info写入容器
-// Uncompressed启用0xBC03无压缩容器模式，Window指定编码窗口边距，ChromaCenteringX与ChromaCenteringY指定色度采样相位（0至4或7）；Workers零值自动，MaxOutputBytes零值采用64MiB
+// Uncompressed启用0xBC03无压缩容器模式，Window指定编码窗口边距，ChromaCenteringX与ChromaCenteringY指定色度采样相位（0至4或7）
+// Scratch提供可选顺序流临时暂存，须支持从零点随机定位读写并可跨当前末尾定位扩展；Workers零值自动，MaxOutputBytes零值采用64MiB
 type EncodeOptions struct {
 	Format                   Format
 	Layout                   Layout
@@ -1643,48 +1644,24 @@ func (c Component) ReadRow(y int, dst []float64) error {
 	case SampleFixed:
 		scale := math.Ldexp(1, -int(info.FractionBits))
 		if info.Precision == 16 {
-			if words != nil {
-				for x := range width {
-					dst[x] = float64(int16(words[base+x*stride])) * scale
-				}
-				return nil
-			}
 			for x := range width {
 				dst[x] = float64(int16(values[base+x*stride])) * scale
 			}
 			return nil
 		}
-		if words != nil {
-			for x := range width {
-				dst[x] = float64(int32(words[base+x*stride])) * scale
-			}
-			return nil
-		}
 		for x := range width {
-			dst[x] = float64(int32(values[base+x*stride])) * scale
+			dst[x] = float64(int32(words[base+x*stride])) * scale
 		}
 		return nil
 	case SampleFloat:
 		if info.Precision == 16 {
-			if words != nil {
-				for x := range width {
-					dst[x] = jxrHalfValue(uint16(words[base+x*stride]))
-				}
-				return nil
-			}
 			for x := range width {
 				dst[x] = jxrHalfValue(values[base+x*stride])
 			}
 			return nil
 		}
-		if words != nil {
-			for x := range width {
-				dst[x] = float64(math.Float32frombits(words[base+x*stride]))
-			}
-			return nil
-		}
 		for x := range width {
-			dst[x] = float64(math.Float32frombits(uint32(values[base+x*stride])))
+			dst[x] = float64(math.Float32frombits(words[base+x*stride]))
 		}
 		return nil
 	case SampleRGBE:
@@ -1700,20 +1677,8 @@ func (c Component) ReadRow(y int, dst []float64) error {
 	default:
 		denom := float64((uint64(1) << info.Precision) - 1)
 		if info.Inverted {
-			if words != nil {
-				for x := range width {
-					dst[x] = 1 - float64(words[base+x*stride])/denom
-				}
-				return nil
-			}
 			for x := range width {
 				dst[x] = 1 - float64(values[base+x*stride])/denom
-			}
-			return nil
-		}
-		if words != nil {
-			for x := range width {
-				dst[x] = float64(words[base+x*stride]) / denom
 			}
 			return nil
 		}

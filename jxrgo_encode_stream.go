@@ -39,6 +39,7 @@ type jxrStreamOutput struct {
 	tiles     []jxrTileSetting
 	rowOrder  bool
 	exact     bool
+	validated bool
 	workers   int
 	maxPixels uint64
 	maxBytes  uint64
@@ -59,11 +60,13 @@ func (img *jxrCoefficientImage) writeStream(ctx context.Context, source *jxrStre
 		return nil, fmt.Errorf("%w: JPEG XR image output", ErrInvalid)
 	}
 	s := *source
-	if err := checkJXRImageHeaders(&s, options.maxPixels); err != nil {
-		return nil, err
-	}
-	if err := img.checkOutput(&s); err != nil {
-		return nil, err
+	if !options.validated {
+		if err := checkJXRImageHeaders(&s, options.maxPixels); err != nil {
+			return nil, err
+		}
+		if err := img.checkOutput(&s); err != nil {
+			return nil, err
+		}
 	}
 	tiles := (len(s.header.columns) - 1) * (len(s.header.rows) - 1)
 	bands := 1
@@ -95,17 +98,19 @@ func (img *jxrCoefficientImage) writeStream(ctx context.Context, source *jxrStre
 		return nil, err
 	}
 	s.packets = make([]uint64, tiles*bands)
-	for _, setting := range options.tiles {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if setting.trim > 15 || !s.header.trim && setting.trim != 0 {
-			return nil, fmt.Errorf("%w: JPEG XR image output trim", ErrInvalid)
-		}
-		for n, p := range [2]*jxrPlane{&s.primary, s.alpha} {
-			if p != nil {
-				if err := checkJXRTileQuant(p, &setting.quant[n]); err != nil {
-					return nil, err
+	if !options.validated {
+		for _, setting := range options.tiles {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if setting.trim > 15 || !s.header.trim && setting.trim != 0 {
+				return nil, fmt.Errorf("%w: JPEG XR image output trim", ErrInvalid)
+			}
+			for n, p := range [2]*jxrPlane{&s.primary, s.alpha} {
+				if p != nil {
+					if err := checkJXRTileQuant(p, &setting.quant[n]); err != nil {
+						return nil, err
+					}
 				}
 			}
 		}
@@ -122,11 +127,13 @@ func (img *jxrCoefficientImage) writeStream(ctx context.Context, source *jxrStre
 	if writer.err != nil {
 		return nil, writer.err
 	}
-	if err := checkJXRProfileDeclarations(s.profiles); err != nil {
-		return nil, err
-	}
-	if err := s.checkProfile(); err != nil {
-		return nil, err
+	if !options.validated {
+		if err := checkJXRProfileDeclarations(s.profiles); err != nil {
+			return nil, err
+		}
+		if err := s.checkProfile(); err != nil {
+			return nil, err
+		}
 	}
 	if tiles > 1 && options.workers > 1 {
 		if data, done, err := img.writeStreamParallel(ctx, &s, options, &writer, budget, tiles, bands); err != nil {
@@ -136,7 +143,7 @@ func (img *jxrCoefficientImage) writeStream(ctx context.Context, source *jxrStre
 		}
 	}
 	var packets [4]jxrBitWriter
-	output := jxrTileOutput{exact: options.exact, maxMemory: options.maxMemory}
+	output := jxrTileOutput{exact: options.exact, validated: true, maxMemory: options.maxMemory}
 	for band := range bands {
 		packets[band] = newJXRBitWriter(ctx, options.maxBytes, budget.limit)
 		packets[band].budget = budget
@@ -175,7 +182,7 @@ func (img *jxrCoefficientImage) writeStream(ctx context.Context, source *jxrStre
 		}
 		base += uint64(len(packets[band].data))
 	}
-	writeJXRStreamHeader(&writer, &s, options.maxPixels, false)
+	writeJXRStreamHeaderChecked(&writer, &s, false)
 	if writer.err != nil {
 		return nil, writer.err
 	}
@@ -242,7 +249,7 @@ func (img *jxrCoefficientImage) writeStreamParallel(ctx context.Context, s *jxrS
 	}
 	perExtraWorker := perWorker + 256
 	workers := resolveJXRWorkers(options.workers, tiles)
-	workers = budgetJXRWorkers(workers, jxrWorkerBudgetAllowance(avail-baseFixed-minOutputReserve, perExtraWorker), perExtraWorker)
+	workers = budgetJXRWorkers(workers, jxrSaturatedAdd(avail-baseFixed-minOutputReserve, perExtraWorker), perExtraWorker)
 	if workers <= 1 {
 		return nil, false, nil
 	}
@@ -256,7 +263,7 @@ func (img *jxrCoefficientImage) writeStreamParallel(ctx context.Context, s *jxrS
 	}
 	slotOutputs := make([]jxrTileOutput, workers)
 	for slot := range workers {
-		slotOutputs[slot] = jxrTileOutput{exact: options.exact, maxMemory: options.maxMemory}
+		slotOutputs[slot] = jxrTileOutput{exact: options.exact, validated: true, maxMemory: options.maxMemory}
 		for n, p := range [2]*jxrPlane{&s.primary, s.alpha} {
 			if p != nil {
 				slotOutputs[slot].macro[n].high = make([]int64, p.channels*256)
@@ -326,7 +333,7 @@ func (img *jxrCoefficientImage) writeStreamParallel(ctx context.Context, s *jxrS
 	}
 	budget.used += tileHeld
 	defer func() { budget.used -= tileHeld }()
-	writeJXRStreamHeader(writer, s, options.maxPixels, false)
+	writeJXRStreamHeaderChecked(writer, s, false)
 	if writer.err != nil {
 		if !writer.maxBytesExceeded && errors.Is(writer.err, ErrLimit) && ctx.Err() == nil {
 			writer.reset()
@@ -495,8 +502,10 @@ func (state *jxrCoefficientImage) writeStreamTo(ctx context.Context, w io.WriteS
 	if state == nil || source == nil {
 		return fmt.Errorf("%w: incremental stream parameters", ErrInvalid)
 	}
-	if err := state.checkOutput(source); err != nil {
-		return err
+	if !options.validated {
+		if err := state.checkOutput(source); err != nil {
+			return err
+		}
 	}
 	return writeJXRPacketsTo(ctx, w, source, options, state.outputWork(source), func(tile int, output *jxrTileOutput) error {
 		_, err := state.writeTile(ctx, source, tile, output)
@@ -512,8 +521,10 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 		return fmt.Errorf("%w: incremental stream parameters", ErrInvalid)
 	}
 	s := *source
-	if err := checkJXRStreamOutput(&s, options.maxPixels); err != nil {
-		return err
+	if !options.validated {
+		if err := checkJXRStreamOutput(&s, options.maxPixels); err != nil {
+			return err
+		}
 	}
 	tiles := (len(s.header.columns) - 1) * (len(s.header.rows) - 1)
 	bands := 1
@@ -539,17 +550,19 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 	if work >= options.maxMemory || extra >= options.maxMemory-work {
 		return fmt.Errorf("%w: incremental output working memory", ErrLimit)
 	}
-	for _, setting := range options.tiles {
-		if setting.trim > 15 || !s.header.trim && setting.trim != 0 {
-			return fmt.Errorf("%w: incremental trim", ErrInvalid)
-		}
-		for index, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
-			if plane != nil {
-				if err := checkJXRModelComponents(plane); err != nil {
-					return err
-				}
-				if err := checkJXRTileQuant(plane, &setting.quant[index]); err != nil {
-					return err
+	if !options.validated {
+		for _, setting := range options.tiles {
+			if setting.trim > 15 || !s.header.trim && setting.trim != 0 {
+				return fmt.Errorf("%w: incremental trim", ErrInvalid)
+			}
+			for index, plane := range [2]*jxrPlane{&s.primary, s.alpha} {
+				if plane != nil {
+					if err := checkJXRModelComponents(plane); err != nil {
+						return err
+					}
+					if err := checkJXRTileQuant(plane, &setting.quant[index]); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -561,9 +574,6 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 	if err != nil {
 		return err
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	if position < 0 {
 		return fmt.Errorf("%w: incremental output position", ErrInvalid)
 	}
@@ -572,10 +582,18 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 		return fmt.Errorf("%w: incremental output address capacity", ErrLimit)
 	}
 	budget := jxrWriteBudget{limit: options.maxMemory - work - extra}
+	if mem, ok := w.(*jxrMemWriteSeeker); ok {
+		prevBudget, prevMax := mem.budget, mem.maxMemory
+		mem.budget = &budget
+		mem.maxMemory = min(prevMax, jxrSaturatedAdd(uint64(cap(mem.data)), budget.limit))
+		defer func() {
+			mem.budget, mem.maxMemory = prevBudget, prevMax
+		}()
+	}
 	s.packets = make([]uint64, count)
 	header := newJXRBitWriter(ctx, maximum, budget.limit)
 	header.budget = &budget
-	indexAt := writeJXRStreamHeader(&header, &s, options.maxPixels, true)
+	indexAt := writeJXRStreamHeaderChecked(&header, &s, true)
 	if header.err != nil {
 		return header.err
 	}
@@ -606,7 +624,7 @@ func writeJXRPacketsTo(ctx context.Context, w io.WriteSeeker, source *jxrStream,
 	budget.used -= uint64(cap(header.data))
 	header.data = nil
 	var packets [4]jxrBitWriter
-	output := jxrTileOutput{exact: options.exact, maxMemory: options.maxMemory}
+	output := jxrTileOutput{exact: options.exact, validated: true, maxMemory: options.maxMemory}
 	for band := range bands {
 		packets[band] = newJXRBitWriter(ctx, maximum-total, budget.limit)
 		packets[band].budget = &budget
@@ -921,18 +939,28 @@ func writeJXRFileAt(ctx context.Context, w io.WriteSeeker, info Info, source *jx
 	if end < 0 || uint64(end) < streamStart || uint64(end)-streamStart > options.maxBytes {
 		return 0, 0, fmt.Errorf("%w: incremental file output extent", ErrInvalid)
 	}
-	if err := seekJXRImageOutput(ctx, w, delta+sizeAt); err != nil {
+	if err := patchJXRFileSize(ctx, w, delta+sizeAt, uint64(end)-streamStart, uint64(end)); err != nil {
 		return 0, 0, err
+	}
+	return uint64(end), link, nil
+}
+
+// patchJXRFileSize 回填容器目录中的主图码流字节长度字段并恢复输出位置至码流末尾
+// 入参: ctx 已规范化Context, w 可定位输出, sizeAt 长度字段绝对偏移, streamSize 主码流字节数, endPos 回填后恢复的流末尾
+// 返回: error 定位、写入或取消错误
+func patchJXRFileSize(ctx context.Context, w io.WriteSeeker, sizeAt, streamSize, endPos uint64) error {
+	if err := seekJXRImageOutput(ctx, w, sizeAt); err != nil {
+		return err
 	}
 	var count [4]byte
-	binary.LittleEndian.PutUint32(count[:], uint32(uint64(end)-streamStart))
+	binary.LittleEndian.PutUint32(count[:], uint32(streamSize))
 	if err := writeEncoderOutput(ctx, w, count[:]); err != nil {
-		return 0, 0, err
+		return err
 	}
-	if err := seekJXRImageOutput(ctx, w, uint64(end)); err != nil {
-		return 0, 0, err
+	if err := seekJXRImageOutput(ctx, w, endPos); err != nil {
+		return err
 	}
-	return uint64(end), link, ctx.Err()
+	return ctx.Err()
 }
 
 // makeJXRFilePrefix 从同一已校验编码布局产生目录及元数据，不构造占位码流或假样本
